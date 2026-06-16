@@ -1,0 +1,21 @@
+# --- Python Junk Files ---
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+
+# --- Environment & IDEs ---
+.venv/
+venv/
+ENV/
+.env
+.vscode/
+.idea/
+.DS_Store
+
+# --- Machine Learning Weights & Data ---
+data/
+*.pth
+*.pt
+*.checkpoint
+outputs/
