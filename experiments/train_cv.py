@@ -11,7 +11,7 @@ from models.baselines import DeepConvNet
 from utils.visualizer import plot_experiment_dashboard
 
 def run_vision_benchmark():
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cuda" if torch.device("cuda").is_available() else "cpu")
     transform = transforms.Compose([transforms.ToTensor(), transforms.Normalize((0.5,), (0.5,))])
     
     trainset = torchvision.datasets.CIFAR10(root='./data', train=True, download=True, transform=transform)
@@ -53,12 +53,24 @@ def run_vision_benchmark():
         acc = 100.0 * correct / total
         avg_loss = running_loss / len(trainloader)
 
+        # Extract layerwise alpha parameters & latent variances
+        alphas = model.extract_alphas()
+        variances = model.extract_latent_variances()
+
         results['alpha_golu']['train_loss'].append(avg_loss)
         results['alpha_golu']['val_acc'].append(acc)
-        results['alpha_golu']['alpha_history'].append(model.extract_alphas())
-        results['alpha_golu']['latent_var'].append(model.extract_latent_variances())
+        results['alpha_golu']['alpha_history'].append(alphas)
+        results['alpha_golu']['latent_var'].append(variances)
 
-        print(f"Epoch {epoch+1} | Loss: {avg_loss:.4f} | Acc: {acc:.2f}% | Alphas: {model.extract_alphas()}")
+        print(f"Epoch {epoch+1} | Loss: {avg_loss:.4f} | Acc: {acc:.2f}% | Alphas: {alphas}")
+
+    # Final summary output printing initial vs learned alphas per layer
+    print("\n================ FINAL LEARNED ALPHAS PER LAYER ================")
+    initial_alphas = results['alpha_golu']['alpha_history'][0]
+    final_alphas = results['alpha_golu']['alpha_history'][-1]
+    for idx, (init, final) in enumerate(zip(initial_alphas, final_alphas)):
+        print(f"  Layer {idx+1}: Initial = {init:.4f} ---> Learned = {final:.4f}")
+    print("=================================================================\n")
 
     plot_experiment_dashboard(results, save_dir="outputs")
 
