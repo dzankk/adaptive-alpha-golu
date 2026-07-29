@@ -176,6 +176,12 @@ def run_segmentation_benchmark():
         mean_iou = total_iou / len(loader)
         print(f"Activation: {act_type.ljust(15)} | Validation mIoU: {mean_iou:.4f}")
 
+def train_and_eval(activation: str = 'alpha_golu', seed: int = 42, epochs: int = 10) -> float:
+    """Returns Mean Intersection over Union (mIoU)."""
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    miou = train_single_seed_segmentation(act_type=activation, seed=seed, epochs=epochs, device=device)
+    return float(miou)
+    
 
 if __name__ == '__main__':
     run_segmentation_benchmark()
