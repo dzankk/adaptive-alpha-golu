@@ -38,7 +38,6 @@ class StaticGoLU(nn.Module):
     def forward(self, x):
         return x * torch.exp(-torch.exp(-x))
 
-
 def get_activation(act_type):
     act_type = act_type.lower()
     if act_type == 'gelu':
@@ -50,7 +49,8 @@ def get_activation(act_type):
     elif act_type == 'golu_static':
         return StaticGoLU()
     elif act_type == 'alpha_golu':
-        return AdaptiveAlphaGoLU(init_alpha=0.50) if hasattr(AdaptiveAlphaGoLU, '__init__') and 'init_alpha' in AdaptiveAlphaGoLU.__init__.__code__.co_varnames else AdaptiveAlphaGoLU()
+        # Removed init_alpha=0.50 override; defaults to optimal init_alpha=1.0
+        return AdaptiveAlphaGoLU()
     raise ValueError(f"Unknown activation: {act_type}")
 
 
