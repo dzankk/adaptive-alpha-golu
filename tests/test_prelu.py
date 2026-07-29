@@ -1,10 +1,25 @@
+"""
+PReLU Baseline Benchmark Test
+=============================
+Evaluates Parametric ReLU (PReLU) as an adaptive activation baseline across multiple random seeds.
+"""
 
-import torch
-import torch.nn as nn
-from models.baselines import DeepConvNet
 from experiments.run_baselines import train_and_eval
 
-print("================ Evaluating PReLU (Adaptive Baseline) ================")
-for seed in [42, 123, 999]:
-    acc = train_and_eval("prelu", seed=seed)
-    print(f"PReLU Seed {seed} -> Accuracy: {acc:.2f}%")
+
+def run_prelu_tests():
+    print("================ Evaluating PReLU (Adaptive Baseline) ================")
+    seeds = [42, 123, 999]
+    results = []
+
+    for seed in seeds:
+        acc = train_and_eval("prelu", seed=seed)
+        results.append(acc)
+        print(f"PReLU Seed {seed} -> Accuracy: {acc:.2f}%")
+
+    avg_acc = sum(results) / len(results)
+    print(f"Mean PReLU Accuracy across seeds: {avg_acc:.2f}%")
+
+
+if __name__ == "__main__":
+    run_prelu_tests()
