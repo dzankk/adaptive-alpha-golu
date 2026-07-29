@@ -1,13 +1,14 @@
 """
-Denoising Diffusion Probabilistic Model (DDPM) Benchmark
-Evaluates noise residual prediction MSE across activation functions.
+DDPM Denoising Benchmark on Fashion-MNIST Image Manifolds
+Evaluates real image residual denoising loss across activation functions.
 """
-
 import math
 import random
 import numpy as np
 import torch
 import torch.nn as nn
+import torchvision
+import torchvision.transforms as transforms
 
 try:
     from models.alpha_golu import AlphaGoLU as AdaptiveAlphaGoLU
@@ -62,8 +63,7 @@ class SinusoidalPositionEmbeddings(nn.Module):
         embeddings = math.log(10000) / (half_dim - 1)
         embeddings = torch.exp(torch.arange(half_dim, device=device) * -embeddings)
         embeddings = time[:, None] * embeddings[None, :]
-        embeddings = torch.cat((embeddings.sin(), embeddings.cos()), dim=-1)
-        return embeddings
+        return torch.cat((embeddings.sin(), embeddings.cos()), dim=-1)
 
 
 class DiffusionUNet(nn.Module):
@@ -87,25 +87,17 @@ class DiffusionUNet(nn.Module):
         return self.out_conv(h)
 
 
-def get_optimizer(model, lr=1e-3, weight_decay=1e-4):
-    act_params, reg_params = [], []
-    for name, param in model.named_parameters():
-        if not param.requires_grad:
-            continue
-        if 'alpha' in name or 'beta' in name:
-            act_params.append(param)
-        else:
-            reg_params.append(param)
-
-    return torch.optim.AdamW([
-        {'params': reg_params, 'weight_decay': weight_decay, 'lr': lr},
-        {'params': act_params, 'weight_decay': 0.0, 'lr': lr * 5.0}
-    ])
-
-
 def run_diffusion_benchmark():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Running Denoising Diffusion Benchmark on {device}...")
+    print(f"Running Real Fashion-MNIST Denoising Diffusion Benchmark on {device}...")
+
+    transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize((0.5,), (0.5,))
+    ])
+
+    trainset = torchvision.datasets.FashionMNIST(root='./data', train=True, download=True, transform=transform)
+    trainloader = torch.utils.data.DataLoader(trainset, batch_size=128, shuffle=True, num_workers=2)
 
     activations = ['gelu', 'swish', 'swish_adaptive', 'golu_static', 'alpha_golu']
     seeds = [42, 123]
@@ -116,19 +108,20 @@ def run_diffusion_benchmark():
     alpha = 1.0 - beta
     alpha_hat = torch.cumprod(alpha, dim=0)
 
-    print("\n================ DDPM Denoising Loss (MSE ↓) ================")
+    print("\n================ Real Fashion-MNIST DDPM Denoising Loss (MSE ↓) ================")
     for act in activations:
         losses = []
         for s in seeds:
             reset_seeds(s)
             model = DiffusionUNet(in_channels=1, act_type=act).to(device)
-            optimizer = get_optimizer(model)
+            optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
             criterion = nn.MSELoss()
 
             model.train()
-            for _ in range(300):
-                x0 = torch.randn(32, 1, 28, 28, device=device)
-                t = torch.randint(0, timesteps, (32,), device=device).long()
+            step_count = 0
+            for x0, _ in trainloader:
+                x0 = x0.to(device)
+                t = torch.randint(0, timesteps, (x0.size(0),), device=device).long()
                 noise = torch.randn_like(x0)
 
                 a_hat_t = alpha_hat[t][:, None, None, None]
@@ -141,12 +134,16 @@ def run_diffusion_benchmark():
                 loss.backward()
                 optimizer.step()
 
+                step_count += 1
+                if step_count >= 300:
+                    break
+
             model.eval()
             val_losses = []
             with torch.no_grad():
-                for _ in range(20):
-                    x0 = torch.randn(32, 1, 28, 28, device=device)
-                    t = torch.randint(0, timesteps, (32,), device=device).long()
+                for x0, _ in list(trainloader)[:15]:
+                    x0 = x0.to(device)
+                    t = torch.randint(0, timesteps, (x0.size(0),), device=device).long()
                     noise = torch.randn_like(x0)
                     a_hat_t = alpha_hat[t][:, None, None, None]
                     xt = torch.sqrt(a_hat_t) * x0 + torch.sqrt(1 - a_hat_t) * noise
@@ -158,7 +155,7 @@ def run_diffusion_benchmark():
 
         results[act] = (np.mean(losses), np.std(losses))
 
-    print("\n================ DIFFUSION SUMMARY ================")
+    print("\n================ FASHION-MNIST DIFFUSION SUMMARY ================")
     for act, (mean_l, std_l) in results.items():
         print(f"  {act.upper():<14}: Loss = {mean_l:.6f} ± {std_l:.6f}")
 
