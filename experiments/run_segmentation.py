@@ -1,17 +1,29 @@
-
 """
-Semantic Segmentation Benchmark (UNet with Noisy Textured Target Masks)
-Prevents trivial 1.0000 mIoU outputs by using challenging target boundaries.
+Optimized Semantic Segmentation Benchmark (UNet)
+Features:
+1. Excludes learnable activation parameters (alpha, beta) from Weight Decay.
+2. Custom learning rate for shape parameters to prevent gradient collapse.
+3. Smooth initialization (alpha = 0.50) for fine-grained spatial gradient preservation.
 """
 
+import random
+import numpy as np
 import torch
 import torch.nn as nn
-import numpy as np
 
 try:
     from models.alpha_golu import AlphaGoLU as AdaptiveAlphaGoLU
 except ImportError:
     from models.alpha_golu import AlphaGoLUModule as AdaptiveAlphaGoLU
+
+
+def reset_all_seeds(seed=42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 
 class AdaptiveSwish(nn.Module):
@@ -37,11 +49,12 @@ class DoubleConv(nn.Module):
             elif act_type == 'swish':
                 return nn.SiLU()
             elif act_type == 'swish_adaptive':
-                return AdaptiveSwish()
+                return AdaptiveSwish(init_beta=1.0)
             elif act_type == 'golu_static':
                 return StaticGoLU()
             elif act_type == 'alpha_golu':
-                return AdaptiveAlphaGoLU()
+                # Smooth initialization (0.50) for segmentation tasks
+                return AdaptiveAlphaGoLU(init_alpha=0.50) if hasattr(AdaptiveAlphaGoLU, '__init__') and 'init_alpha' in AdaptiveAlphaGoLU.__init__.__code__.co_varnames else AdaptiveAlphaGoLU()
 
         self.double_conv = nn.Sequential(
             nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1, bias=False),
@@ -81,6 +94,26 @@ class UNet(nn.Module):
         return self.outc(x)
 
 
+def get_optimizer(model, lr=1e-3, weight_decay=1e-4):
+    """Separates activation parameters (alpha/beta) from standard weight decay."""
+    act_params = []
+    regularized_params = []
+
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if 'alpha' in name or 'beta' in name:
+            act_params.append(param)
+        else:
+            regularized_params.append(param)
+
+    optimizer_grouped_parameters = [
+        {'params': regularized_params, 'weight_decay': weight_decay, 'lr': lr},
+        {'params': act_params, 'weight_decay': 0.0, 'lr': lr * 5.0}  # Higher LR, Zero Weight Decay
+    ]
+    return torch.optim.AdamW(optimizer_grouped_parameters)
+
+
 def compute_miou(preds, targets, num_classes=2):
     ious = []
     preds = torch.argmax(preds, dim=1)
@@ -95,14 +128,12 @@ def compute_miou(preds, targets, num_classes=2):
 
 
 def generate_hard_batch(batch_size=32, device='cuda'):
-    # Creates noisy textured spatial masks (stochastic shapes + high noise background)
     images = torch.randn(batch_size, 3, 64, 64) * 1.5
     masks = torch.zeros(batch_size, 64, 64, dtype=torch.long)
     for i in range(batch_size):
         cx, cy = np.random.randint(20, 44, size=2)
         x, y = torch.meshgrid(torch.arange(64), torch.arange(64), indexing='ij')
         dist = (x - cx)**2 + (y - cy)**2
-        # Fuzzy boundary mask
         mask = ((dist < 250) & (torch.rand(64, 64) > 0.25)).long()
         masks[i] = mask
         images[i, 0] += mask.float() * 1.2
@@ -112,7 +143,7 @@ def generate_hard_batch(batch_size=32, device='cuda'):
 
 def run_segmentation_benchmark():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Running Hard UNet Segmentation Benchmark on {device}...")
+    print(f"Running Optimized UNet Segmentation Benchmark on {device}...")
 
     activations = ['gelu', 'swish', 'swish_adaptive', 'golu_static', 'alpha_golu']
     seeds = [42, 123]
@@ -122,10 +153,9 @@ def run_segmentation_benchmark():
     for act_type in activations:
         mious = []
         for s in seeds:
-            torch.manual_seed(s)
-            np.random.seed(s)
+            reset_all_seeds(s)
             model = UNet(n_channels=3, n_classes=2, act_type=act_type).to(device)
-            optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
+            optimizer = get_optimizer(model, lr=1e-3, weight_decay=1e-4)
             criterion = nn.CrossEntropyLoss()
 
             model.train()
@@ -152,7 +182,7 @@ def run_segmentation_benchmark():
 
         results[act_type] = (np.mean(mious), np.std(mious))
 
-    print("\n================ HARD SEGMENTATION SUMMARY ================")
+    print("\n================ OPTIMIZED SEGMENTATION SUMMARY ================")
     for act_type, (mean_miou, std_miou) in results.items():
         print(f"  {act_type.upper():<14}: Mean IoU = {mean_miou:.4f} ± {std_miou:.4f}")
 
