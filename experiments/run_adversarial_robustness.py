@@ -297,6 +297,12 @@ def run_benchmark():
         print(f"FGSM Robust Accuracy: {fgsm_correct / total * 100:.2f}%")
         print(f"PGD-10 Robust Accuracy: {pgd_correct / total * 100:.2f}%")
 
+def train_and_eval(activation: str = 'alpha_golu', seed: int = 42, epochs: int = 10) -> float:
+    """Returns Robust Accuracy under PGD/FGSM attack."""
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    robust_acc = train_single_seed_robustness(act_type=activation, seed=seed, epochs=epochs, device=device)
+    return float(robust_acc)
+    
 
 if __name__ == '__main__':
     run_benchmark()
