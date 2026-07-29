@@ -1,3 +1,9 @@
+"""
+Benchmark: Language Modeling & Autoregressive Generation (Mini-GPT)
+Evaluates autoregressive sequence modeling perplexity across transformer block activations.
+Uses Causal Multi-Head Attention with zero-weight-decay parameter splitting 
+to ensure adaptive activation parameters do not decay prematurely.
+"""
 import inspect
 import math
 import torch
