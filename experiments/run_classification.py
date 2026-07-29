@@ -189,24 +189,30 @@ def train_single_seed(act_type, dataset_name="cifar10", seed=42, epochs=10, devi
     
     model = ResNet18(num_classes=10, act_type=act_type).to(device)
     
-    # Correct parameter grouping for non-weight-decayed parameters (including PReLU)
     act_params = []
     weight_params = []
     for n, p in model.named_parameters():
-        if 'alpha' in n or 'beta' in n or 'weight' in n and isinstance(dict(model.named_modules())[n.rsplit('.', 1)[0]], nn.PReLU):
+        if 'alpha' in n or 'beta' in n or ('weight' in n and isinstance(dict(model.named_modules())[n.rsplit('.', 1)[0]], nn.PReLU)):
             act_params.append(p)
         else:
             weight_params.append(p)
     
     optimizer = torch.optim.AdamW([
-    {'params': weight_params, 'lr': 1e-3, 'weight_decay': 5e-4},
-    {'params': act_params, 'lr': 1e-4, 'weight_decay': 0.0}  # Try 1e-4 or 3e-4 for alpha!
-])
+        {'params': weight_params, 'lr': 1e-3, 'weight_decay': 5e-4},
+        {'params': act_params, 'lr': 1e-4, 'weight_decay': 0.0}
+    ])
     scheduler = CosineAnnealingLR(optimizer, T_max=epochs)
     criterion = nn.CrossEntropyLoss()
 
     for epoch in range(epochs):
         model.train()
+        
+        # Warmup: freeze activation parameters during first 2 epochs
+        if act_params:
+            requires_grad = (epoch >= 2)
+            for p in act_params:
+                p.requires_grad = requires_grad
+
         for inputs, labels in trainloader:
             inputs, labels = inputs.to(device), labels.to(device)
             optimizer.zero_grad()
@@ -264,7 +270,8 @@ def train_and_eval(activation: str = 'alpha_golu', seed: int = 42, dataset_name:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     acc, _ = train_single_seed(act_type=activation, dataset_name=dataset_name, seed=seed, epochs=epochs, device=device)
     return float(acc)
-    
+
+
 if __name__ == '__main__':
     run_benchmark(dataset_name="cifar10", seeds=[42, 123, 999], epochs=10)
     run_benchmark(dataset_name="fashion_mnist", seeds=[42, 123, 999], epochs=10)
