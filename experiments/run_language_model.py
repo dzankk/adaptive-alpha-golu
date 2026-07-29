@@ -4,7 +4,6 @@ Evaluates autoregressive sequence modeling perplexity across transformer block a
 Uses Causal Multi-Head Attention with zero-weight-decay parameter splitting 
 to ensure adaptive activation parameters do not decay prematurely.
 """
-import inspect
 import math
 import torch
 import torch.nn as nn
@@ -16,15 +15,17 @@ from torch.utils.data import DataLoader, Dataset
 # ==========================================
 class GoLUStatic(nn.Module):
     def forward(self, x):
-        return x * torch.sigmoid(1.702 * x)
+        scaled = torch.clamp(-x, min=-88.0, max=88.0)
+        return x * torch.exp(-torch.exp(scaled))
 
 class AdaptiveAlphaGoLU(nn.Module):
-    def __init__(self, init_alpha=0.5):
+    def __init__(self, init_alpha=1.0):
         super().__init__()
         self.alpha = nn.Parameter(torch.tensor(float(init_alpha)))
 
     def forward(self, x):
-        return x * torch.sigmoid(1.702 * self.alpha * x)
+        scaled = torch.clamp(-self.alpha * x, min=-88.0, max=88.0)
+        return x * torch.exp(-torch.exp(scaled))
 
 class SwishAdaptive(nn.Module):
     def __init__(self, init_beta=1.0):
@@ -43,11 +44,9 @@ def get_activation(act_type: str) -> nn.Module:
     elif act_type == 'golu_static':
         return GoLUStatic()
     elif act_type == 'alpha_golu':
-        sig = inspect.signature(AdaptiveAlphaGoLU)
-        return AdaptiveAlphaGoLU(init_alpha=0.50) if 'init_alpha' in sig.parameters else AdaptiveAlphaGoLU()
+        return AdaptiveAlphaGoLU(init_alpha=1.0)
     elif act_type == 'swish_adaptive':
-        sig = inspect.signature(SwishAdaptive)
-        return SwishAdaptive(init_beta=1.00) if 'init_beta' in sig.parameters else SwishAdaptive()
+        return SwishAdaptive(init_beta=1.0)
     else:
         raise ValueError(f"Unknown activation type: {act_type}")
 
@@ -64,7 +63,7 @@ def get_optimizer(model: nn.Module, lr: float = 1e-3, weight_decay: float = 1e-4
 
     param_groups = [{'params': base_params, 'weight_decay': weight_decay}]
     if act_params:
-        param_groups.append({'params': act_params, 'lr': lr * 5.0, 'weight_decay': 0.0})
+        param_groups.append({'params': act_params, 'lr': lr, 'weight_decay': 0.0})
 
     return optim.AdamW(param_groups, lr=lr)
 
@@ -113,7 +112,7 @@ class MiniGPT(nn.Module):
     def __init__(self, vocab_size=1000, d_model=128, n_heads=4, n_layers=2, act_type='relu'):
         super().__init__()
         self.token_emb = nn.Embedding(vocab_size, d_model)
-        self.pos_emb = nn.Parameter(torch.zeros(1, 64, d_model))
+        self.pos_emb = nn.Parameter(torch.randn(1, 64, d_model) * 0.02)
         self.blocks = nn.ModuleList([TransformerBlock(d_model, n_heads, act_type) for _ in range(n_layers)])
         self.ln_f = nn.LayerNorm(d_model)
         self.head = nn.Linear(d_model, vocab_size, bias=False)
