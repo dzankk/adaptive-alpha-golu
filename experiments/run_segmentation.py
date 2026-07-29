@@ -4,26 +4,33 @@ Measures pixel-level target segmentation performance (mIoU) across activation fu
 Demonstrates layer skip-connections combined with parameter-group optimization 
 (disabling weight decay for trainable activation variables like alpha and beta).
 """
-import inspect
+
+import math
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, Dataset
 
 # ==========================================
-# 1. Custom Activations
+# 1. Fixed Custom Activations
 # ==========================================
 class GoLUStatic(nn.Module):
+    """Gompertz Linear Unit: x * exp(-exp(-x))"""
     def forward(self, x):
-        return x * torch.sigmoid(1.702 * x)
+        scaled = torch.clamp(-x, min=-88.0, max=88.0)
+        return x * torch.exp(-torch.exp(scaled))
+
 
 class AdaptiveAlphaGoLU(nn.Module):
-    def __init__(self, init_alpha=0.5):
+    """Adaptive Gompertz Linear Unit: x * exp(-exp(-alpha * x))"""
+    def __init__(self, init_alpha=1.0):
         super().__init__()
         self.alpha = nn.Parameter(torch.tensor(float(init_alpha)))
 
     def forward(self, x):
-        return x * torch.sigmoid(1.702 * self.alpha * x)
+        scaled = torch.clamp(-self.alpha * x, min=-88.0, max=88.0)
+        return x * torch.exp(-torch.exp(scaled))
+
 
 class SwishAdaptive(nn.Module):
     def __init__(self, init_beta=1.0):
@@ -32,6 +39,7 @@ class SwishAdaptive(nn.Module):
 
     def forward(self, x):
         return x * torch.sigmoid(self.beta * x)
+
 
 def get_activation(act_type: str) -> nn.Module:
     act_type = act_type.lower()
@@ -42,13 +50,12 @@ def get_activation(act_type: str) -> nn.Module:
     elif act_type == 'golu_static':
         return GoLUStatic()
     elif act_type == 'alpha_golu':
-        sig = inspect.signature(AdaptiveAlphaGoLU)
-        return AdaptiveAlphaGoLU(init_alpha=0.50) if 'init_alpha' in sig.parameters else AdaptiveAlphaGoLU()
+        return AdaptiveAlphaGoLU(init_alpha=1.0)
     elif act_type == 'swish_adaptive':
-        sig = inspect.signature(SwishAdaptive)
-        return SwishAdaptive(init_beta=1.00) if 'init_beta' in sig.parameters else SwishAdaptive()
+        return SwishAdaptive(init_beta=1.0)
     else:
         raise ValueError(f"Unknown activation type: {act_type}")
+
 
 def get_optimizer(model: nn.Module, lr: float = 1e-3, weight_decay: float = 1e-4) -> optim.Optimizer:
     act_params = []
@@ -63,7 +70,8 @@ def get_optimizer(model: nn.Module, lr: float = 1e-3, weight_decay: float = 1e-4
 
     param_groups = [{'params': base_params, 'weight_decay': weight_decay}]
     if act_params:
-        param_groups.append({'params': act_params, 'lr': lr * 5.0, 'weight_decay': 0.0})
+        # Zero weight-decay applied to trainable activation variables
+        param_groups.append({'params': act_params, 'lr': lr, 'weight_decay': 0.0})
 
     return optim.AdamW(param_groups, lr=lr)
 
@@ -84,6 +92,7 @@ class UNetBlock(nn.Module):
 
     def forward(self, x):
         return self.conv(x)
+
 
 class UNet(nn.Module):
     def __init__(self, in_channels=3, num_classes=1, act_type='relu'):
@@ -125,12 +134,14 @@ class SyntheticSegmentationDataset(Dataset):
         y = (x[0:1] > 0.5).float()
         return x, y
 
+
 def compute_mIoU(preds, targets, threshold=0.5):
     preds_binary = (torch.sigmoid(preds) > threshold).float()
     intersection = (preds_binary * targets).sum(dim=[2, 3])
     union = (preds_binary + targets - preds_binary * targets).sum(dim=[2, 3])
     iou = (intersection + 1e-6) / (union + 1e-6)
     return iou.mean().item()
+
 
 def run_segmentation_benchmark():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -164,6 +175,7 @@ def run_segmentation_benchmark():
 
         mean_iou = total_iou / len(loader)
         print(f"Activation: {act_type.ljust(15)} | Validation mIoU: {mean_iou:.4f}")
+
 
 if __name__ == '__main__':
     run_segmentation_benchmark()
