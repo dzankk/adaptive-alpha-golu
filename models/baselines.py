@@ -8,6 +8,7 @@ comparative evaluations under fixed parameter initialization seeds.
 import torch
 import torch.nn as nn
 from models.alpha_golu import StaticGoLU, AlphaGoLU, LatentVarianceTracker
+import torch.nn.functional as F
 
 
 def get_activation_layer(act_name: str, init_alpha: float = 1.0) -> nn.Module:
@@ -23,7 +24,21 @@ def get_activation_layer(act_name: str, init_alpha: float = 1.0) -> nn.Module:
         return AlphaGoLU(init_alpha=init_alpha)
     else:
         raise ValueError(f"Unsupported activation function: {act_name}")
+        
 
+
+class ParametricGELU(nn.Module):
+    """
+    Parametric GELU (P-GELU): x * Phi(alpha * x)
+    Uses a learnable alpha scalar per layer to scale the Gaussian CDF.
+    """
+    def __init__(self, init_alpha=1.0):
+        super().__init__()
+        self.alpha = nn.Parameter(torch.tensor(float(init_alpha)))
+
+    def forward(self, x):
+        # erf formulation of GELU with learnable alpha scaling
+        return x * 0.5 * (1.0 + torch.erf((self.alpha * x) / 1.41421356))
 
 class DeepConvNet(nn.Module):
     """
