@@ -1,8 +1,8 @@
 """
-ResNet-18 Multi-Seed Benchmark (Optimized Training)
-===================================================
-Evaluates GELU, Static GoLU, and Adaptive Alpha-GoLU on ResNet-18
-with Cosine Annealing learning rate schedule across N=3 seeds.
+ResNet-18 Multi-Seed Benchmark (Optimized Training + P-GELU)
+=============================================================
+Evaluates GELU, Static GoLU, Parametric GELU (P-GELU), and Adaptive Alpha-GoLU
+on ResNet-18 with Cosine Annealing learning rate schedule across N=3 seeds.
 """
 
 import torch
@@ -11,6 +11,7 @@ import numpy as np
 import torchvision
 import torchvision.transforms as transforms
 from torchvision.models import resnet18
+from models.baselines import ParametricGELU
 
 try:
     from models.alpha_golu import AlphaGoLU as AdaptiveAlphaGoLU
@@ -22,7 +23,7 @@ except ImportError:
 
 
 def replace_relus(model, act_type):
-    """Replaces ReLUs in ResNet with the target activation function."""
+    """Replaces ReLUs in ResNet modules with the target activation function."""
     for name, module in model.named_children():
         if isinstance(module, nn.ReLU):
             if act_type == 'gelu':
@@ -32,6 +33,8 @@ def replace_relus(model, act_type):
                     def forward(self, x):
                         return x * torch.exp(-torch.exp(-x))
                 setattr(model, name, StaticGoLU())
+            elif act_type == 'pgelu':
+                setattr(model, name, ParametricGELU(init_alpha=1.0))
             elif act_type == 'alpha_golu':
                 setattr(model, name, AdaptiveAlphaGoLU())
         else:
@@ -60,10 +63,10 @@ def run_resnet_eval():
 
     seeds = [42, 123, 999]
     results = {}
-    epochs = 10  # Increased to 10 epochs for proper ResNet convergence
+    epochs = 10
 
     print("================ ResNet-18 Multi-Seed Benchmark (10 Epochs + Cosine LR) ================")
-    for act_type in ['gelu', 'golu_static', 'alpha_golu']:
+    for act_type in ['gelu', 'golu_static', 'pgelu', 'alpha_golu']:
         accs = []
         for s in seeds:
             torch.manual_seed(s)
@@ -98,7 +101,7 @@ def run_resnet_eval():
 
             acc = 100.0 * correct / total
             accs.append(acc)
-            print(f"[{act_type.upper()} | Seed {s}] ResNet-18 Test Acc: {acc:.2f}%")
+            print(f"[{act_type.upper():<12} | Seed {s}] ResNet-18 Test Acc: {acc:.2f}%")
 
         mean_acc = np.mean(accs)
         std_acc = np.std(accs)
