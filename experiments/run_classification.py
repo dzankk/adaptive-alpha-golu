@@ -259,21 +259,12 @@ def run_benchmark(dataset_name="cifar10", seeds=[42, 123, 999], epochs=10):
         p_val = calculate_p_value(results['golu_static'], results['alpha_golu'])
         print(f"\nStatistical Significance (Alpha-GoLU vs Static GoLU p-value): {p_val:.4f}")
 
-def train_and_eval(activation: str = 'alpha_golu', seed: int = 42, dataset_name: str = 'cifar10', epochs: int = 10) -> float:
-    """
-    Standard interface used by cli.py and unit tests.
-    Returns test accuracy as a float.
-    """
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    acc, _ = train_single_seed(
-        act_type=activation,
-        dataset_name=dataset_name,
-        seed=seed,
-        epochs=epochs,
-        device=device
-    )
-    return float(acc)
 
+def train_and_eval(activation: str = 'alpha_golu', seed: int = 42, dataset_name: str = 'cifar10', epochs: int = 10) -> float:
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    acc, _ = train_single_seed(act_type=activation, dataset_name=dataset_name, seed=seed, epochs=epochs, device=device)
+    return float(acc)
+    
 if __name__ == '__main__':
     run_benchmark(dataset_name="cifar10", seeds=[42, 123, 999], epochs=10)
     run_benchmark(dataset_name="fashion_mnist", seeds=[42, 123, 999], epochs=10)
