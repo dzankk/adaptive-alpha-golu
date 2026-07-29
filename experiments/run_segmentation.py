@@ -1,3 +1,9 @@
+"""
+Benchmark: Semantic Segmentation (U-Net)
+Measures pixel-level target segmentation performance (mIoU) across activation functions.
+Demonstrates layer skip-connections combined with parameter-group optimization 
+(disabling weight decay for trainable activation variables like alpha and beta).
+"""
 import inspect
 import torch
 import torch.nn as nn
