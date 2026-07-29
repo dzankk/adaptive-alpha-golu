@@ -12,20 +12,6 @@ import torch.nn as nn
 import torchvision
 import torchvision.transforms as transforms
 
-try:
-    from models.alpha_golu import AlphaGoLU as AdaptiveAlphaGoLU
-except ImportError:
-    try:
-        from models.alpha_golu import AlphaGoLUModule as AdaptiveAlphaGoLU
-    except ImportError:
-        class AdaptiveAlphaGoLU(nn.Module):
-            def __init__(self, init_alpha=0.5):
-                super().__init__()
-                self.alpha = nn.Parameter(torch.tensor(float(init_alpha)))
-
-            def forward(self, x):
-                return x * torch.sigmoid(1.702 * self.alpha * x)
-
 
 def reset_seeds(seed=42):
     random.seed(seed)
@@ -36,6 +22,27 @@ def reset_seeds(seed=42):
     torch.backends.cudnn.benchmark = False
 
 
+# ==========================================
+# 1. Fixed Activation Functions
+# ==========================================
+class StaticGoLU(nn.Module):
+    """Gompertz Linear Unit: x * exp(-exp(-x))"""
+    def forward(self, x):
+        scaled = torch.clamp(-x, min=-88.0, max=88.0)
+        return x * torch.exp(-torch.exp(scaled))
+
+
+class AdaptiveAlphaGoLU(nn.Module):
+    """Adaptive Gompertz Linear Unit: x * exp(-exp(-alpha * x))"""
+    def __init__(self, init_alpha=1.0):
+        super().__init__()
+        self.alpha = nn.Parameter(torch.tensor(float(init_alpha)))
+
+    def forward(self, x):
+        scaled = torch.clamp(-self.alpha * x, min=-88.0, max=88.0)
+        return x * torch.exp(-torch.exp(scaled))
+
+
 class AdaptiveSwish(nn.Module):
     def __init__(self, init_beta=1.0):
         super().__init__()
@@ -43,11 +50,6 @@ class AdaptiveSwish(nn.Module):
 
     def forward(self, x):
         return x * torch.sigmoid(self.beta * x)
-
-
-class StaticGoLU(nn.Module):
-    def forward(self, x):
-        return x * torch.sigmoid(1.702 * x)
 
 
 def get_activation(act_type):
@@ -61,10 +63,13 @@ def get_activation(act_type):
     elif act_type == 'golu_static':
         return StaticGoLU()
     elif act_type == 'alpha_golu':
-        return AdaptiveAlphaGoLU()
+        return AdaptiveAlphaGoLU(init_alpha=1.0)
     raise ValueError(f"Unknown activation: {act_type}")
 
 
+# ==========================================
+# 2. Diffusion Architecture
+# ==========================================
 class SinusoidalPositionEmbeddings(nn.Module):
     def __init__(self, dim):
         super().__init__()
@@ -100,6 +105,9 @@ class DiffusionUNet(nn.Module):
         return self.out_conv(h)
 
 
+# ==========================================
+# 3. Benchmark Execution
+# ==========================================
 def run_diffusion_benchmark():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Running FashionMNIST DDPM Diffusion Benchmark on {device}...")
@@ -128,8 +136,13 @@ def run_diffusion_benchmark():
             reset_seeds(s)
             model = DiffusionUNet(in_channels=1, act_type=act).to(device)
 
-            alpha_params = [p for n, p in model.named_parameters() if 'alpha' in n or 'beta' in n]
-            other_params = [p for n, p in model.named_parameters() if 'alpha' not in n and 'beta' not in n]
+            alpha_params = []
+            other_params = []
+            for n, p in model.named_parameters():
+                if 'alpha' in n or 'beta' in n:
+                    alpha_params.append(p)
+                else:
+                    other_params.append(p)
 
             optimizer = torch.optim.AdamW([
                 {'params': other_params, 'lr': 2e-4, 'weight_decay': 1e-4},
