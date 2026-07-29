@@ -199,9 +199,9 @@ def train_single_seed(act_type, dataset_name="cifar10", seed=42, epochs=10, devi
             weight_params.append(p)
     
     optimizer = torch.optim.AdamW([
-        {'params': weight_params, 'lr': 1e-3, 'weight_decay': 5e-4},
-        {'params': act_params, 'lr': 1e-3, 'weight_decay': 0.0}
-    ])
+    {'params': weight_params, 'lr': 1e-3, 'weight_decay': 5e-4},
+    {'params': act_params, 'lr': 1e-4, 'weight_decay': 0.0}  # Try 1e-4 or 3e-4 for alpha!
+])
     scheduler = CosineAnnealingLR(optimizer, T_max=epochs)
     criterion = nn.CrossEntropyLoss()
 
