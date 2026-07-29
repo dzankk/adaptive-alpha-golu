@@ -15,15 +15,17 @@ from torch.utils.data import DataLoader, Dataset
 # ==========================================
 class GoLUStatic(nn.Module):
     def forward(self, x):
-        return x * torch.sigmoid(1.702 * x)
+        scaled = torch.clamp(-x, min=-88.0, max=88.0)
+        return x * torch.exp(-torch.exp(scaled))
 
 class AdaptiveAlphaGoLU(nn.Module):
-    def __init__(self, init_alpha=0.5):
+    def __init__(self, init_alpha=1.0):
         super().__init__()
         self.alpha = nn.Parameter(torch.tensor(float(init_alpha)))
 
     def forward(self, x):
-        return x * torch.sigmoid(1.702 * self.alpha * x)
+        scaled = torch.clamp(-self.alpha * x, min=-88.0, max=88.0)
+        return x * torch.exp(-torch.exp(scaled))
 
 class SwishAdaptive(nn.Module):
     def __init__(self, init_beta=1.0):
@@ -42,11 +44,9 @@ def get_activation(act_type: str) -> nn.Module:
     elif act_type == 'golu_static':
         return GoLUStatic()
     elif act_type == 'alpha_golu':
-        sig = inspect.signature(AdaptiveAlphaGoLU)
-        return AdaptiveAlphaGoLU(init_alpha=0.50) if 'init_alpha' in sig.parameters else AdaptiveAlphaGoLU()
+        return AdaptiveAlphaGoLU(init_alpha=1.0)
     elif act_type == 'swish_adaptive':
-        sig = inspect.signature(SwishAdaptive)
-        return SwishAdaptive(init_beta=1.00) if 'init_beta' in sig.parameters else SwishAdaptive()
+        return SwishAdaptive(init_beta=1.0)
     else:
         raise ValueError(f"Unknown activation type: {act_type}")
 
@@ -63,7 +63,7 @@ def get_optimizer(model: nn.Module, lr: float = 1e-3, weight_decay: float = 1e-4
 
     param_groups = [{'params': base_params, 'weight_decay': weight_decay}]
     if act_params:
-        param_groups.append({'params': act_params, 'lr': lr * 5.0, 'weight_decay': 0.0})
+        param_groups.append({'params': act_params, 'lr': lr, 'weight_decay': 0.0})
 
     return optim.AdamW(param_groups, lr=lr)
 
@@ -86,6 +86,9 @@ class FPN(nn.Module):
 class RetinaHead(nn.Module):
     def __init__(self, num_classes=5, num_anchors=3, act_type='relu'):
         super().__init__()
+        self.num_classes = num_classes
+        self.num_anchors = num_anchors
+        
         self.cls_head = nn.Sequential(
             nn.Conv2d(32, 32, 3, padding=1),
             get_activation(act_type),
@@ -121,7 +124,8 @@ class SyntheticDetectionDataset(Dataset):
 
     def __getitem__(self, idx):
         img = torch.randn(3, 64, 64)
-        cls_target = torch.randint(0, 5, (15, 16, 16))
+        # Target classes for 16x16 spatial map with 3 anchors per location
+        cls_target = torch.randint(0, 5, (3, 16, 16), dtype=torch.long)
         box_target = torch.randn(12, 16, 16)
         return img, cls_target, box_target
 
@@ -146,7 +150,13 @@ def run_detection_benchmark():
                 optimizer.zero_grad()
                 
                 cls_logits, box_preds = model(img)
-                loss_cls = cls_loss_fn(cls_logits, cls_target)
+                
+                # Reshape cls_logits from (B, 15, 16, 16) -> (B * 3, 5, 16, 16) to align with CrossEntropyLoss
+                B, C_total, H, W = cls_logits.shape
+                cls_logits_reshaped = cls_logits.view(B, 3, 5, H, W).view(-1, 5, H, W)
+                cls_target_reshaped = cls_target.view(-1, H, W)
+                
+                loss_cls = cls_loss_fn(cls_logits_reshaped, cls_target_reshaped)
                 loss_box = box_loss_fn(box_preds, box_target)
                 
                 loss = loss_cls + loss_box
@@ -158,4 +168,4 @@ def run_detection_benchmark():
         print(f"Activation: {act_type.ljust(15)} | Validation Loss: {avg_loss:.4f}")
 
 if __name__ == '__main__':
-    run_detection_benchmark()
+    run_benchmark()
