@@ -1,8 +1,8 @@
-
 """
-ResNet-18 Multi-Seed Benchmark
-===============================
-Evaluates GELU, Static GoLU, and Adaptive Alpha-GoLU on ResNet-18 (N=3 seeds).
+ResNet-18 Multi-Seed Benchmark (Optimized Training)
+===================================================
+Evaluates GELU, Static GoLU, and Adaptive Alpha-GoLU on ResNet-18
+with Cosine Annealing learning rate schedule across N=3 seeds.
 """
 
 import torch
@@ -60,8 +60,9 @@ def run_resnet_eval():
 
     seeds = [42, 123, 999]
     results = {}
+    epochs = 10  # Increased to 10 epochs for proper ResNet convergence
 
-    print("================ ResNet-18 Multi-Seed Benchmark (N=3) ================")
+    print("================ ResNet-18 Multi-Seed Benchmark (10 Epochs + Cosine LR) ================")
     for act_type in ['gelu', 'golu_static', 'alpha_golu']:
         accs = []
         for s in seeds:
@@ -71,10 +72,11 @@ def run_resnet_eval():
             replace_relus(model, act_type)
             model = model.to(device)
 
-            optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+            optimizer = torch.optim.AdamW(model.parameters(), lr=0.001, weight_decay=1e-4)
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
             criterion = nn.CrossEntropyLoss()
 
-            for epoch in range(5):
+            for epoch in range(epochs):
                 model.train()
                 for inputs, labels in trainloader:
                     inputs, labels = inputs.to(device), labels.to(device)
@@ -82,6 +84,7 @@ def run_resnet_eval():
                     loss = criterion(model(inputs), labels)
                     loss.backward()
                     optimizer.step()
+                scheduler.step()
 
             model.eval()
             correct, total = 0, 0
@@ -95,13 +98,13 @@ def run_resnet_eval():
 
             acc = 100.0 * correct / total
             accs.append(acc)
-            print(f"[{act_type.upper()} | Seed {s}] ResNet-18 CIFAR-10 Acc: {acc:.2f}%")
+            print(f"[{act_type.upper()} | Seed {s}] ResNet-18 Test Acc: {acc:.2f}%")
 
         mean_acc = np.mean(accs)
         std_acc = np.std(accs)
         results[act_type] = (mean_acc, std_acc)
 
-    print("\n================ RESNET-18 RESULTS SUMMARY ================")
+    print("\n================ RESNET-18 OPTIMIZED SUMMARY ================")
     for act_type, (mean, std) in results.items():
         print(f"  {act_type.upper():<12}: {mean:.2f}% ± {std:.2f}%")
 
