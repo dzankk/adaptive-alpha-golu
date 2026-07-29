@@ -167,5 +167,11 @@ def run_detection_benchmark():
         avg_loss = total_loss / (len(loader) * 2)
         print(f"Activation: {act_type.ljust(15)} | Validation Loss: {avg_loss:.4f}")
 
+def train_and_eval(activation: str = 'alpha_golu', seed: int = 42, epochs: int = 10) -> float:
+    """Returns Mean Average Precision (mAP)."""
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    map_score = train_single_seed_detection(act_type=activation, seed=seed, epochs=epochs, device=device)
+    return float(map_score)
+    
 if __name__ == '__main__':
     run_benchmark()
