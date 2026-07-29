@@ -17,6 +17,10 @@ def get_activation_layer(act_name: str, init_alpha: float = 1.0) -> nn.Module:
         return nn.GELU()
     elif act_name == 'swish':
         return nn.SiLU()
+    elif act_name == 'prelu':
+        return nn.PReLU(init=init_alpha)
+    elif act_name == 'pgelu':
+        return ParametricGELU(init_alpha=init_alpha)
     elif act_name == 'golu_static':
         return StaticGoLU()
     elif act_name == 'alpha_golu':
