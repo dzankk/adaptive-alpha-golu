@@ -1,17 +1,19 @@
 """
 Alpha-Gompertz Linear Unit (Alpha-GoLU) Module
 ==============================================
-This module implements both standard (Static) GoLU and the parameterized 
+This module implements standard (Static) GoLU and the parameterized 
 Adaptive Gompertz Linear Unit (Alpha-GoLU). Alpha-GoLU parameterizes the 
 double-exponential Gumbel CDF gate, allowing backpropagation to autonomously 
 optimize layer-wise asymmetry and latent variance squeezing boundaries.
 
-Author: Your Research Team
+Author: Džana Kopić
 Paper Reference: Gompertz Linear Units (Das et al., 2025)
 """
 
+import math
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 class LatentVarianceTracker(nn.Module):
@@ -43,87 +45,8 @@ class StaticGoLU(nn.Module):
         super().__init__()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Clamp exponent to prevent numerical float32 overflow/underflow
-        scaled_x = torch.clamp(-x, min=-88.0, max=88.0)
-        gate = torch.exp(-torch.exp(scaled_x))
-        return x * gate
-
-
-class AlphaGoLU(nn.Module):
-    """
-    Parameterized Adaptive Gompertz Linear Unit (Alpha-GoLU).
-    
-    Mathematical Formulation:
-        AlphaGoLU(x) = x * exp(-exp(-alpha * x))
-        
-    Attributes:
-        num_parameters (int): Number of learnable alpha parameters. 
-            1 for layer-wide scalar, or C for channel-wise vectors.
-        init_alpha (float): Initial value for parameter alpha (Default: 1.0).
-        alpha (nn.Parameter): Learnable scaling factor governing gate asymmetry.
-    """
-    def __init__(self, num_parameters: int = 1, init_alpha: float = 1.0):
-        super().__init__()
-        self.num_parameters = num_parameters
-        self.alpha = nn.Parameter(
-            torch.full((num_parameters,), float(init_alpha), dtype=torch.float32)
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Broadcast channel-wise vs. scalar parameters
-        if self.num_parameters > 1:
-            if x.dim() == 4:     # CNN Feature Map (B, C, H, W)
-                shape = (1, -1, 1, 1)
-            elif x.dim() == 3:   # Transformer Sequence (B, L, C)
-                shape = (1, 1, -1)
-            else:               # Standard Linear Output (B, C)
-                shape = (1, -1)
-            alpha_param = self.alpha.view(*shape)
-        else:
-            alpha_param = self.alpha
-
-        # Compute double-exponential Gompertz gate with safe clamping
-        scaled_x = torch.clamp(-alpha_param * x, min=-88.0, max=88.0)
-        gate = torch.exp(-torch.exp(scaled_x))
-        return x * gate
-
-    def get_alpha_val(self) -> torch.Tensor:
-        """Returns the current alpha parameter tensor for logging."""
-        return self.alpha.detach()
-
-    def extra_repr(self) -> str:
-        if self.num_parameters == 1:
-            return f"num_parameters=1, current_alpha={self.alpha.item():.4f}"
-        return f"num_parameters={self.num_parameters}, mean_alpha={self.alpha.mean().item():.4f}""""
-Alpha-Gompertz Linear Unit (Alpha-GoLU) Module
-==============================================
-This module implements both standard (Static) GoLU and the parameterized 
-Adaptive Gompertz Linear Unit (Alpha-GoLU). Alpha-GoLU parameterizes the 
-double-exponential Gumbel CDF gate, allowing backpropagation to autonomously 
-optimize layer-wise asymmetry and latent variance squeezing boundaries.
-
-Author: Your Research Team
-Paper Reference: Gompertz Linear Units (Das et al., 2025)
-"""
-
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-
-
-class StaticGoLU(nn.Module):
-    """
-    Standard unparameterized Gompertz Linear Unit (Das et al., 2025).
-    
-    Mathematical Formulation:
-        GoLU(x) = x * exp(-exp(-x))
-    """
-    def __init__(self):
-        super(StaticGoLU, self).__init__()
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Clamped inside exp to prevent numerical overflow in double-exp
-        scaled_x = torch.clamp(x, min=-88.0, max=88.0)
+        scaled_x = torch.clamp(x, min=-15.0, max=15.0)
         gate = torch.exp(-torch.exp(-scaled_x))
         return x * gate
 
@@ -134,46 +57,62 @@ class AlphaGoLU(nn.Module):
     
     Mathematical Formulation:
         AlphaGoLU(x) = x * exp(-exp(-alpha * x))
+        where alpha = softplus(raw_alpha) > 0
         
     Attributes:
         num_parameters (int): Number of learnable alpha parameters. 
             1 for layer-wide scalar, or C for channel-wise vectors.
-        init_alpha (float): Initial value for the parameter alpha (Default: 1.0).
-        alpha (nn.Parameter): Learnable scaling factor governing gate asymmetry.
+        init_alpha (float): Initial target value for parameter alpha (Default: 1.0).
+        raw_alpha (nn.Parameter): Learnable raw parameter mapped through softplus.
     """
     def __init__(self, num_parameters: int = 1, init_alpha: float = 1.0):
-        super(AlphaGoLU, self).__init__()
+        super().__init__()
         self.num_parameters = num_parameters
-        # Initialize alpha as a learnable parameter tensor
-        self.alpha = nn.Parameter(
-            torch.full((num_parameters,), float(init_alpha), dtype=torch.float32)
+        
+        # Inverse softplus initialization: softplus(raw_alpha) == init_alpha
+        # Formula: raw = log(exp(init_alpha) - 1.0)
+        init_val = float(init_alpha)
+        init_raw = math.log(math.exp(init_val) - 1.0) if init_val < 20 else init_val
+        
+        self.raw_alpha = nn.Parameter(
+            torch.full((num_parameters,), init_raw, dtype=torch.float32)
         )
 
+    @property
+    def alpha(self) -> torch.Tensor:
+        """Guarantees alpha is strictly positive (alpha > 0)."""
+        return F.softplus(self.raw_alpha)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        current_alpha = self.alpha
+
         # Handle dimensional broadcasting for channel-wise vs layer-wide parameters
         if self.num_parameters > 1:
             if x.dim() == 4:     # CNN Feature Map (B, C, H, W)
                 shape = (1, -1, 1, 1)
             elif x.dim() == 3:   # Transformer Sequence (B, L, C)
                 shape = (1, 1, -1)
-            else:               # Standard Linear Output (B, C)
+            else:                # Standard Linear Output (B, C)
                 shape = (1, -1)
-            alpha_param = self.alpha.view(*shape)
+            alpha_param = current_alpha.view(*shape)
         else:
-            alpha_param = self.alpha
+            alpha_param = current_alpha
 
-        # Scaled input with numerical safety bounds (fp32 double-exp limit is ~88.0)
-        scaled_x = torch.clamp(-alpha_param * x, min=-88.0, max=88.0)
+        # Compute double-exponential Gompertz gate with safe numerical bounds
+        scaled_x = torch.clamp(-alpha_param * x, min=-15.0, max=15.0)
         gate = torch.exp(-torch.exp(scaled_x))
         return x * gate
 
     def get_alpha_val(self) -> torch.Tensor:
-        """
-        Returns the current alpha parameter tensor for tracking/logging.
-        """
+        """Returns the current alpha parameter tensor for tracking/logging."""
         return self.alpha.detach()
 
     def extra_repr(self) -> str:
+        current_a = self.alpha.detach()
         if self.num_parameters == 1:
-            return f"num_parameters=1, current_alpha={self.alpha.item():.4f}"
-        return f"num_parameters={self.num_parameters}, mean_alpha={self.alpha.mean().item():.4f}"
+            return f"num_parameters=1, current_alpha={current_a.item():.4f}"
+        return f"num_parameters={self.num_parameters}, mean_alpha={current_a.mean().item():.4f}"
+
+
+# Alias for backward compatibility across experiment runners
+AdaptiveAlphaGoLU = AlphaGoLU
