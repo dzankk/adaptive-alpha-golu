@@ -4,6 +4,7 @@ Unified ResNet-18 runner for CIFAR-10 and Fashion-MNIST across multi-seed evalua
 Supports GELU, Swish, Adaptive Swish, PReLU, Static GoLU, and Adaptive Alpha-GoLU.
 """
 
+import inspect
 import random
 import numpy as np
 import torch
@@ -20,20 +21,6 @@ except ImportError:
     def calculate_p_value(a, b):
         return 0.05
 
-try:
-    from models.alpha_golu import AlphaGoLU as AdaptiveAlphaGoLU
-except ImportError:
-    try:
-        from models.alpha_golu import AlphaGoLUModule as AdaptiveAlphaGoLU
-    except ImportError:
-        class AdaptiveAlphaGoLU(nn.Module):
-            def __init__(self, init_alpha=0.5):
-                super().__init__()
-                self.alpha = nn.Parameter(torch.tensor(float(init_alpha)))
-
-            def forward(self, x):
-                return x * torch.sigmoid(1.702 * self.alpha * x)
-
 
 def reset_all_seeds(seed=42):
     random.seed(seed)
@@ -42,6 +29,27 @@ def reset_all_seeds(seed=42):
     torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
+
+
+# ==========================================
+# 1. Fixed Activation Implementations
+# ==========================================
+class StaticGoLU(nn.Module):
+    """Correct Gompertz Linear Unit: x * exp(-exp(-x))"""
+    def forward(self, x):
+        scaled = torch.clamp(-x, min=-88.0, max=88.0)
+        return x * torch.exp(-torch.exp(scaled))
+
+
+class AdaptiveAlphaGoLU(nn.Module):
+    """Adaptive Gompertz Linear Unit: x * exp(-exp(-alpha * x))"""
+    def __init__(self, init_alpha=1.0):
+        super().__init__()
+        self.alpha = nn.Parameter(torch.tensor(float(init_alpha)))
+
+    def forward(self, x):
+        scaled = torch.clamp(-self.alpha * x, min=-88.0, max=88.0)
+        return x * torch.exp(-torch.exp(scaled))
 
 
 class AdaptiveSwish(nn.Module):
@@ -53,11 +61,9 @@ class AdaptiveSwish(nn.Module):
         return x * torch.sigmoid(self.beta * x)
 
 
-class StaticGoLU(nn.Module):
-    def forward(self, x):
-        return x * torch.sigmoid(1.702 * x)
-
-
+# ==========================================
+# 2. ResNet Architecture
+# ==========================================
 class ResNetBlock(nn.Module):
     def __init__(self, in_planes, planes, stride=1, act_type='alpha_golu'):
         super().__init__()
@@ -78,18 +84,19 @@ class ResNetBlock(nn.Module):
         self.act2 = self._get_act()
 
     def _get_act(self):
-        if self.act_type == 'gelu':
+        act_type = self.act_type.lower()
+        if act_type == 'gelu':
             return nn.GELU()
-        elif self.act_type == 'swish':
+        elif act_type == 'swish':
             return nn.SiLU()
-        elif self.act_type == 'swish_adaptive':
-            return AdaptiveSwish()
-        elif self.act_type == 'prelu':
+        elif act_type == 'swish_adaptive':
+            return AdaptiveSwish(init_beta=1.0)
+        elif act_type == 'prelu':
             return nn.PReLU()
-        elif self.act_type == 'golu_static':
+        elif act_type == 'golu_static':
             return StaticGoLU()
-        elif self.act_type == 'alpha_golu':
-            return AdaptiveAlphaGoLU()
+        elif act_type == 'alpha_golu':
+            return AdaptiveAlphaGoLU(init_alpha=1.0)
         else:
             raise ValueError(f"Unknown activation type: {self.act_type}")
 
@@ -105,22 +112,13 @@ class ResNet18(nn.Module):
     def __init__(self, num_classes=10, act_type='alpha_golu'):
         super().__init__()
         self.in_planes = 64
+        self.act_type = act_type
+        
         self.conv1 = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
         self.bn1 = nn.BatchNorm2d(64)
         
-        self.act_type = act_type
-        if act_type == 'gelu':
-            self.act = nn.GELU()
-        elif act_type == 'swish':
-            self.act = nn.SiLU()
-        elif act_type == 'swish_adaptive':
-            self.act = AdaptiveSwish()
-        elif act_type == 'prelu':
-            self.act = nn.PReLU()
-        elif act_type == 'golu_static':
-            self.act = StaticGoLU()
-        elif act_type == 'alpha_golu':
-            self.act = AdaptiveAlphaGoLU()
+        block_tmp = ResNetBlock(64, 64, act_type=act_type)
+        self.act = block_tmp._get_act()
 
         self.layer1 = self._make_layer(64, 2, stride=1, act_type=act_type)
         self.layer2 = self._make_layer(128, 2, stride=2, act_type=act_type)
@@ -129,7 +127,7 @@ class ResNet18(nn.Module):
         self.linear = nn.Linear(512, num_classes)
 
     def _make_layer(self, planes, num_blocks, stride, act_type):
-        strides = [stride] + [1]*(num_blocks-1)
+        strides = [stride] + [1] * (num_blocks - 1)
         layers = []
         for s in strides:
             layers.append(ResNetBlock(self.in_planes, planes, s, act_type))
@@ -150,7 +148,7 @@ class ResNet18(nn.Module):
     def extract_alphas(self):
         alphas = []
         for name, param in self.named_parameters():
-            if 'alpha' in name:
+            if 'alpha' in name or 'beta' in name:
                 alphas.extend(param.detach().cpu().numpy().flatten())
         return alphas
 
@@ -191,12 +189,18 @@ def train_single_seed(act_type, dataset_name="cifar10", seed=42, epochs=10, devi
     
     model = ResNet18(num_classes=10, act_type=act_type).to(device)
     
-    alpha_params = [p for n, p in model.named_parameters() if 'alpha' in n or 'beta' in n]
-    weight_params = [p for n, p in model.named_parameters() if 'alpha' not in n and 'beta' not in n]
+    # Correct parameter grouping for non-weight-decayed parameters (including PReLU)
+    act_params = []
+    weight_params = []
+    for n, p in model.named_parameters():
+        if 'alpha' in n or 'beta' in n or 'weight' in n and isinstance(dict(model.named_modules())[n.rsplit('.', 1)[0]], nn.PReLU):
+            act_params.append(p)
+        else:
+            weight_params.append(p)
     
     optimizer = torch.optim.AdamW([
         {'params': weight_params, 'lr': 1e-3, 'weight_decay': 5e-4},
-        {'params': alpha_params, 'lr': 5e-3, 'weight_decay': 0.0}
+        {'params': act_params, 'lr': 1e-3, 'weight_decay': 0.0}
     ])
     scheduler = CosineAnnealingLR(optimizer, T_max=epochs)
     criterion = nn.CrossEntropyLoss()
@@ -240,7 +244,7 @@ def run_benchmark(dataset_name="cifar10", seeds=[42, 123, 999], epochs=10):
         for s in seeds:
             acc, alphas = train_single_seed(act, dataset_name=dataset_name, seed=s, epochs=epochs, device=device)
             results[act].append(acc)
-            if act == 'alpha_golu' and alphas:
+            if 'golu' in act and alphas:
                 mean_alpha = np.mean(alphas)
                 print(f"[{act.upper():<14} | Seed {s}] Accuracy: {acc:.2f}% | Final Mean Alpha: {mean_alpha:.4f}")
             else:
