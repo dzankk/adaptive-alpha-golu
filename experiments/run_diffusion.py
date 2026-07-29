@@ -1,6 +1,7 @@
 """
-DDPM Denoising Benchmark on FashionMNIST
+Benchmark: DDPM Denoising on FashionMNIST
 Evaluates spatial noise prediction MSE on real image manifolds.
+Tests static vs. adaptive activation dynamics across multi-step diffusion steps.
 """
 
 import math
@@ -14,7 +15,16 @@ import torchvision.transforms as transforms
 try:
     from models.alpha_golu import AlphaGoLU as AdaptiveAlphaGoLU
 except ImportError:
-    from models.alpha_golu import AlphaGoLUModule as AdaptiveAlphaGoLU
+    try:
+        from models.alpha_golu import AlphaGoLUModule as AdaptiveAlphaGoLU
+    except ImportError:
+        class AdaptiveAlphaGoLU(nn.Module):
+            def __init__(self, init_alpha=0.5):
+                super().__init__()
+                self.alpha = nn.Parameter(torch.tensor(float(init_alpha)))
+
+            def forward(self, x):
+                return x * torch.sigmoid(1.702 * self.alpha * x)
 
 
 def reset_seeds(seed=42):
@@ -23,12 +33,13 @@ def reset_seeds(seed=42):
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 
 class AdaptiveSwish(nn.Module):
     def __init__(self, init_beta=1.0):
         super().__init__()
-        self.beta = nn.Parameter(torch.tensor(init_beta))
+        self.beta = nn.Parameter(torch.tensor(float(init_beta)))
 
     def forward(self, x):
         return x * torch.sigmoid(self.beta * x)
@@ -36,7 +47,7 @@ class AdaptiveSwish(nn.Module):
 
 class StaticGoLU(nn.Module):
     def forward(self, x):
-        return x * torch.exp(-torch.exp(-x))
+        return x * torch.sigmoid(1.702 * x)
 
 
 def get_activation(act_type):
@@ -50,7 +61,6 @@ def get_activation(act_type):
     elif act_type == 'golu_static':
         return StaticGoLU()
     elif act_type == 'alpha_golu':
-        # Defaulting to init_alpha=1.0 for optimal gradient dynamics
         return AdaptiveAlphaGoLU()
     raise ValueError(f"Unknown activation: {act_type}")
 
@@ -118,20 +128,18 @@ def run_diffusion_benchmark():
             reset_seeds(s)
             model = DiffusionUNet(in_channels=1, act_type=act).to(device)
 
-            # Separate learnable activation parameters (alpha/beta) for stable optimization
             alpha_params = [p for n, p in model.named_parameters() if 'alpha' in n or 'beta' in n]
             other_params = [p for n, p in model.named_parameters() if 'alpha' not in n and 'beta' not in n]
 
             optimizer = torch.optim.AdamW([
                 {'params': other_params, 'lr': 2e-4, 'weight_decay': 1e-4},
-                {'params': alpha_params, 'lr': 1e-4, 'weight_decay': 0.0}
+                {'params': alpha_params, 'lr': 1e-3, 'weight_decay': 0.0}
             ])
             criterion = nn.MSELoss()
 
             model.train()
             step_count = 0
             
-            # Train for 1000 Mini-batches
             while step_count < 1000:
                 for x0, _ in trainloader:
                     x0 = x0.to(device)
@@ -156,7 +164,7 @@ def run_diffusion_benchmark():
             model.eval()
             val_losses = []
             with torch.no_grad():
-                for x0, _ in list(trainloader)[:20]:
+                for idx, (x0, _) in zip(range(20), trainloader):
                     x0 = x0.to(device)
                     t = torch.randint(0, timesteps, (x0.size(0),), device=device).long()
                     noise = torch.randn_like(x0)
