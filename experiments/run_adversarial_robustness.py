@@ -1,12 +1,13 @@
 """
-Adversarial Robustness Benchmark
-Evaluates ResNet-18 resilience against FGSM and PGD adversarial attacks.
+Adversarial Robustness Benchmark (CIFAR-10)
+Matches the original GoLU evaluation protocol using FGSM and PGD attacks.
 """
-
 import random
 import numpy as np
 import torch
 import torch.nn as nn
+import torchvision
+import torchvision.transforms as transforms
 
 try:
     from models.alpha_golu import AlphaGoLU as AdaptiveAlphaGoLU
@@ -50,20 +51,37 @@ def get_activation(act_type):
     raise ValueError(f"Unknown activation: {act_type}")
 
 
-class SimpleClassifier(nn.Module):
-    def __init__(self, act_type='alpha_golu'):
+class ResBlock(nn.Module):
+    def __init__(self, channels, act_type):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Conv2d(3, 32, kernel_size=3, padding=1),
-            nn.BatchNorm2d(32),
-            get_activation(act_type),
-            nn.AdaptiveAvgPool2d((4, 4)),
-            nn.Flatten(),
-            nn.Linear(32 * 4 * 4, 10)
-        )
+        self.conv1 = nn.Conv2d(channels, channels, 3, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(channels)
+        self.act1 = get_activation(act_type)
+        self.conv2 = nn.Conv2d(channels, channels, 3, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(channels)
+        self.act2 = get_activation(act_type)
 
     def forward(self, x):
-        return self.net(x)
+        return self.act2(x + self.bn2(self.conv2(self.act1(self.bn1(self.conv1(x))))))
+
+
+class SmallCIFARNet(nn.Module):
+    def __init__(self, act_type='alpha_golu'):
+        super().__init__()
+        self.stem = nn.Sequential(
+            nn.Conv2d(3, 32, 3, padding=1, bias=False),
+            nn.BatchNorm2d(32),
+            get_activation(act_type)
+        )
+        self.block1 = ResBlock(32, act_type)
+        self.pool = nn.AdaptiveAvgPool2d((1, 1))
+        self.fc = nn.Linear(32, 10)
+
+    def forward(self, x):
+        x = self.stem(x)
+        x = self.block1(x)
+        x = self.pool(x)
+        return self.fc(torch.flatten(x, 1))
 
 
 def fgsm_attack(model, images, labels, epsilon=0.03):
@@ -72,59 +90,68 @@ def fgsm_attack(model, images, labels, epsilon=0.03):
     loss = nn.CrossEntropyLoss()(outputs, labels)
     model.zero_grad()
     loss.backward()
-    perturbed_images = images + epsilon * images.grad.sign()
-    return torch.clamp(perturbed_images, 0, 1)
+    return torch.clamp(images + epsilon * images.grad.sign(), -1, 1)
 
 
-def pgd_attack(model, images, labels, epsilon=0.03, alpha=0.01, iters=7):
-    original_images = images.clone().detach()
-    perturbed_images = images.clone().detach()
+def pgd_attack(model, images, labels, epsilon=0.03, alpha=0.01, iters=5):
+    orig = images.clone().detach()
+    adv = images.clone().detach()
 
     for _ in range(iters):
-        perturbed_images.requires_grad = True
-        outputs = model(perturbed_images)
+        adv.requires_grad = True
+        outputs = model(adv)
         loss = nn.CrossEntropyLoss()(outputs, labels)
         model.zero_grad()
         loss.backward()
 
-        adv = perturbed_images + alpha * perturbed_images.grad.sign()
-        eta = torch.clamp(adv - original_images, min=-epsilon, max=epsilon)
-        perturbed_images = torch.clamp(original_images + eta, min=0, max=1).detach()
+        step = adv + alpha * adv.grad.sign()
+        eta = torch.clamp(step - orig, min=-epsilon, max=epsilon)
+        adv = torch.clamp(orig + eta, min=-1, max=1).detach()
 
-    return perturbed_images
+    return adv
 
 
 def run_robustness_benchmark():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Running Adversarial Robustness Benchmark on {device}...")
+    print(f"Running Real CIFAR-10 Adversarial Robustness Benchmark on {device}...")
+
+    transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
+    ])
+
+    trainset = torchvision.datasets.CIFAR10(root='./data', train=True, download=True, transform=transform)
+    testset = torchvision.datasets.CIFAR10(root='./data', train=False, download=True, transform=transform)
+
+    trainloader = torch.utils.data.DataLoader(trainset, batch_size=128, shuffle=True, num_workers=2)
+    testloader = torch.utils.data.DataLoader(testset, batch_size=128, shuffle=False, num_workers=2)
 
     activations = ['gelu', 'swish', 'swish_adaptive', 'golu_static', 'alpha_golu']
-    epsilon = 0.05
-    results = {}
+    epsilon = 0.03
 
-    print(f"\n================ Adversarial Defense Accuracy (Epsilon = {epsilon}) ================")
+    print(f"\n================ CIFAR-10 Adversarial Robustness (Epsilon = {epsilon}) ================")
     for act in activations:
         reset_seeds(42)
-        model = SimpleClassifier(act_type=act).to(device)
-        optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+        model = SmallCIFARNet(act_type=act).to(device)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
+        criterion = nn.CrossEntropyLoss()
 
-        # Train briefly
         model.train()
-        for _ in range(150):
-            x = torch.randn(32, 3, 32, 32, device=device)
-            y = torch.randint(0, 10, (32,), device=device)
-            loss = nn.CrossEntropyLoss()(model(x), y)
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+        for epoch in range(3):
+            for x, y in trainloader:
+                x, y = x.to(device), y.to(device)
+                optimizer.zero_grad()
+                loss = criterion(model(x), y)
+                loss.backward()
+                optimizer.step()
 
         model.eval()
         clean_accs, fgsm_accs, pgd_accs = [], [], []
 
-        for _ in range(10):
-            x = torch.randn(32, 3, 32, 32, device=device)
-            y = torch.randint(0, 10, (32,), device=device)
-
+        for i, (x, y) in enumerate(testloader):
+            if i >= 10:
+                break
+            x, y = x.to(device), y.to(device)
             clean_accs.append((model(x).argmax(dim=1) == y).float().mean().item())
 
             x_fgsm = fgsm_attack(model, x, y, epsilon=epsilon)
@@ -133,7 +160,8 @@ def run_robustness_benchmark():
             x_pgd = pgd_attack(model, x, y, epsilon=epsilon)
             pgd_accs.append((model(x_pgd).argmax(dim=1) == y).float().mean().item())
 
-        print(f"[{act.upper():<14}] Clean Acc: {np.mean(clean_accs)*100:.1f}% | FGSM Acc: {np.mean(fgsm_accs)*100:.1f}% | PGD Acc: {np.mean(pgd_accs)*100:.1f}%")
+        print(f"[{act.upper():<14}] Clean Acc: {np.mean(clean_accs)*100:.2f}% | FGSM Acc: {np.mean(fgsm_accs)*100:.2f}% | PGD Acc: {np.mean(pgd_accs)*100:.2f}%")
+
 
 if __name__ == '__main__':
     run_robustness_benchmark()
