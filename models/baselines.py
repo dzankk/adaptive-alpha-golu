@@ -11,11 +11,11 @@ from models.alpha_golu import StaticGoLU, AlphaGoLU, LatentVarianceTracker
 
 
 def get_activation_layer(act_name: str, init_alpha: float = 1.0) -> nn.Module:
-    """Factory function for instantiating activation functions."""
+    """Factory function for instantiating activation functions across all experiment runners."""
     act_name = act_name.lower()
-    if act_name == 'gelu':
+    if act_name in ['gelu', 'gelu_static']:
         return nn.GELU()
-    elif act_name == 'swish':
+    elif act_name in ['swish', 'silu']:
         return nn.SiLU()
     elif act_name == 'prelu':
         return nn.PReLU(init=init_alpha)
@@ -23,8 +23,8 @@ def get_activation_layer(act_name: str, init_alpha: float = 1.0) -> nn.Module:
         return ParametricGELU(init_alpha=init_alpha)
     elif act_name == 'golu_static':
         return StaticGoLU()
-    elif act_name == 'alpha_golu':
-        return AlphaGoLU(init_alpha=init_alpha)
+    elif act_name in ['alpha_golu', 'adaptive_alpha_golu']:
+        return AlphaGoLU(init_alpha=init_alpha)  # or AdaptiveAlphaGoLU(init_alpha=init_alpha)
     else:
         raise ValueError(f"Unsupported activation function: {act_name}")
 
