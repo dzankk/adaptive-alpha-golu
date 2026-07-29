@@ -1,3 +1,9 @@
+"""
+Benchmark: Adversarial Robustness on CIFAR-10 (ResNet-18)
+Evaluates clean accuracy vs. FGSM and PGD-10 adversarial attack robustness 
+across standard (ReLU, GELU) and custom adaptive activation functions (GoLU, Swish-Adaptive).
+Ensures accurate pixel-space clamping normalized to CIFAR-10 stats.
+"""
 import os
 import time
 import inspect
