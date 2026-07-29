@@ -195,6 +195,12 @@ def run_diffusion_benchmark():
     for act, (m_loss, s_loss) in results.items():
         print(f"  {act.upper():<14}: Loss = {m_loss:.6f} ± {s_loss:.6f}")
 
+def train_and_eval(activation: str = 'alpha_golu', seed: int = 42, epochs: int = 10) -> float:
+    """Returns Fréchet Inception Distance (FID) or Test Loss."""
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    fid_or_loss = train_single_seed_diffusion(act_type=activation, seed=seed, epochs=epochs, device=device)
+    return float(fid_or_loss)
+
 
 if __name__ == '__main__':
     run_diffusion_benchmark()
