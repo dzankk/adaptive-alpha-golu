@@ -1,10 +1,11 @@
 """
 PReLU Baseline Benchmark Test
 =============================
-Evaluates Parametric ReLU (PReLU) as an adaptive activation baseline across multiple random seeds.
+Evaluates Parametric ReLU (PReLU) as an adaptive activation baseline across multiple random seeds
+using the classification runner.
 """
 
-from experiments.run_baselines import train_and_eval
+from experiments.run_classification import train_and_eval
 
 
 def run_prelu_tests():
@@ -18,7 +19,7 @@ def run_prelu_tests():
         print(f"PReLU Seed {seed} -> Accuracy: {acc:.2f}%")
 
     avg_acc = sum(results) / len(results)
-    print(f"Mean PReLU Accuracy across seeds: {avg_acc:.2f}%")
+    print(f"\nMean PReLU Accuracy: {avg_acc:.2f}%")
 
 
 if __name__ == "__main__":
