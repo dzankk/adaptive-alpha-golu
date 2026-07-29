@@ -38,6 +38,7 @@ class StaticGoLU(nn.Module):
     def forward(self, x):
         return x * torch.exp(-torch.exp(-x))
 
+
 def get_activation(act_type):
     act_type = act_type.lower()
     if act_type == 'gelu':
@@ -49,7 +50,7 @@ def get_activation(act_type):
     elif act_type == 'golu_static':
         return StaticGoLU()
     elif act_type == 'alpha_golu':
-        # Removed init_alpha=0.50 override; defaults to optimal init_alpha=1.0
+        # Defaulting to init_alpha=1.0 for optimal gradient dynamics
         return AdaptiveAlphaGoLU()
     raise ValueError(f"Unknown activation: {act_type}")
 
@@ -116,7 +117,15 @@ def run_diffusion_benchmark():
         for s in seeds:
             reset_seeds(s)
             model = DiffusionUNet(in_channels=1, act_type=act).to(device)
-            optimizer = torch.optim.AdamW(model.parameters(), lr=2e-4, weight_decay=1e-4)
+
+            # Separate learnable activation parameters (alpha/beta) for stable optimization
+            alpha_params = [p for n, p in model.named_parameters() if 'alpha' in n or 'beta' in n]
+            other_params = [p for n, p in model.named_parameters() if 'alpha' not in n and 'beta' not in n]
+
+            optimizer = torch.optim.AdamW([
+                {'params': other_params, 'lr': 2e-4, 'weight_decay': 1e-4},
+                {'params': alpha_params, 'lr': 1e-4, 'weight_decay': 0.0}
+            ])
             criterion = nn.MSELoss()
 
             model.train()
