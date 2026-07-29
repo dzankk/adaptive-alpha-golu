@@ -1,190 +1,163 @@
-"""
-Optimized Semantic Segmentation Benchmark (UNet)
-Features:
-1. Excludes learnable activation parameters (alpha, beta) from Weight Decay.
-2. Custom learning rate for shape parameters to prevent gradient collapse.
-3. Smooth initialization (alpha = 0.50) for fine-grained spatial gradient preservation.
-"""
-
-import random
-import numpy as np
+import inspect
 import torch
 import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, Dataset
 
-try:
-    from models.alpha_golu import AlphaGoLU as AdaptiveAlphaGoLU
-except ImportError:
-    from models.alpha_golu import AlphaGoLUModule as AdaptiveAlphaGoLU
+# ==========================================
+# 1. Custom Activations
+# ==========================================
+class GoLUStatic(nn.Module):
+    def forward(self, x):
+        return x * torch.sigmoid(1.702 * x)
 
+class AdaptiveAlphaGoLU(nn.Module):
+    def __init__(self, init_alpha=0.5):
+        super().__init__()
+        self.alpha = nn.Parameter(torch.tensor(float(init_alpha)))
 
-def reset_all_seeds(seed=42):
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
+    def forward(self, x):
+        return x * torch.sigmoid(1.702 * self.alpha * x)
 
-
-class AdaptiveSwish(nn.Module):
+class SwishAdaptive(nn.Module):
     def __init__(self, init_beta=1.0):
         super().__init__()
-        self.beta = nn.Parameter(torch.tensor(init_beta))
+        self.beta = nn.Parameter(torch.tensor(float(init_beta)))
 
     def forward(self, x):
         return x * torch.sigmoid(self.beta * x)
 
+def get_activation(act_type: str) -> nn.Module:
+    act_type = act_type.lower()
+    if act_type == 'relu':
+        return nn.ReLU()
+    elif act_type == 'gelu':
+        return nn.GELU()
+    elif act_type == 'golu_static':
+        return GoLUStatic()
+    elif act_type == 'alpha_golu':
+        sig = inspect.signature(AdaptiveAlphaGoLU)
+        return AdaptiveAlphaGoLU(init_alpha=0.50) if 'init_alpha' in sig.parameters else AdaptiveAlphaGoLU()
+    elif act_type == 'swish_adaptive':
+        sig = inspect.signature(SwishAdaptive)
+        return SwishAdaptive(init_beta=1.00) if 'init_beta' in sig.parameters else SwishAdaptive()
+    else:
+        raise ValueError(f"Unknown activation type: {act_type}")
 
-class StaticGoLU(nn.Module):
-    def forward(self, x):
-        return x * torch.exp(-torch.exp(-x))
-
-
-class DoubleConv(nn.Module):
-    def __init__(self, in_channels, out_channels, act_type='alpha_golu'):
-        super().__init__()
-        def get_act():
-            if act_type == 'gelu':
-                return nn.GELU()
-            elif act_type == 'swish':
-                return nn.SiLU()
-            elif act_type == 'swish_adaptive':
-                return AdaptiveSwish(init_beta=1.0)
-            elif act_type == 'golu_static':
-                return StaticGoLU()
-            elif act_type == 'alpha_golu':
-                # Smooth initialization (0.50) for segmentation tasks
-                return AdaptiveAlphaGoLU(init_alpha=0.50) if hasattr(AdaptiveAlphaGoLU, '__init__') and 'init_alpha' in AdaptiveAlphaGoLU.__init__.__code__.co_varnames else AdaptiveAlphaGoLU()
-
-        self.double_conv = nn.Sequential(
-            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(out_channels),
-            get_act(),
-            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(out_channels),
-            get_act()
-        )
-
-    def forward(self, x):
-        return self.double_conv(x)
-
-
-class UNet(nn.Module):
-    def __init__(self, n_channels=3, n_classes=2, act_type='alpha_golu'):
-        super().__init__()
-        self.inc = DoubleConv(n_channels, 32, act_type)
-        self.down1 = nn.Sequential(nn.MaxPool2d(2), DoubleConv(32, 64, act_type))
-        self.down2 = nn.Sequential(nn.MaxPool2d(2), DoubleConv(64, 128, act_type))
-        self.up1 = nn.ConvTranspose2d(128, 64, kernel_size=2, stride=2)
-        self.conv_up1 = DoubleConv(128, 64, act_type)
-        self.up2 = nn.ConvTranspose2d(64, 32, kernel_size=2, stride=2)
-        self.conv_up2 = DoubleConv(32*2, 32, act_type)
-        self.outc = nn.Conv2d(32, n_classes, kernel_size=1)
-
-    def forward(self, x):
-        x1 = self.inc(x)
-        x2 = self.down1(x1)
-        x3 = self.down2(x2)
-        x = self.up1(x3)
-        x = torch.cat([x, x2], dim=1)
-        x = self.conv_up1(x)
-        x = self.up2(x)
-        x = torch.cat([x, x1], dim=1)
-        x = self.conv_up2(x)
-        return self.outc(x)
-
-
-def get_optimizer(model, lr=1e-3, weight_decay=1e-4):
-    """Separates activation parameters (alpha/beta) from standard weight decay."""
+def get_optimizer(model: nn.Module, lr: float = 1e-3, weight_decay: float = 1e-4) -> optim.Optimizer:
     act_params = []
-    regularized_params = []
-
+    base_params = []
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
         if 'alpha' in name or 'beta' in name:
             act_params.append(param)
         else:
-            regularized_params.append(param)
+            base_params.append(param)
 
-    optimizer_grouped_parameters = [
-        {'params': regularized_params, 'weight_decay': weight_decay, 'lr': lr},
-        {'params': act_params, 'weight_decay': 0.0, 'lr': lr * 5.0}  # Higher LR, Zero Weight Decay
-    ]
-    return torch.optim.AdamW(optimizer_grouped_parameters)
+    param_groups = [{'params': base_params, 'weight_decay': weight_decay}]
+    if act_params:
+        param_groups.append({'params': act_params, 'lr': lr * 5.0, 'weight_decay': 0.0})
 
+    return optim.AdamW(param_groups, lr=lr)
 
-def compute_miou(preds, targets, num_classes=2):
-    ious = []
-    preds = torch.argmax(preds, dim=1)
-    for cls in range(num_classes):
-        pred_inds = (preds == cls)
-        target_inds = (targets == cls)
-        intersection = (pred_inds & target_inds).long().sum().item()
-        union = (pred_inds | target_inds).long().sum().item()
-        if union > 0:
-            ious.append(intersection / union)
-    return np.mean(ious) if ious else 0.0
+# ==========================================
+# 2. U-Net Architecture
+# ==========================================
+class UNetBlock(nn.Module):
+    def __init__(self, in_ch, out_ch, act_type):
+        super().__init__()
+        self.conv = nn.Sequential(
+            nn.Conv2d(in_ch, out_ch, 3, padding=1),
+            nn.BatchNorm2d(out_ch),
+            get_activation(act_type),
+            nn.Conv2d(out_ch, out_ch, 3, padding=1),
+            nn.BatchNorm2d(out_ch),
+            get_activation(act_type)
+        )
 
+    def forward(self, x):
+        return self.conv(x)
 
-def generate_hard_batch(batch_size=32, device='cuda'):
-    images = torch.randn(batch_size, 3, 64, 64) * 1.5
-    masks = torch.zeros(batch_size, 64, 64, dtype=torch.long)
-    for i in range(batch_size):
-        cx, cy = np.random.randint(20, 44, size=2)
-        x, y = torch.meshgrid(torch.arange(64), torch.arange(64), indexing='ij')
-        dist = (x - cx)**2 + (y - cy)**2
-        mask = ((dist < 250) & (torch.rand(64, 64) > 0.25)).long()
-        masks[i] = mask
-        images[i, 0] += mask.float() * 1.2
-        images[i, 1] += torch.sin(x.float()/5.0) * mask.float()
-    return images.to(device), masks.to(device)
+class UNet(nn.Module):
+    def __init__(self, in_channels=3, num_classes=1, act_type='relu'):
+        super().__init__()
+        self.enc1 = UNetBlock(in_channels, 32, act_type)
+        self.pool1 = nn.MaxPool2d(2)
+        self.enc2 = UNetBlock(32, 64, act_type)
+        self.pool2 = nn.MaxPool2d(2)
+        
+        self.bottleneck = UNetBlock(64, 128, act_type)
 
+        self.up2 = nn.ConvTranspose2d(128, 64, 2, stride=2)
+        self.dec2 = UNetBlock(128, 64, act_type)
+        self.up1 = nn.ConvTranspose2d(64, 32, 2, stride=2)
+        self.dec1 = UNetBlock(64, 32, act_type)
+
+        self.head = nn.Conv2d(32, num_classes, 1)
+
+    def forward(self, x):
+        e1 = self.enc1(x)
+        e2 = self.enc2(self.pool1(e1))
+        b = self.bottleneck(self.pool2(e2))
+        
+        d2 = self.up2(b)
+        d2 = self.dec2(torch.cat([d2, e2], dim=1))
+        d1 = self.up1(d2)
+        d1 = self.dec1(torch.cat([d1, e1], dim=1))
+        return self.head(d1)
+
+# ==========================================
+# 3. Synthetic Dataset & Metrics
+# ==========================================
+class SyntheticSegmentationDataset(Dataset):
+    def __len__(self):
+        return 100
+
+    def __getitem__(self, idx):
+        x = torch.randn(3, 128, 128)
+        y = (x[0:1] > 0.5).float()
+        return x, y
+
+def compute_mIoU(preds, targets, threshold=0.5):
+    preds_binary = (torch.sigmoid(preds) > threshold).float()
+    intersection = (preds_binary * targets).sum(dim=[2, 3])
+    union = (preds_binary + targets - preds_binary * targets).sum(dim=[2, 3])
+    iou = (intersection + 1e-6) / (union + 1e-6)
+    return iou.mean().item()
 
 def run_segmentation_benchmark():
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Running Optimized UNet Segmentation Benchmark on {device}...")
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Running Segmentation Benchmark on {device}")
 
-    activations = ['gelu', 'swish', 'swish_adaptive', 'golu_static', 'alpha_golu']
-    seeds = [42, 123]
-    results = {}
+    loader = DataLoader(SyntheticSegmentationDataset(), batch_size=8, shuffle=True)
+    activations = ['relu', 'gelu', 'golu_static', 'alpha_golu', 'swish_adaptive']
 
-    print("\n================ Hard Semantic Segmentation (Mean IoU ↑) ================")
     for act_type in activations:
-        mious = []
-        for s in seeds:
-            reset_all_seeds(s)
-            model = UNet(n_channels=3, n_classes=2, act_type=act_type).to(device)
-            optimizer = get_optimizer(model, lr=1e-3, weight_decay=1e-4)
-            criterion = nn.CrossEntropyLoss()
+        model = UNet(act_type=act_type).to(device)
+        optimizer = get_optimizer(model)
+        criterion = nn.BCEWithLogitsLoss()
 
-            model.train()
-            for step in range(300):
-                xb, yb = generate_hard_batch(batch_size=32, device=device)
-                logits = model(xb)
-                loss = criterion(logits, yb)
+        model.train()
+        for epoch in range(2):
+            for x, y in loader:
+                x, y = x.to(device), y.to(device)
                 optimizer.zero_grad()
+                out = model(x)
+                loss = criterion(out, y)
                 loss.backward()
                 optimizer.step()
 
-            model.eval()
-            val_ious = []
-            with torch.no_grad():
-                for _ in range(20):
-                    xb, yb = generate_hard_batch(batch_size=32, device=device)
-                    logits = model(xb)
-                    miou = compute_miou(logits, yb)
-                    val_ious.append(miou)
+        model.eval()
+        total_iou = 0.0
+        with torch.no_grad():
+            for x, y in loader:
+                x, y = x.to(device), y.to(device)
+                out = model(x)
+                total_iou += compute_mIoU(out, y)
 
-            mean_val_miou = np.mean(val_ious)
-            mious.append(mean_val_miou)
-            print(f"[{act_type.upper():<14} | Seed {s}] Validation Mean IoU: {mean_val_miou:.4f}")
-
-        results[act_type] = (np.mean(mious), np.std(mious))
-
-    print("\n================ OPTIMIZED SEGMENTATION SUMMARY ================")
-    for act_type, (mean_miou, std_miou) in results.items():
-        print(f"  {act_type.upper():<14}: Mean IoU = {mean_miou:.4f} ± {std_miou:.4f}")
+        mean_iou = total_iou / len(loader)
+        print(f"Activation: {act_type.ljust(15)} | Validation mIoU: {mean_iou:.4f}")
 
 if __name__ == '__main__':
     run_segmentation_benchmark()
