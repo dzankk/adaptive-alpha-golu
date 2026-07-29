@@ -173,5 +173,11 @@ def run_lm_benchmark():
         perplexity = math.exp(avg_loss)
         print(f"Activation: {act_type.ljust(15)} | Test Perplexity: {perplexity:.2f}")
 
+def train_and_eval(activation: str = 'alpha_golu', seed: int = 42, epochs: int = 10) -> float:
+    """Returns Perplexity (PPL)."""
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    ppl = train_single_seed_lm(act_type=activation, seed=seed, epochs=epochs, device=device)
+    return float(ppl)
+    
 if __name__ == '__main__':
     run_lm_benchmark()
