@@ -18,7 +18,15 @@ from torch.utils.data import DataLoader
 try:
     from models.alpha_golu import AlphaGoLU as AdaptiveAlphaGoLU
 except ImportError:
-    from models.alpha_golu import AlphaGoLUModule as AdaptiveAlphaGoLU
+    class AdaptiveAlphaGoLU(nn.Module):
+        """Fallback implementation if local module is missing"""
+        def __init__(self, init_alpha=1.0):
+            super().__init__()
+            self.alpha = nn.Parameter(torch.tensor(float(init_alpha)))
+
+        def forward(self, x):
+            scaled = torch.clamp(-self.alpha * x, min=-88.0, max=88.0)
+            return x * torch.exp(-torch.exp(scaled))
 
 
 def reset_all_seeds(seed=42):
@@ -34,9 +42,10 @@ def reset_all_seeds(seed=42):
 # 1. Custom Activation Implementations
 # ==========================================
 class StaticGoLU(nn.Module):
-    """Correct Gompertz activation: x * exp(-exp(-x))"""
+    """Correct & numerically stable Gompertz activation: x * exp(-exp(-x))"""
     def forward(self, x):
-        return x * torch.exp(-torch.exp(-x))
+        scaled = torch.clamp(-x, min=-88.0, max=88.0)
+        return x * torch.exp(-torch.exp(scaled))
 
 
 class SwishAdaptive(nn.Module):
@@ -63,7 +72,7 @@ def get_activation(act_type: str) -> nn.Module:
         return StaticGoLU()
     elif act_type == 'alpha_golu':
         sig = inspect.signature(AdaptiveAlphaGoLU)
-        return AdaptiveAlphaGoLU(init_alpha=0.50) if 'init_alpha' in sig.parameters else AdaptiveAlphaGoLU()
+        return AdaptiveAlphaGoLU(init_alpha=1.00) if 'init_alpha' in sig.parameters else AdaptiveAlphaGoLU()
     elif act_type == 'swish_adaptive':
         sig = inspect.signature(SwishAdaptive)
         return SwishAdaptive(init_beta=1.00) if 'init_beta' in sig.parameters else SwishAdaptive()
@@ -84,7 +93,7 @@ def get_optimizer(model: nn.Module, lr: float = 1e-3, weight_decay: float = 1e-4
 
     param_groups = [{'params': base_params, 'weight_decay': weight_decay}]
     if act_params:
-        param_groups.append({'params': act_params, 'lr': lr * 5.0, 'weight_decay': 0.0})
+        param_groups.append({'params': act_params, 'lr': lr, 'weight_decay': 0.0})
 
     return optim.AdamW(param_groups, lr=lr)
 
@@ -155,7 +164,7 @@ class ResNet18(nn.Module):
 
 
 # ==========================================
-# 4. Adversarial Attack Utilities
+# 4. Adversarial Attack Utilities (Fixed Clamping)
 # ==========================================
 CIFAR_MEAN = torch.tensor([0.4914, 0.4822, 0.4465]).view(1, 3, 1, 1)
 CIFAR_STD = torch.tensor([0.2023, 0.1994, 0.2010]).view(1, 3, 1, 1)
@@ -182,7 +191,8 @@ def fgsm_attack(model, images, labels, eps=8/255):
     loss.backward()
 
     perturbed = images_req + eps_norm * images_req.grad.sign()
-    return torch.clamp(perturbed, min_val, max_val)
+    # Element-wise tensor clamping
+    return torch.max(torch.min(perturbed, max_val), min_val)
 
 
 def pgd_attack(model, images, labels, eps=8/255, alpha=2/255, iters=10):
@@ -195,7 +205,7 @@ def pgd_attack(model, images, labels, eps=8/255, alpha=2/255, iters=10):
 
     ori_images = images.clone().detach()
     perturbed = images.clone().detach() + (torch.rand_like(images) - 0.5) * 2 * eps_norm
-    perturbed = torch.clamp(perturbed, min_val, max_val)
+    perturbed = torch.max(torch.min(perturbed, max_val), min_val)
 
     for _ in range(iters):
         perturbed.requires_grad = True
@@ -205,8 +215,11 @@ def pgd_attack(model, images, labels, eps=8/255, alpha=2/255, iters=10):
         loss.backward()
 
         adv_images = perturbed + alpha_norm * perturbed.grad.sign()
-        eta = torch.clamp(adv_images - ori_images, min=-eps_norm, max=eps_norm)
-        perturbed = torch.clamp(ori_images + eta, min_val, max_val).detach()
+        diff = adv_images - ori_images
+        
+        # Element-wise bounds clamping
+        eta = torch.max(torch.min(diff, eps_norm), -eps_norm)
+        perturbed = torch.max(torch.min(ori_images + eta, max_val), min_val).detach()
 
     return perturbed
 
@@ -235,7 +248,7 @@ def run_benchmark():
     testset = torchvision.datasets.CIFAR10(root='./data', train=False, download=True, transform=transform_test)
     test_loader = DataLoader(testset, batch_size=64, shuffle=False, num_workers=2)
 
-    activations = ['relu', 'gelu', 'golu_static', 'alpha_golu', 'swish_adaptive']
+    activations = ['relu', 'gelu', 'swish', 'golu_static', 'alpha_golu', 'swish_adaptive']
 
     for act_type in activations:
         print(f"\n--- Evaluated Activation: {act_type.upper()} ---")
@@ -244,10 +257,10 @@ def run_benchmark():
         optimizer = get_optimizer(model)
         criterion = nn.CrossEntropyLoss()
         
-        # Train for 3 epochs so weights learn meaningful features before testing robustness
         print("Training model for 3 epochs before robustness check...")
         for epoch in range(3):
             model.train()
+            running_loss = 0.0
             for inputs, targets in train_loader:
                 inputs, targets = inputs.to(device), targets.to(device)
                 optimizer.zero_grad()
@@ -255,13 +268,15 @@ def run_benchmark():
                 loss = criterion(outputs, targets)
                 loss.backward()
                 optimizer.step()
+                running_loss += loss.item()
+            print(f"Epoch {epoch+1}/3 Loss: {running_loss/len(train_loader):.4f}")
 
         model.eval()
         clean_correct, fgsm_correct, pgd_correct, total = 0, 0, 0, 0
 
         for idx, (images, labels) in enumerate(test_loader):
             if idx > 15: 
-                break  # Fast verification pass across 1000 images
+                break  # Fast verification pass across ~1000 images
             images, labels = images.to(device), labels.to(device)
             
             with torch.no_grad():
