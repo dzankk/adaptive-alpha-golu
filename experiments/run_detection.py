@@ -1,3 +1,9 @@
+"""
+Benchmark: Dense Object Detection (Mini-RetinaNet + FPN)
+Benchmarking activation dynamics across multi-scale feature pyramids (FPN) 
+and parallel multi-head architectures (classification vs. bounding box regression).
+Calculates combined loss (Cross-Entropy + Smooth L1) across activation variants.
+"""
 import inspect
 import torch
 import torch.nn as nn
