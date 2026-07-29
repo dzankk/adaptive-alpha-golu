@@ -1,11 +1,11 @@
 """
-Unit tests for activation factory function across all comparative baselines.
+Unit tests for activation layer instantiation across all comparative baselines.
 """
 
 import unittest
 import torch
 import torch.nn as nn
-from models.benchmarks import get_activation_layer
+from models.baselines import get_activation_layer
 
 
 class TestActivationFactory(unittest.TestCase):
