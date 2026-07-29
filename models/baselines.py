@@ -8,7 +8,6 @@ comparative evaluations under fixed parameter initialization seeds.
 import torch
 import torch.nn as nn
 from models.alpha_golu import StaticGoLU, AlphaGoLU, LatentVarianceTracker
-import torch.nn.functional as F
 
 
 def get_activation_layer(act_name: str, init_alpha: float = 1.0) -> nn.Module:
@@ -24,21 +23,20 @@ def get_activation_layer(act_name: str, init_alpha: float = 1.0) -> nn.Module:
         return AlphaGoLU(init_alpha=init_alpha)
     else:
         raise ValueError(f"Unsupported activation function: {act_name}")
-        
 
 
 class ParametricGELU(nn.Module):
     """
     Parametric GELU (P-GELU): x * Phi(alpha * x)
-    Uses a learnable alpha scalar per layer to scale the Gaussian CDF.
+    Uses a learnable alpha scalar per layer to scale Gaussian CDF.
     """
     def __init__(self, init_alpha=1.0):
         super().__init__()
         self.alpha = nn.Parameter(torch.tensor(float(init_alpha)))
 
     def forward(self, x):
-        # erf formulation of GELU with learnable alpha scaling
         return x * 0.5 * (1.0 + torch.erf((self.alpha * x) / 1.41421356))
+
 
 class DeepConvNet(nn.Module):
     """
@@ -46,16 +44,14 @@ class DeepConvNet(nn.Module):
     Tracks layer-wise alpha parameters and latent variance across depth.
     """
     def __init__(self, act_type: str = 'alpha_golu', num_classes: int = 10, in_channels: int = 3):
-        super(DeepConvNet, self).__init__()
+        super().__init__()
         self.act_type = act_type.lower()
         
-        # Define 4 distinct activation modules
         self.act1 = get_activation_layer(act_type)
         self.act2 = get_activation_layer(act_type)
         self.act3 = get_activation_layer(act_type)
         self.act4 = get_activation_layer(act_type)
         
-        # Wrap in variance trackers for theoretical empirical validation
         self.tr1 = LatentVarianceTracker(self.act1)
         self.tr2 = LatentVarianceTracker(self.act2)
         self.tr3 = LatentVarianceTracker(self.act3)
@@ -97,7 +93,7 @@ class DeepConvNet(nn.Module):
         return self.classifier(x)
 
     def extract_alphas(self) -> list:
-        """Returns current alpha values if using AlphaGoLU, else empty list."""
+        """Returns current alpha values if using AlphaGoLU, else static scalars."""
         if self.act_type == 'alpha_golu':
             return [
                 self.act1.get_alpha_val(),
@@ -105,7 +101,7 @@ class DeepConvNet(nn.Module):
                 self.act3.get_alpha_val(),
                 self.act4.get_alpha_val()
             ]
-        return [1.0, 1.0, 1.0, 1.0]
+        return [torch.tensor(1.0) for _ in range(4)]
 
     def extract_latent_variances(self) -> list:
         """Returns the latest post-activation variances across layers."""
