@@ -1,7 +1,8 @@
 """
-DDPM Denoising Benchmark on Fashion-MNIST Image Manifolds
-Evaluates real image residual denoising loss across activation functions.
+DDPM Denoising Benchmark on FashionMNIST
+Evaluates spatial noise prediction MSE on real image manifolds.
 """
+
 import math
 import random
 import numpy as np
@@ -39,6 +40,7 @@ class StaticGoLU(nn.Module):
 
 
 def get_activation(act_type):
+    act_type = act_type.lower()
     if act_type == 'gelu':
         return nn.GELU()
     elif act_type == 'swish':
@@ -70,15 +72,15 @@ class DiffusionUNet(nn.Module):
     def __init__(self, in_channels=1, act_type='alpha_golu'):
         super().__init__()
         self.time_mlp = nn.Sequential(
-            SinusoidalPositionEmbeddings(32),
-            nn.Linear(32, 32),
+            SinusoidalPositionEmbeddings(64),
+            nn.Linear(64, 64),
             get_activation(act_type)
         )
-        self.conv1 = nn.Conv2d(in_channels, 32, kernel_size=3, padding=1)
+        self.conv1 = nn.Conv2d(in_channels, 64, kernel_size=3, padding=1)
         self.act1 = get_activation(act_type)
-        self.conv2 = nn.Conv2d(32, 32, kernel_size=3, padding=1)
+        self.conv2 = nn.Conv2d(64, 64, kernel_size=3, padding=1)
         self.act2 = get_activation(act_type)
-        self.out_conv = nn.Conv2d(32, in_channels, kernel_size=1)
+        self.out_conv = nn.Conv2d(64, in_channels, kernel_size=1)
 
     def forward(self, x, time):
         t_emb = self.time_mlp(time)[:, :, None, None]
@@ -89,7 +91,7 @@ class DiffusionUNet(nn.Module):
 
 def run_diffusion_benchmark():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Running Real Fashion-MNIST Denoising Diffusion Benchmark on {device}...")
+    print(f"Running FashionMNIST DDPM Diffusion Benchmark on {device}...")
 
     transform = transforms.Compose([
         transforms.ToTensor(),
@@ -97,51 +99,55 @@ def run_diffusion_benchmark():
     ])
 
     trainset = torchvision.datasets.FashionMNIST(root='./data', train=True, download=True, transform=transform)
-    trainloader = torch.utils.data.DataLoader(trainset, batch_size=128, shuffle=True, num_workers=2)
+    trainloader = torch.utils.data.DataLoader(trainset, batch_size=128, shuffle=True, num_workers=2, pin_memory=True)
 
     activations = ['gelu', 'swish', 'swish_adaptive', 'golu_static', 'alpha_golu']
     seeds = [42, 123]
     results = {}
 
-    timesteps = 100
+    timesteps = 1000
     beta = torch.linspace(0.0001, 0.02, timesteps, device=device)
     alpha = 1.0 - beta
     alpha_hat = torch.cumprod(alpha, dim=0)
 
-    print("\n================ Real Fashion-MNIST DDPM Denoising Loss (MSE ↓) ================")
+    print("\n================ FashionMNIST DDPM Denoising Loss (MSE ↓) ================")
     for act in activations:
-        losses = []
+        seed_losses = []
         for s in seeds:
             reset_seeds(s)
             model = DiffusionUNet(in_channels=1, act_type=act).to(device)
-            optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
+            optimizer = torch.optim.AdamW(model.parameters(), lr=2e-4, weight_decay=1e-4)
             criterion = nn.MSELoss()
 
             model.train()
             step_count = 0
-            for x0, _ in trainloader:
-                x0 = x0.to(device)
-                t = torch.randint(0, timesteps, (x0.size(0),), device=device).long()
-                noise = torch.randn_like(x0)
+            
+            # Train for 1000 Mini-batches
+            while step_count < 1000:
+                for x0, _ in trainloader:
+                    x0 = x0.to(device)
+                    t = torch.randint(0, timesteps, (x0.size(0),), device=device).long()
+                    noise = torch.randn_like(x0)
 
-                a_hat_t = alpha_hat[t][:, None, None, None]
-                xt = torch.sqrt(a_hat_t) * x0 + torch.sqrt(1 - a_hat_t) * noise
+                    a_hat_t = alpha_hat[t][:, None, None, None]
+                    xt = torch.sqrt(a_hat_t) * x0 + torch.sqrt(1 - a_hat_t) * noise
 
-                predicted_noise = model(xt, t)
-                loss = criterion(predicted_noise, noise)
+                    predicted_noise = model(xt, t)
+                    loss = criterion(predicted_noise, noise)
 
-                optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
+                    optimizer.zero_grad()
+                    loss.backward()
+                    optimizer.step()
 
-                step_count += 1
-                if step_count >= 300:
-                    break
+                    step_count += 1
+                    if step_count >= 1000:
+                        break
 
+            # Evaluate Denoising Accuracy
             model.eval()
             val_losses = []
             with torch.no_grad():
-                for x0, _ in list(trainloader)[:15]:
+                for x0, _ in list(trainloader)[:20]:
                     x0 = x0.to(device)
                     t = torch.randint(0, timesteps, (x0.size(0),), device=device).long()
                     noise = torch.randn_like(x0)
@@ -149,15 +155,15 @@ def run_diffusion_benchmark():
                     xt = torch.sqrt(a_hat_t) * x0 + torch.sqrt(1 - a_hat_t) * noise
                     val_losses.append(criterion(model(xt, t), noise).item())
 
-            mean_val_loss = np.mean(val_losses)
-            losses.append(mean_val_loss)
-            print(f"[{act.upper():<14} | Seed {s}] Denoising Val Loss: {mean_val_loss:.6f}")
+            mean_val = np.mean(val_losses)
+            seed_losses.append(mean_val)
+            print(f"[{act.upper():<14} | Seed {s}] Denoising MSE: {mean_val:.6f}")
 
-        results[act] = (np.mean(losses), np.std(losses))
+        results[act] = (np.mean(seed_losses), np.std(seed_losses))
 
-    print("\n================ FASHION-MNIST DIFFUSION SUMMARY ================")
-    for act, (mean_l, std_l) in results.items():
-        print(f"  {act.upper():<14}: Loss = {mean_l:.6f} ± {std_l:.6f}")
+    print("\n================ FASHIONMNIST DIFFUSION SUMMARY ================")
+    for act, (m_loss, s_loss) in results.items():
+        print(f"  {act.upper():<14}: Loss = {m_loss:.6f} ± {s_loss:.6f}")
 
 
 if __name__ == '__main__':
