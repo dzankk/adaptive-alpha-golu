@@ -1,21 +1,31 @@
-
 """
 ResNet-18 Benchmark with GELU, Swish, Adaptive Swish, Static GoLU, and Adaptive Alpha-GoLU
-Includes trajectory tracking for learnable parameters.
+Includes deterministic seed resetting and trajectory tracking for learnable parameters.
 """
 
+import random
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
 import torchvision
 import torchvision.transforms as transforms
-import numpy as np
 from torch.optim.lr_scheduler import CosineAnnealingLR
 
 try:
     from models.alpha_golu import AlphaGoLU as AdaptiveAlphaGoLU
 except ImportError:
     from models.alpha_golu import AlphaGoLUModule as AdaptiveAlphaGoLU
+
+
+def reset_all_seeds(seed=42):
+    """Ensures true reproducibility across CUDA operations and activations."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 
 class AdaptiveSwish(nn.Module):
@@ -118,7 +128,7 @@ class ResNet18(nn.Module):
         alphas = []
         for m in self.modules():
             if isinstance(m, AdaptiveAlphaGoLU):
-                alphas.append(m.alpha.item())
+                alphas.extend(m.alpha.detach().cpu().numpy().flatten())
         return alphas
 
 
@@ -139,7 +149,7 @@ def run_benchmark():
 
     trainset = torchvision.datasets.CIFAR10(root='./data', train=True, download=True, transform=transform_train)
     trainloader = torch.utils.data.DataLoader(trainset, batch_size=128, shuffle=True, num_workers=2)
-    testset = torchvision.datasets.CIFAR10(root='./data', train=False, download=True, transform=transform_test)
+    testset = torchvision.datasets.CIFAR10(root='./data', train=False, download=True, transform=testset_transform if 'testset_transform' in locals() else transform_test)
     testloader = torch.utils.data.DataLoader(testset, batch_size=100, shuffle=False, num_workers=2)
 
     activations = ['gelu', 'swish', 'swish_adaptive', 'golu_static', 'alpha_golu']
@@ -150,7 +160,7 @@ def run_benchmark():
     for act_type in activations:
         accs = []
         for s in seeds:
-            torch.manual_seed(s)
+            reset_all_seeds(s)  # <-- Fix A: Reset CUDA RNG state on every single iteration
             model = ResNet18(num_classes=10, act_type=act_type).to(device)
             criterion = nn.CrossEntropyLoss()
             optimizer = optim.AdamW(model.parameters(), lr=1e-3, weight_decay=5e-4)
@@ -182,7 +192,7 @@ def run_benchmark():
             
             if act_type == 'alpha_golu':
                 alphas = model.get_alpha_values()
-                mean_alpha = np.mean(alphas) if alphas else 1.0
+                mean_alpha = np.mean(alphas) if len(alphas) > 0 else 1.0
                 print(f"[{act_type.upper():<14} | Seed {s}] Accuracy: {acc:.2f}% | Final Mean Alpha: {mean_alpha:.4f}")
             else:
                 print(f"[{act_type.upper():<14} | Seed {s}] Accuracy: {acc:.2f}%")
