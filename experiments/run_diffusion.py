@@ -64,8 +64,10 @@ class AdaptiveSwish(nn.Module):
 
 
 def get_activation(act_type: str) -> nn.Module:
-    act_type = act_type.lower()
-    if act_type == 'gelu':
+    act_type = str(act_type).lower().strip()
+    if act_type == 'relu':
+        return nn.ReLU()
+    elif act_type == 'gelu':
         return nn.GELU()
     elif act_type == 'swish':
         return nn.SiLU()
@@ -73,7 +75,7 @@ def get_activation(act_type: str) -> nn.Module:
         return nn.PReLU()
     elif act_type == 'pgelu':
         return PGELU(init_alpha=1.0)
-    elif act_type == 'swish_adaptive':
+    elif act_type in ('swish_adaptive', 'adaptive_swish'):
         return AdaptiveSwish(init_beta=1.0)
     elif act_type == 'golu_static':
         return StaticGoLU()
@@ -128,7 +130,7 @@ def get_optimizer(model: nn.Module) -> torch.optim.Optimizer:
     other_params = []
 
     # Safely isolate adaptive activation parameters (including nn.PReLU)
-    for module_name, module in model.named_modules():
+    for module in model.modules():
         if isinstance(module, (AdaptiveAlphaGoLU, PGELU, AdaptiveSwish, nn.PReLU)):
             for p in module.parameters():
                 if p.requires_grad:
@@ -208,8 +210,8 @@ def run_diffusion_benchmark():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Running FashionMNIST DDPM Diffusion Benchmark on {device}...")
 
-    activations = ['gelu', 'swish', 'prelu', 'pgelu', 'golu_static', 'alpha_golu']
-    seeds = [42, 123]
+    activations = ['relu', 'gelu', 'swish', 'adaptive_swish', 'prelu', 'pgelu', 'golu_static', 'alpha_golu']
+    seeds = [42, 123, 999, 2024, 2025]
     results = {}
 
     print("\n================ FashionMNIST DDPM Denoising Loss (MSE ↓) ================")
