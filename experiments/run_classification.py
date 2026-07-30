@@ -255,7 +255,7 @@ def train_single_seed(act_type: str, dataset_name: str = "cifar10", seed: int = 
     act_params = []
     weight_params = []
 
-    activation_module_types = (AdaptiveAlphaGoLU, AdaptiveSwish, nn.PReLU)
+    activation_module_types = (AdaptiveAlphaGoLU, AdaptiveSwish, PGELU, nn.PReLU)
     activation_param_ids = set()
     for module in model.modules():
         if isinstance(module, activation_module_types):
