@@ -429,16 +429,22 @@ def run_detection_benchmark():
         print(f"Activation: {act_type.ljust(15)} | VOC mAP@0.5: {map50:.4f}")
 
 
-def train_and_eval(activation: str = "alpha_golu", seed: int = 42, epochs: int = 3) -> float:
+def train_and_eval(
+    activation: str = "alpha_golu",
+    seed: int = 42,
+    epochs: int = 8,
+    max_train_samples: int | None = None,
+    max_eval_samples: int | None = None,
+) -> float:
     """Returns VOC mAP@0.5 on a held-out Pascal VOC validation split."""
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     map50 = train_single_seed_detection(
         act_type=activation,
         seed=seed,
-        epochs=max(epochs, 8),
+        epochs=epochs,
         device=device,
-        max_train_samples=2000,
-        max_eval_samples=400,
+        max_train_samples=max_train_samples,
+        max_eval_samples=max_eval_samples,
     )
     return float(map50)
 

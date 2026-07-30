@@ -24,56 +24,9 @@ from models.alpha_golu import AlphaGoLU as AdaptiveAlphaGoLU, StaticGoLU
 
 
 # ==========================================
-# 0. Statistical Fallbacks & Utilities
+# 0. Statistical Rigor & Utilities
 # ==========================================
-try:
-    from utils.metrics import compute_summary_statistics, calculate_p_value
-except ImportError:
-    try:
-        from utils.stats import compute_summary_statistics, calculate_p_value
-    except ImportError:
-        def compute_summary_statistics(data):
-            arr = np.array(data, dtype=np.float64)
-            return {
-                'mean': float(np.mean(arr)),
-                'std': float(np.std(arr, ddof=1)) if len(arr) > 1 else 0.0
-            }
-
-        def calculate_p_value(a, b):
-            """Welch's t-test with Welch-Satterthwaite degrees of freedom approximation."""
-            try:
-                from scipy import stats
-                _, p_val = stats.ttest_ind(a, b, equal_var=False)
-                return float(p_val)
-            except Exception:
-                a_arr = np.array(a, dtype=np.float64)
-                b_arr = np.array(b, dtype=np.float64)
-                n_a, n_b = len(a_arr), len(b_arr)
-
-                if n_a < 2 or n_b < 2:
-                    return 1.0
-
-                mean_a, mean_b = np.mean(a_arr), np.mean(b_arr)
-                var_a = np.var(a_arr, ddof=1)
-                var_b = np.var(b_arr, ddof=1)
-
-                vn_a = var_a / n_a
-                vn_b = var_b / n_b
-                se = np.sqrt(vn_a + vn_b)
-
-                if se <= 1e-12:
-                    return 1.0 if abs(mean_a - mean_b) < 1e-12 else 0.0
-
-                t_stat = abs(mean_a - mean_b) / se
-                
-                # Welch-Satterthwaite degrees of freedom
-                df = ((vn_a + vn_b) ** 2) / ((vn_a ** 2) / (n_a - 1) + (vn_b ** 2) / (n_b - 1)) if (vn_a + vn_b) > 0 else 1.0
-                
-                # Approximate CDF for Student's t distribution
-                x = df / (df + t_stat ** 2)
-                # Beta incomplete function approximation for p-value tail
-                p_val = float(math.pow(x, df / 2.0))
-                return min(max(p_val, 0.0), 1.0)
+from utils.stats import compute_summary_statistics, calculate_p_value
 
 
 def seed_worker(worker_id):
@@ -295,11 +248,11 @@ def train_single_seed(act_type: str, dataset_name: str = "cifar10", seed: int = 
     act_params = []
     weight_params = []
     
-    # Robust named parameter separation ensuring zero weight decay on activation parameters
+    # Explicit parameter separation ensuring zero weight decay on activation parameters
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
-        if any(keyword in name for keyword in ['raw_alpha', 'beta', 'weight_orig']) or ('act' in name and 'weight' in name):
+        if any(keyword in name for keyword in ['raw_alpha', 'beta', 'weight_orig', 'alpha', 'act1', 'act2', 'act3', 'act4']):
             act_params.append(param)
         else:
             weight_params.append(param)
