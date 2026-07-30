@@ -1,0 +1,24 @@
+{
+    "name": "paper_benchmark_suite",
+    "tasks": [
+        "classification",
+        "detection",
+        "segmentation",
+        "diffusion",
+        "language_model",
+        "robustness"
+    ],
+    "activations": [
+        "relu",
+        "gelu",
+        "swish",
+        "prelu",
+        "pgelu",
+        "adaptive_swish",
+        "golu_static",
+        "alpha_golu"
+    ],
+    "seeds": [42, 123, 999, 2024, 2025],
+    "output_root": "outputs/runs",
+    "summary_path": "outputs/benchmark_results.json"
+}

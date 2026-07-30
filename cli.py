@@ -24,6 +24,8 @@ from experiments.run_diffusion import train_and_eval as run_diffusion
 from experiments.run_language_model import train_and_eval as run_language_model
 from experiments.run_adversarial_robustness import train_and_eval as run_robustness
 
+from utils.experiment_config import load_benchmark_config
+from utils.run_artifacts import build_run_manifest, create_run_directory, write_json
 from utils.stats import compute_summary_statistics, calculate_p_value
 
 TASK_MAP = {
@@ -55,6 +57,7 @@ def handle_run(args):
     task = args.task.lower()
     act = args.activation.lower()
     seeds = args.seeds
+    run_dir = create_run_directory("outputs/runs", task=task, activation=act, seeds=seeds)
 
     if task not in TASK_MAP:
         print(f"[Error] Task '{task}' not recognized. Choose from: {list(TASK_MAP.keys())}")
@@ -69,23 +72,60 @@ def handle_run(args):
         print(f"Seed {seed} Output Metric: {metric:.4f}")
 
     stats = compute_summary_statistics(results)
+    write_json(
+        run_dir / "run_manifest.json",
+        build_run_manifest(
+            command="run",
+            task=task,
+            seeds=seeds,
+            activations=[act],
+            extra_config={"activation": act},
+        ),
+    )
+    write_json(
+        run_dir / "results.json",
+        {
+            "task": task,
+            "activation": act,
+            "seeds": seeds,
+            "scores": results,
+            "summary": stats,
+        },
+    )
     print(f"\n[Summary - {task.upper()} - {act.upper()}]")
     print(f"Mean: {stats['mean']:.4f} | Std: {stats['std']:.4f} | SEM: {stats['sem']:.4f}")
+    print(f"[IO] Saved run artifacts to {run_dir}")
 
 
 def handle_run_all(args):
     """Runs all benchmark tasks across selected activations and seeds."""
-    seeds = args.seeds
-    activations = args.activations if args.activations else SUPPORTED_ACTIVATIONS
+    config = load_benchmark_config(args.config) if args.config else {}
+    seeds = config.get("seeds", args.seeds)
+    activations = config.get("activations", args.activations if args.activations else SUPPORTED_ACTIVATIONS)
+    task_names = config.get("tasks", list(TASK_MAP.keys()))
+    output_root = config.get("output_root", "outputs/runs")
+    summary_path = config.get("summary_path", "outputs/benchmark_results.json")
+    run_dir = create_run_directory(output_root, task="full_suite", activation="all", seeds=seeds)
+
+    selected_tasks = []
+    for task_name in task_names:
+        normalized_task = task_name.lower()
+        if normalized_task not in TASK_MAP:
+            print(f"[Error] Task '{normalized_task}' not recognized in config. Choose from: {list(TASK_MAP.keys())}")
+            sys.exit(1)
+        selected_tasks.append(normalized_task)
     
     print("\n================ Launching Full Paper Benchmark Suite ================")
     print(f"Activations to test ({len(activations)}): {', '.join(activations)}")
     print(f"Seeds ({len(seeds)}): {seeds}")
+    if args.config:
+        print(f"[Config] Loaded benchmark config from {args.config}")
     
     all_task_results = {}
-    os.makedirs("outputs", exist_ok=True)
+    os.makedirs(os.path.dirname(summary_path) or ".", exist_ok=True)
 
-    for task_name, runner_fn in TASK_MAP.items():
+    for task_name in selected_tasks:
+        runner_fn = TASK_MAP[task_name]
         print(f"\n\n################ Task: {task_name.upper()} ################")
         all_task_results[task_name] = {}
         
@@ -113,10 +153,30 @@ def handle_run_all(args):
             all_task_results[task_name]["p_value_welch_alpha_vs_static"] = p_val
             print(f"\n[Statistical Significance] Welch t-test (Alpha-GoLU vs Static): p = {p_val:.4f}")
 
-    json_path = os.path.join("outputs", "benchmark_results.json")
+    json_path = summary_path
     with open(json_path, "w") as f:
         json.dump(all_task_results, f, indent=4)
+    write_json(run_dir / "benchmark_results.json", all_task_results)
+    if args.config:
+        write_json(run_dir / "config.json", config)
+    write_json(
+        run_dir / "run_manifest.json",
+        build_run_manifest(
+            command="run_all",
+            task="full_suite",
+            seeds=seeds,
+            activations=activations,
+            extra_config={
+                "activations": activations,
+                "tasks": selected_tasks,
+                "summary_path": summary_path,
+                "output_root": output_root,
+                **({"config_path": args.config} if args.config else {}),
+            },
+        ),
+    )
     print(f"\n[IO] Saved benchmark JSON summary to {json_path}")
+    print(f"[IO] Saved full-suite run artifacts to {run_dir}")
     print("\n================ All Experiments Completed Successfully! ================")
 
 
@@ -230,6 +290,7 @@ def main():
         help="Activations to evaluate"
     )
     run_all_parser.add_argument("--seeds", type=int, nargs="+", default=DEFAULT_SEEDS, help="Random seeds for statistical testing")
+    run_all_parser.add_argument("--config", type=str, default=None, help="Path to a JSON benchmark config file")
 
     # Command: generate_table
     table_parser = subparsers.add_parser("generate_table", help="Generate LaTeX table from saved JSON results")
