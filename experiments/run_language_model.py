@@ -9,6 +9,7 @@ synthetic proxy dataset.
 """
 
 import math
+import sys
 import random
 import re
 import urllib.request
@@ -21,6 +22,10 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, Dataset
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 from models.alpha_golu import AlphaGoLU as AdaptiveAlphaGoLU, StaticGoLU
 

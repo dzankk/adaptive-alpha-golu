@@ -8,7 +8,9 @@ Includes proper Gompertz math, deterministic PGD evaluation, and CUDA seed reset
 
 import math
 import inspect
+import sys
 import random
+from pathlib import Path
 import numpy as np
 import torch
 import torch.nn as nn
@@ -16,6 +18,10 @@ import torch.optim as optim
 import torchvision
 import torchvision.transforms as transforms
 from torch.utils.data import DataLoader
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 try:
     from models.alpha_golu import AlphaGoLU as AdaptiveAlphaGoLU, StaticGoLU

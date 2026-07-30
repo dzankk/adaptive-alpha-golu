@@ -6,7 +6,9 @@ Demonstrates layer skip-connections combined with parameter-group optimization
 """
 
 import math
+import sys
 import random
+from pathlib import Path
 import numpy as np
 import torch
 import torch.nn as nn
@@ -15,6 +17,11 @@ import torch.optim as optim
 from torch.utils.data import DataLoader, Dataset, random_split
 from torchvision.datasets import VOCSegmentation
 from torchvision.transforms import functional as TF
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
 from models.alpha_golu import AlphaGoLU as AdaptiveAlphaGoLU, StaticGoLU
 
 

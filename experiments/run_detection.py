@@ -10,7 +10,9 @@ activation scalars remain isolated from weight decay.
 
 import argparse
 import random
+import sys
 from collections import defaultdict
+from pathlib import Path
 from typing import Dict, List, Tuple
 
 import numpy as np
@@ -26,6 +28,10 @@ from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
 from torchvision.models.detection.rpn import AnchorGenerator
 from torchvision.ops import box_iou
 from torchvision.transforms import functional as TF
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 from models.alpha_golu import AlphaGoLU as AdaptiveAlphaGoLU, StaticGoLU
 
