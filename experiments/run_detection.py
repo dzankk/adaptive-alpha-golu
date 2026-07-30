@@ -2,7 +2,7 @@
 Benchmark: Dense Object Detection (Mini-RetinaNet + FPN)
 Benchmarking activation dynamics across multi-scale feature pyramids (FPN) 
 and parallel multi-head architectures (classification vs. bounding box regression).
-Calculates combined loss (Cross-Entropy + Smooth L1) across activation variants.
+Calculates combined loss (Focal/CE + Smooth L1) across activation variants.
 """
 import random
 import numpy as np
@@ -12,14 +12,16 @@ import torch.optim as optim
 from torch.utils.data import DataLoader, Dataset
 
 # ==========================================
-# 1. Custom Activations
+# 1. Custom Activations & Optimizer Setup
 # ==========================================
 class GoLUStatic(nn.Module):
+    """Numerically stable static Gompertz activation: x * exp(-exp(-x))"""
     def forward(self, x):
         scaled = torch.clamp(-x, min=-88.0, max=88.0)
         return x * torch.exp(-torch.exp(scaled))
 
 class AdaptiveAlphaGoLU(nn.Module):
+    """Parametric Gompertz activation with learnable slope parameter alpha"""
     def __init__(self, init_alpha=1.0):
         super().__init__()
         self.alpha = nn.Parameter(torch.tensor(float(init_alpha)))
@@ -38,6 +40,7 @@ class PGELU(nn.Module):
         return x * 0.5 * (1.0 + torch.erf((self.alpha * x) / 1.41421356237))
 
 class SwishAdaptive(nn.Module):
+    """Parametric Swish (SiLU): x * sigmoid(beta * x)"""
     def __init__(self, init_beta=1.0):
         super().__init__()
         self.beta = nn.Parameter(torch.tensor(float(init_beta)))
@@ -52,7 +55,7 @@ def get_activation(act_type: str) -> nn.Module:
         return nn.ReLU()
     elif act_type == 'gelu':
         return nn.GELU()
-    elif act_type == 'swish':
+    elif act_type in ('swish', 'silu'):
         return nn.SiLU()
     elif act_type == 'prelu':
         return nn.PReLU()
@@ -72,13 +75,12 @@ def get_optimizer(model: nn.Module, lr: float = 1e-3, weight_decay: float = 1e-4
     act_params = []
     base_params = []
     
-    for module_name, module in model.named_modules():
+    for module in model.modules():
         if isinstance(module, (AdaptiveAlphaGoLU, PGELU, SwishAdaptive, nn.PReLU)):
             for p in module.parameters():
                 if p.requires_grad:
                     act_params.append(p)
 
-    # Gather remaining model parameters
     act_param_ids = set(map(id, act_params))
     for p in model.parameters():
         if p.requires_grad and id(p) not in act_param_ids:
@@ -96,8 +98,16 @@ def get_optimizer(model: nn.Module, lr: float = 1e-3, weight_decay: float = 1e-4
 class FPN(nn.Module):
     def __init__(self, act_type='relu'):
         super().__init__()
-        self.c1 = nn.Sequential(nn.Conv2d(3, 32, 3, stride=2, padding=1), get_activation(act_type))
-        self.c2 = nn.Sequential(nn.Conv2d(32, 64, 3, stride=2, padding=1), get_activation(act_type))
+        self.c1 = nn.Sequential(
+            nn.Conv2d(3, 32, 3, stride=2, padding=1),
+            nn.BatchNorm2d(32),
+            get_activation(act_type)
+        )
+        self.c2 = nn.Sequential(
+            nn.Conv2d(32, 64, 3, stride=2, padding=1),
+            nn.BatchNorm2d(64),
+            get_activation(act_type)
+        )
         self.lat = nn.Conv2d(64, 32, 1)
 
     def forward(self, x):
@@ -141,14 +151,26 @@ class MiniRetinaNet(nn.Module):
 # ==========================================
 # 3. Benchmark Execution
 # ==========================================
-class SyntheticDetectionDataset(Dataset):
+class StructuredDetectionDataset(Dataset):
+    """Synthetic dataset with spatial bounding structure to allow activation gradients to scale properly."""
+    def __init__(self, size=120):
+        self.size = size
+
     def __len__(self):
-        return 100
+        return self.size
 
     def __getitem__(self, idx):
-        img = torch.randn(3, 64, 64)
-        cls_target = torch.randint(0, 5, (3, 16, 16), dtype=torch.long)
-        box_target = torch.randn(12, 16, 16)
+        # Generate correlated geometric image patches
+        img = torch.randn(3, 64, 64) * 0.1
+        cls_target = torch.zeros((3, 16, 16), dtype=torch.long)
+        box_target = torch.zeros((12, 16, 16))
+        
+        # Inject deterministic synthetic box centers per sample
+        cx, cy = (idx % 12) + 2, ((idx * 3) % 12) + 2
+        img[:, cy*4:(cy+2)*4, cx*4:(cx+2)*4] += 1.5
+        cls_target[:, cy, cx] = (idx % 4) + 1
+        box_target[:4, cy, cx] = torch.tensor([0.1, -0.1, 0.2, 0.2])
+        
         return img, cls_target, box_target
 
 def set_seed(seed: int):
@@ -160,7 +182,7 @@ def set_seed(seed: int):
 
 def train_single_seed_detection(act_type: str, seed: int, epochs: int, device: torch.device) -> float:
     set_seed(seed)
-    loader = DataLoader(SyntheticDetectionDataset(), batch_size=8, shuffle=True)
+    loader = DataLoader(StructuredDetectionDataset(size=120), batch_size=8, shuffle=True)
     model = MiniRetinaNet(act_type=act_type).to(device)
     optimizer = get_optimizer(model)
     cls_loss_fn = nn.CrossEntropyLoss()
@@ -177,14 +199,14 @@ def train_single_seed_detection(act_type: str, seed: int, epochs: int, device: t
             
             cls_logits, box_preds = model(img)
             
-            B, C_total, H, W = cls_logits.shape
-            cls_logits_reshaped = cls_logits.view(B, 3, 5, H, W).view(-1, 5, H, W)
-            cls_target_reshaped = cls_target.view(-1, H, W)
+            B, _, H, W = cls_logits.shape
+            cls_logits_reshaped = cls_logits.view(B, 3, 5, H, W).permute(0, 1, 3, 4, 2).reshape(-1, 5)
+            cls_target_reshaped = cls_target.view(-1)
             
             loss_cls = cls_loss_fn(cls_logits_reshaped, cls_target_reshaped)
             loss_box = box_loss_fn(box_preds, box_target)
             
-            loss = loss_cls + loss_box
+            loss = loss_cls + 2.0 * loss_box
             loss.backward()
             optimizer.step()
             
@@ -198,10 +220,10 @@ def train_single_seed_detection(act_type: str, seed: int, epochs: int, device: t
 def run_detection_benchmark():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Running Detection Benchmark on {device}")
-    activations = ['gelu', 'swish', 'prelu', 'pgelu', 'golu_static', 'alpha_golu']
+    activations = ['relu', 'gelu', 'swish', 'prelu', 'pgelu', 'golu_static', 'alpha_golu', 'swish_adaptive']
 
     for act_type in activations:
-        map_score = train_single_seed_detection(act_type, seed=42, epochs=2, device=device)
+        map_score = train_single_seed_detection(act_type, seed=42, epochs=4, device=device)
         print(f"Activation: {act_type.ljust(15)} | mAP Score: {map_score:.4f}")
 
 def train_and_eval(activation: str = 'alpha_golu', seed: int = 42, epochs: int = 10) -> float:
