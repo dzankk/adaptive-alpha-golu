@@ -87,7 +87,6 @@ def get_optimizer(model: nn.Module, lr: float = 1e-3, weight_decay: float = 1e-4
     act_params = []
     base_params = []
     
-    # Safely identify learnable parameters attached to activation modules
     for module in model.modules():
         if isinstance(module, (AdaptiveAlphaGoLU, PGELU, SwishAdaptive, nn.PReLU)):
             for p in module.parameters():
@@ -101,7 +100,6 @@ def get_optimizer(model: nn.Module, lr: float = 1e-3, weight_decay: float = 1e-4
 
     param_groups = [{'params': base_params, 'lr': lr, 'weight_decay': weight_decay}]
     if act_params:
-        # Match base lr and ensure ZERO weight decay on dynamic parameters
         param_groups.append({'params': act_params, 'lr': lr, 'weight_decay': 0.0})
 
     return optim.AdamW(param_groups)
@@ -169,14 +167,28 @@ class MiniGPT(nn.Module):
 
 
 # ==========================================
-# 3. Benchmark Runs & Interface
+# 3. Structured Synthetic Dataset
 # ==========================================
 class SyntheticTextDataset(Dataset):
+    """
+    Generates synthetic token sequences with local correlations 
+    to evaluate perplexity meaningfully.
+    """
+    def __init__(self, vocab_size=1000, seq_len=65, num_samples=200):
+        self.samples = []
+        for _ in range(num_samples):
+            pattern_len = 8
+            pattern = torch.randint(0, vocab_size // 10, (pattern_len,))
+            seq = pattern.repeat((seq_len // pattern_len) + 1)[:seq_len]
+            noise_mask = torch.rand(seq_len) < 0.10
+            seq[noise_mask] = torch.randint(0, vocab_size, (noise_mask.sum().item(),))
+            self.samples.append(seq)
+
     def __len__(self):
-        return 200
+        return len(self.samples)
 
     def __getitem__(self, idx):
-        return torch.randint(0, 1000, (65,))
+        return self.samples[idx]
 
 
 def train_single_seed_lm(act_type='alpha_golu', seed=42, epochs=10, device='cuda'):
@@ -211,7 +223,6 @@ def train_single_seed_lm(act_type='alpha_golu', seed=42, epochs=10, device='cuda
 
     avg_loss = total_loss / len(loader)
     
-    # Safeguard against overflow when calculating perplexity
     try:
         perplexity = math.exp(min(avg_loss, 20.0))
     except OverflowError:
