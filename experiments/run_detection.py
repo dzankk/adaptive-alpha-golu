@@ -4,12 +4,14 @@ Benchmarking activation dynamics across multi-scale feature pyramids (FPN)
 and parallel multi-head architectures (classification vs. bounding box regression).
 Calculates combined loss (Focal/CE + Smooth L1) across activation variants.
 """
+
 import random
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, Dataset
+
 
 # ==========================================
 # 1. Custom Activations & Optimizer Setup
@@ -19,6 +21,7 @@ class GoLUStatic(nn.Module):
     def forward(self, x):
         scaled = torch.clamp(-x, min=-88.0, max=88.0)
         return x * torch.exp(-torch.exp(scaled))
+
 
 class AdaptiveAlphaGoLU(nn.Module):
     """Parametric Gompertz activation with learnable slope parameter alpha"""
@@ -30,6 +33,7 @@ class AdaptiveAlphaGoLU(nn.Module):
         scaled = torch.clamp(-self.alpha * x, min=-88.0, max=88.0)
         return x * torch.exp(-torch.exp(scaled))
 
+
 class PGELU(nn.Module):
     """Parametric GELU: x * CDF(alpha * x)"""
     def __init__(self, init_alpha=1.0):
@@ -38,6 +42,7 @@ class PGELU(nn.Module):
 
     def forward(self, x):
         return x * 0.5 * (1.0 + torch.erf((self.alpha * x) / 1.41421356237))
+
 
 class SwishAdaptive(nn.Module):
     """Parametric Swish (SiLU): x * sigmoid(beta * x)"""
@@ -49,8 +54,12 @@ class SwishAdaptive(nn.Module):
         return x * torch.sigmoid(self.beta * x)
 
 
+# Alias for naming consistency across CLI tools
+AdaptiveSwish = SwishAdaptive
+
+
 def get_activation(act_type: str) -> nn.Module:
-    act_type = act_type.lower()
+    act_type = str(act_type).lower().strip()
     if act_type == 'relu':
         return nn.ReLU()
     elif act_type == 'gelu':
@@ -65,7 +74,7 @@ def get_activation(act_type: str) -> nn.Module:
         return GoLUStatic()
     elif act_type == 'alpha_golu':
         return AdaptiveAlphaGoLU(init_alpha=1.0)
-    elif act_type == 'swish_adaptive':
+    elif act_type in ('swish_adaptive', 'adaptive_swish'):
         return SwishAdaptive(init_beta=1.0)
     else:
         raise ValueError(f"Unknown activation type: {act_type}")
@@ -76,7 +85,7 @@ def get_optimizer(model: nn.Module, lr: float = 1e-3, weight_decay: float = 1e-4
     base_params = []
     
     for module in model.modules():
-        if isinstance(module, (AdaptiveAlphaGoLU, PGELU, SwishAdaptive, nn.PReLU)):
+        if isinstance(module, (AdaptiveAlphaGoLU, PGELU, SwishAdaptive, AdaptiveSwish, nn.PReLU)):
             for p in module.parameters():
                 if p.requires_grad:
                     act_params.append(p)
@@ -91,6 +100,7 @@ def get_optimizer(model: nn.Module, lr: float = 1e-3, weight_decay: float = 1e-4
         param_groups.append({'params': act_params, 'lr': lr, 'weight_decay': 0.0})
 
     return optim.AdamW(param_groups, lr=lr)
+
 
 # ==========================================
 # 2. Object Detection Architecture
@@ -116,6 +126,7 @@ class FPN(nn.Module):
         p2 = self.lat(c2_out)
         return p2
 
+
 class RetinaHead(nn.Module):
     def __init__(self, num_classes=5, num_anchors=3, act_type='relu'):
         super().__init__()
@@ -138,6 +149,7 @@ class RetinaHead(nn.Module):
         box_preds = self.box_head(fpn_feat)
         return cls_logits, box_preds
 
+
 class MiniRetinaNet(nn.Module):
     def __init__(self, act_type='relu'):
         super().__init__()
@@ -147,6 +159,7 @@ class MiniRetinaNet(nn.Module):
     def forward(self, x):
         feat = self.fpn(x)
         return self.head(feat)
+
 
 # ==========================================
 # 3. Benchmark Execution
@@ -173,12 +186,14 @@ class StructuredDetectionDataset(Dataset):
         
         return img, cls_target, box_target
 
+
 def set_seed(seed: int):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
 
 def train_single_seed_detection(act_type: str, seed: int, epochs: int, device: torch.device) -> float:
     set_seed(seed)
@@ -217,6 +232,7 @@ def train_single_seed_detection(act_type: str, seed: int, epochs: int, device: t
     map_score = max(0.0, 100.0 - (avg_loss * 25.0))
     return map_score
 
+
 def run_detection_benchmark():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Running Detection Benchmark on {device}")
@@ -226,11 +242,13 @@ def run_detection_benchmark():
         map_score = train_single_seed_detection(act_type, seed=42, epochs=4, device=device)
         print(f"Activation: {act_type.ljust(15)} | mAP Score: {map_score:.4f}")
 
+
 def train_and_eval(activation: str = 'alpha_golu', seed: int = 42, epochs: int = 10) -> float:
     """Returns Mean Average Precision (mAP)."""
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     map_score = train_single_seed_detection(act_type=activation, seed=seed, epochs=epochs, device=device)
     return float(map_score)
+
 
 if __name__ == '__main__':
     run_detection_benchmark()
