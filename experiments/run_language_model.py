@@ -17,7 +17,8 @@ def reset_all_seeds(seed=42):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
@@ -74,16 +75,18 @@ def get_optimizer(model: nn.Module, lr: float = 1e-3, weight_decay: float = 1e-4
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
-        if 'alpha' in name or 'beta' in name:
+        # Catch trainable activation parameters (alpha, beta, etc.)
+        if 'alpha' in name or 'beta' in name or 'act' in name:
             act_params.append(param)
         else:
             base_params.append(param)
 
-    param_groups = [{'params': base_params, 'weight_decay': weight_decay}]
+    param_groups = [{'params': base_params, 'lr': lr, 'weight_decay': weight_decay}]
     if act_params:
-        param_groups.append({'params': act_params, 'lr': 1e-4, 'weight_decay': 0.0})
+        # Match base lr and ensure ZERO weight decay on dynamic parameters
+        param_groups.append({'params': act_params, 'lr': lr, 'weight_decay': 0.0})
 
-    return optim.AdamW(param_groups, lr=lr)
+    return optim.AdamW(param_groups)
 
 
 # ==========================================
