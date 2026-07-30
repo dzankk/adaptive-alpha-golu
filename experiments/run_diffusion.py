@@ -44,6 +44,16 @@ class AdaptiveAlphaGoLU(nn.Module):
         return x * torch.exp(-torch.exp(scaled))
 
 
+class PGELU(nn.Module):
+    """Parametric GELU: x * CDF(alpha * x)"""
+    def __init__(self, init_alpha=1.0):
+        super().__init__()
+        self.alpha = nn.Parameter(torch.tensor(float(init_alpha)))
+
+    def forward(self, x):
+        return x * 0.5 * (1.0 + torch.erf((self.alpha * x) / 1.41421356237))
+
+
 class AdaptiveSwish(nn.Module):
     def __init__(self, init_beta=1.0):
         super().__init__()
@@ -53,12 +63,16 @@ class AdaptiveSwish(nn.Module):
         return x * torch.sigmoid(self.beta * x)
 
 
-def get_activation(act_type):
+def get_activation(act_type: str) -> nn.Module:
     act_type = act_type.lower()
     if act_type == 'gelu':
         return nn.GELU()
     elif act_type == 'swish':
         return nn.SiLU()
+    elif act_type == 'prelu':
+        return nn.PReLU()
+    elif act_type == 'pgelu':
+        return PGELU(init_alpha=1.0)
     elif act_type == 'swish_adaptive':
         return AdaptiveSwish(init_beta=1.0)
     elif act_type == 'golu_static':
@@ -109,6 +123,28 @@ class DiffusionUNet(nn.Module):
 # ==========================================
 # 3. Benchmark Execution
 # ==========================================
+def get_optimizer(model: nn.Module) -> torch.optim.Optimizer:
+    alpha_params = []
+    other_params = []
+
+    # Safely isolate adaptive activation parameters (including nn.PReLU)
+    for module_name, module in model.named_modules():
+        if isinstance(module, (AdaptiveAlphaGoLU, PGELU, AdaptiveSwish, nn.PReLU)):
+            for p in module.parameters():
+                if p.requires_grad:
+                    alpha_params.append(p)
+
+    alpha_param_ids = set(map(id, alpha_params))
+    for p in model.parameters():
+        if p.requires_grad and id(p) not in alpha_param_ids:
+            other_params.append(p)
+
+    return torch.optim.AdamW([
+        {'params': other_params, 'lr': 2e-4, 'weight_decay': 1e-4},
+        {'params': alpha_params, 'lr': 1e-3, 'weight_decay': 0.0}
+    ])
+
+
 def train_single_seed_diffusion(act_type: str, seed: int, epochs: int, device: torch.device) -> float:
     reset_seeds(seed)
 
@@ -126,19 +162,7 @@ def train_single_seed_diffusion(act_type: str, seed: int, epochs: int, device: t
     alpha_hat = torch.cumprod(alpha, dim=0)
 
     model = DiffusionUNet(in_channels=1, act_type=act_type).to(device)
-
-    alpha_params = []
-    other_params = []
-    for n, p in model.named_parameters():
-        if 'alpha' in n or 'beta' in n:
-            alpha_params.append(p)
-        else:
-            other_params.append(p)
-
-    optimizer = torch.optim.AdamW([
-        {'params': other_params, 'lr': 2e-4, 'weight_decay': 1e-4},
-        {'params': alpha_params, 'lr': 1e-3, 'weight_decay': 0.0}
-    ])
+    optimizer = get_optimizer(model)
     criterion = nn.MSELoss()
 
     model.train()
@@ -184,7 +208,7 @@ def run_diffusion_benchmark():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Running FashionMNIST DDPM Diffusion Benchmark on {device}...")
 
-    activations = ['gelu', 'swish', 'swish_adaptive', 'golu_static', 'alpha_golu']
+    activations = ['gelu', 'swish', 'prelu', 'pgelu', 'golu_static', 'alpha_golu']
     seeds = [42, 123]
     results = {}
 
