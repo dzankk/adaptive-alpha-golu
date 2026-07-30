@@ -6,7 +6,7 @@ multitask evaluations, and extracting statistical diagnostics
 
 usage examples:
     python cli.py run --task classification --activation alpha_golu --seeds 42 123 999
-    python cli.py run_all --seeds 42 123
+    python cli.py run_all --seeds 42 123 999
     python cli.py analyze --results_dir outputs/
 """
 
@@ -24,7 +24,6 @@ from experiments.run_language_model import train_and_eval as run_language_model
 from experiments.run_adversarial_robustness import train_and_eval as run_robustness
 
 from utils.stats import compute_summary_statistics, calculate_p_value
-from utils.visualization import plot_experiment_dashboard
 
 TASK_MAP = {
     "classification": run_classification,
@@ -52,7 +51,6 @@ def handle_run(args):
     results = []
     for seed in seeds:
         print(f"\n---> Running Seed: {seed}")
-        # Call appropriate runner function
         metric = TASK_MAP[task](act, seed=seed)
         results.append(metric)
         print(f"Seed {seed} Output Metric: {metric:.4f}")
@@ -65,9 +63,13 @@ def handle_run(args):
 def handle_run_all(args):
     """Runs all benchmark tasks across selected activations and seeds."""
     seeds = args.seeds
-    activations = args.activations or ["golu_static", "alpha_golu"]
+    # Fix: Default to ALL supported activations if not provided
+    activations = args.activations if args.activations else SUPPORTED_ACTIVATIONS
     
     print("\n================ Launching Full Paper Benchmark Suite ================")
+    print(f"Activations to test ({len(activations)}): {', '.join(activations)}")
+    print(f"Seeds ({len(seeds)}): {seeds}")
+    
     all_task_results = {}
 
     for task_name, runner_fn in TASK_MAP.items():
@@ -90,7 +92,7 @@ def handle_run_all(args):
                 "sem": stats["sem"]
             }
 
-        # Calculate p-value if both static and adaptive GoLU exist
+        # Calculate p-value comparing Alpha-GoLU against Static GoLU if both present
         if "golu_static" in activations and "alpha_golu" in activations:
             p_val = calculate_p_value(
                 all_task_results[task_name]["golu_static"]["scores"],
@@ -116,7 +118,14 @@ def main():
 
     # Command: run_all
     run_all_parser = subparsers.add_parser("run_all", help="Reproduce all paper tables across all tasks")
-    run_all_parser.add_argument("--activations", type=str, nargs="+", default=["gelu", "golu_static", "alpha_golu"], choices=SUPPORTED_ACTIVATIONS, help="Activations to evaluate")
+    run_all_parser.add_argument(
+        "--activations", 
+        type=str, 
+        nargs="+", 
+        default=SUPPORTED_ACTIVATIONS,  # Fix: defaults to all 6 activations
+        choices=SUPPORTED_ACTIVATIONS, 
+        help="Activations to evaluate"
+    )
     run_all_parser.add_argument("--seeds", type=int, nargs="+", default=[42, 123, 999], help="Random seeds for statistical testing")
 
     args = parser.parse_args()
