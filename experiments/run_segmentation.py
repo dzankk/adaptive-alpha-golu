@@ -5,7 +5,8 @@ Demonstrates layer skip-connections combined with parameter-group optimization
 (disabling weight decay for trainable activation variables like alpha and beta).
 """
 
-import math
+import random
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -143,45 +144,58 @@ def compute_mIoU(preds, targets, threshold=0.5):
     return iou.mean().item()
 
 
+def set_seed(seed: int):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def train_single_seed_segmentation(act_type: str, seed: int, epochs: int, device: torch.device) -> float:
+    set_seed(seed)
+    loader = DataLoader(SyntheticSegmentationDataset(), batch_size=8, shuffle=True)
+    model = UNet(act_type=act_type).to(device)
+    optimizer = get_optimizer(model)
+    criterion = nn.BCEWithLogitsLoss()
+
+    model.train()
+    for epoch in range(epochs):
+        for x, y in loader:
+            x, y = x.to(device), y.to(device)
+            optimizer.zero_grad()
+            out = model(x)
+            loss = criterion(out, y)
+            loss.backward()
+            optimizer.step()
+
+    model.eval()
+    total_iou = 0.0
+    with torch.no_grad():
+        for x, y in loader:
+            x, y = x.to(device), y.to(device)
+            out = model(x)
+            total_iou += compute_mIoU(out, y)
+
+    return total_iou / len(loader)
+
+
 def run_segmentation_benchmark():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Running Segmentation Benchmark on {device}")
-
-    loader = DataLoader(SyntheticSegmentationDataset(), batch_size=8, shuffle=True)
     activations = ['relu', 'gelu', 'golu_static', 'alpha_golu', 'swish_adaptive']
 
     for act_type in activations:
-        model = UNet(act_type=act_type).to(device)
-        optimizer = get_optimizer(model)
-        criterion = nn.BCEWithLogitsLoss()
-
-        model.train()
-        for epoch in range(2):
-            for x, y in loader:
-                x, y = x.to(device), y.to(device)
-                optimizer.zero_grad()
-                out = model(x)
-                loss = criterion(out, y)
-                loss.backward()
-                optimizer.step()
-
-        model.eval()
-        total_iou = 0.0
-        with torch.no_grad():
-            for x, y in loader:
-                x, y = x.to(device), y.to(device)
-                out = model(x)
-                total_iou += compute_mIoU(out, y)
-
-        mean_iou = total_iou / len(loader)
+        mean_iou = train_single_seed_segmentation(act_type=act_type, seed=42, epochs=2, device=device)
         print(f"Activation: {act_type.ljust(15)} | Validation mIoU: {mean_iou:.4f}")
+
 
 def train_and_eval(activation: str = 'alpha_golu', seed: int = 42, epochs: int = 10) -> float:
     """Returns Mean Intersection over Union (mIoU)."""
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     miou = train_single_seed_segmentation(act_type=activation, seed=seed, epochs=epochs, device=device)
     return float(miou)
-    
+
 
 if __name__ == '__main__':
     run_segmentation_benchmark()
