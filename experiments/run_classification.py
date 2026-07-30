@@ -1,11 +1,16 @@
 """
 Benchmark: Consolidated Image Classification & Trajectory Analysis
+===================================================================
 Unified ResNet-18 runner for CIFAR-10 and Fashion-MNIST across multi-seed evaluations.
 Supports ReLU, GELU, Swish, Adaptive Swish, PReLU, PGELU, Static GoLU, and Adaptive Alpha-GoLU.
 Includes strict softplus alpha constraints, robust statistics, and memory-decoupled architecture.
+
+Author: Džana Kopić
+Paper Reference: Gompertz Linear Units (Das et al., 2025)
 """
 
 import inspect
+import math
 import random
 import numpy as np
 import torch
@@ -14,8 +19,12 @@ import torch.nn.functional as F
 import torchvision
 import torchvision.transforms as transforms
 from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.utils.data import DataLoader
 
-# Fallback robust statistical calculation using SciPy/NumPy
+
+# ==========================================
+# 0. Statistical Fallbacks & Utilities
+# ==========================================
 try:
     from utils.metrics import compute_summary_statistics, calculate_p_value
 except ImportError:
@@ -36,16 +45,14 @@ except ImportError:
                 _, p_val = stats.ttest_ind(a, b, equal_var=False)
                 return float(p_val)
             except Exception:
-                # Basic Gaussian approximation fallback
-                a_arr, b_arr = np.array(a), np.array(b)
+                a_arr, b_arr = np.array(a, dtype=np.float64), np.array(b, dtype=np.float64)
                 mean_a, mean_b = np.mean(a_arr), np.mean(b_arr)
-                var_a = np.var(a_arr, ddof=1) / len(a_arr)
-                var_b = np.var(b_arr, ddof=1) / len(b_arr)
+                var_a = np.var(a_arr, ddof=1) / max(len(a_arr), 1)
+                var_b = np.var(b_arr, ddof=1) / max(len(b_arr), 1)
                 se = np.sqrt(var_a + var_b)
                 if se == 0:
                     return 1.0
                 z = abs(mean_a - mean_b) / se
-                # Standard normal approximation for p-value
                 p_val = float(2.0 * (1.0 - 0.5 * (1.0 + torch.erf(torch.tensor(z / np.sqrt(2.0))).item())))
                 return p_val
 
@@ -64,59 +71,79 @@ def reset_all_seeds(seed=42):
 # 1. Activation Implementations
 # ==========================================
 class StaticGoLU(nn.Module):
-    """Numerically stable Gompertz Linear Unit: x * exp(-exp(-x))"""
-    def forward(self, x):
+    """
+    Numerically stable unparameterized Gompertz Linear Unit (Das et al., 2025).
+    
+    Mathematical Formulation:
+        GoLU(x) = x * exp(-exp(-x))
+    """
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         scaled = torch.clamp(-x, min=-88.0, max=88.0)
         return x * torch.exp(-torch.exp(scaled))
 
 
 class AdaptiveAlphaGoLU(nn.Module):
-    """Adaptive Gompertz Linear Unit with softplus constrained positive alpha."""
-    def __init__(self, init_alpha=1.0):
+    """
+    Adaptive Gompertz Linear Unit with softplus-constrained positive alpha parameter.
+    
+    Mathematical Formulation:
+        AlphaGoLU(x) = x * exp(-exp(-alpha * x))
+        where alpha = softplus(raw_alpha) > 0
+    """
+    def __init__(self, init_alpha: float = 1.0):
         super().__init__()
         init_val = float(init_alpha)
-        # Softplus inverse initialization: softplus(init_raw) = init_alpha
-        init_raw = np.log(np.exp(init_val) - 1.0) if init_val < 20 else init_val
+        # Exact inverse softplus initialization: softplus(init_raw) = init_val
+        init_raw = math.log(math.expm1(init_val)) if init_val < 20.0 else init_val
         self.raw_alpha = nn.Parameter(torch.tensor(init_raw, dtype=torch.float32))
 
     @property
-    def alpha(self):
-        """Ensures alpha stays strictly positive (> 0) during gradient descent."""
+    def alpha(self) -> torch.Tensor:
+        """Ensures alpha stays strictly positive (> 0) during backpropagation."""
         return F.softplus(self.raw_alpha)
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         scaled = torch.clamp(-self.alpha * x, min=-88.0, max=88.0)
         return x * torch.exp(-torch.exp(scaled))
 
 
 class PGELU(nn.Module):
-    """Parametric GELU: x * CDF(alpha * x) with softplus constrained positive alpha."""
-    def __init__(self, init_alpha=1.0):
+    """
+    Parametric GELU: x * CDF(alpha * x) with softplus-constrained positive alpha parameter.
+    """
+    def __init__(self, init_alpha: float = 1.0):
         super().__init__()
         init_val = float(init_alpha)
-        init_raw = np.log(np.exp(init_val) - 1.0) if init_val < 20 else init_val
+        init_raw = math.log(math.expm1(init_val)) if init_val < 20.0 else init_val
         self.raw_alpha = nn.Parameter(torch.tensor(init_raw, dtype=torch.float32))
 
     @property
-    def alpha(self):
+    def alpha(self) -> torch.Tensor:
         return F.softplus(self.raw_alpha)
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         return x * 0.5 * (1.0 + torch.erf((self.alpha * x) / 1.41421356237))
 
 
 class AdaptiveSwish(nn.Module):
-    """Adaptive Swish: x * sigmoid(beta * x)"""
-    def __init__(self, init_beta=1.0):
+    """
+    Adaptive Swish (SiLU): x * sigmoid(beta * x)
+    """
+    def __init__(self, init_beta: float = 1.0):
         super().__init__()
         self.beta = nn.Parameter(torch.tensor(float(init_beta), dtype=torch.float32))
 
-    def forward(self, x):
+    @property
+    def alpha((self)) -> torch.Tensor:
+        """Alias property so extract_alphas works consistently across modules."""
+        return self.beta
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         return x * torch.sigmoid(self.beta * x)
 
 
 def get_activation(act_type: str) -> nn.Module:
-    """Activation factory function."""
+    """Factory function for instantiating activation modules."""
     act_type = str(act_type).lower().strip()
     if act_type == 'relu':
         return nn.ReLU()
@@ -142,7 +169,7 @@ def get_activation(act_type: str) -> nn.Module:
 # 2. ResNet Architecture
 # ==========================================
 class ResNetBlock(nn.Module):
-    def __init__(self, in_planes, planes, stride=1, act_type='alpha_golu'):
+    def __init__(self, in_planes: int, planes: int, stride: int = 1, act_type: str = 'alpha_golu'):
         super().__init__()
         self.conv1 = nn.Conv2d(in_planes, planes, kernel_size=3, stride=stride, padding=1, bias=False)
         self.bn1 = nn.BatchNorm2d(planes)
@@ -159,7 +186,7 @@ class ResNetBlock(nn.Module):
         self.act1 = get_activation(act_type)
         self.act2 = get_activation(act_type)
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         out = self.act1(self.bn1(self.conv1(x)))
         out = self.bn2(self.conv2(out))
         out += self.shortcut(x)
@@ -168,7 +195,7 @@ class ResNetBlock(nn.Module):
 
 
 class ResNet18(nn.Module):
-    def __init__(self, num_classes=10, act_type='alpha_golu'):
+    def __init__(self, num_classes: int = 10, act_type: str = 'alpha_golu'):
         super().__init__()
         self.in_planes = 64
         self.act_type = act_type
@@ -183,7 +210,7 @@ class ResNet18(nn.Module):
         self.layer4 = self._make_layer(512, 2, stride=2, act_type=act_type)
         self.linear = nn.Linear(512, num_classes)
 
-    def _make_layer(self, planes, num_blocks, stride, act_type):
+    def _make_layer(self, planes: int, num_blocks: int, stride: int, act_type: str):
         strides = [stride] + [1] * (num_blocks - 1)
         layers = []
         for s in strides:
@@ -191,28 +218,32 @@ class ResNet18(nn.Module):
             self.in_planes = planes
         return nn.Sequential(*layers)
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         out = self.act(self.bn1(self.conv1(x)))
         out = self.layer1(out)
         out = self.layer2(out)
         out = self.layer3(out)
         out = self.layer4(out)
-        out = torch.mean(out, dim=[2, 3])  # Spatial Adaptive Pooling (B, 512)
+        out = torch.mean(out, dim=[2, 3])  # Global Average Pooling
         out = self.linear(out)
         return out
 
-    def extract_alphas(self):
+    def extract_alphas(self) -> list:
         alphas = []
         for module in self.modules():
             if isinstance(module, (AdaptiveAlphaGoLU, AdaptiveSwish, PGELU)):
-                # Return evaluated softplus alpha property values
-                alphas.append(module.alpha.detach().cpu().item())
+                val = module.alpha.detach().cpu().numpy().flatten()
+                alphas.extend(val.tolist())
             elif isinstance(module, nn.PReLU):
-                alphas.extend(module.weight.detach().cpu().numpy().flatten())
+                val = module.weight.detach().cpu().numpy().flatten()
+                alphas.extend(val.tolist())
         return alphas
 
 
-def get_dataloaders(dataset_name="cifar10", batch_size=128):
+# ==========================================
+# 3. Data Pipeline & Optimization Helpers
+# ==========================================
+def get_dataloaders(dataset_name: str = "cifar10", batch_size: int = 128):
     dataset_name_lower = str(dataset_name).lower().strip()
     if dataset_name_lower == "cifar10":
         transform_train = transforms.Compose([
@@ -238,12 +269,15 @@ def get_dataloaders(dataset_name="cifar10", batch_size=128):
     else:
         raise ValueError(f"Unsupported dataset: {dataset_name}")
 
-    trainloader = torch.utils.data.DataLoader(trainset, batch_size=batch_size, shuffle=True, num_workers=2, pin_memory=True)
-    testloader = torch.utils.data.DataLoader(testset, batch_size=256, shuffle=False, num_workers=2, pin_memory=True)
+    trainloader = DataLoader(trainset, batch_size=batch_size, shuffle=True, num_workers=2, pin_memory=True)
+    testloader = DataLoader(testset, batch_size=256, shuffle=False, num_workers=2, pin_memory=True)
     return trainloader, testloader
 
 
-def train_single_seed(act_type, dataset_name="cifar10", seed=42, epochs=10, device="cuda"):
+# ==========================================
+# 4. Training & Benchmark Execution
+# ==========================================
+def train_single_seed(act_type: str, dataset_name: str = "cifar10", seed: int = 42, epochs: int = 10, device: torch.device = torch.device("cuda")):
     reset_all_seeds(seed)
     trainloader, testloader = get_dataloaders(dataset_name)
     
@@ -252,7 +286,7 @@ def train_single_seed(act_type, dataset_name="cifar10", seed=42, epochs=10, devi
     act_params = []
     weight_params = []
     
-    # Explicit memory ID-based parameter isolation
+    # Memory address-based parameter isolation
     for module in model.modules():
         if isinstance(module, (AdaptiveAlphaGoLU, AdaptiveSwish, PGELU, nn.PReLU)):
             for p in module.parameters():
@@ -273,13 +307,6 @@ def train_single_seed(act_type, dataset_name="cifar10", seed=42, epochs=10, devi
 
     for epoch in range(epochs):
         model.train()
-        
-        # Warmup: freeze activation parameters during first 2 epochs for stability
-        if act_params:
-            requires_grad = (epoch >= 2)
-            for p in act_params:
-                p.requires_grad = requires_grad
-
         for inputs, labels in trainloader:
             inputs, labels = inputs.to(device), labels.to(device)
             optimizer.zero_grad()
@@ -305,7 +332,7 @@ def train_single_seed(act_type, dataset_name="cifar10", seed=42, epochs=10, devi
     return acc, alphas
 
 
-def run_benchmark(dataset_name="cifar10", seeds=[42, 123, 999, 2024, 2025], epochs=10):
+def run_benchmark(dataset_name: str = "cifar10", seeds: list = [42, 123, 999, 2024, 2025], epochs: int = 10):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     activations = ['relu', 'gelu', 'swish', 'adaptive_swish', 'prelu', 'pgelu', 'golu_static', 'alpha_golu']
     results = {act: [] for act in activations}
@@ -319,9 +346,9 @@ def run_benchmark(dataset_name="cifar10", seeds=[42, 123, 999, 2024, 2025], epoc
             results[act].append(acc)
             if 'golu' in act and alphas:
                 mean_alpha = np.mean(alphas)
-                print(f"[{act.upper():<14} | Seed {s}] Accuracy: {acc:.2f}% | Final Mean Alpha: {mean_alpha:.4f}")
+                print(f"[{act.upper():<14} | Seed {s:4d}] Accuracy: {acc:.2f}% | Final Mean Alpha: {mean_alpha:.4f}")
             else:
-                print(f"[{act.upper():<14} | Seed {s}] Accuracy: {acc:.2f}%")
+                print(f"[{act.upper():<14} | Seed {s:4d}] Accuracy: {acc:.2f}%")
 
     print(f"\n================ {dataset_name.upper()} SUMMARY STATISTICS ================")
     for act, accs in results.items():
