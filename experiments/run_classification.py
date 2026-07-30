@@ -39,22 +39,46 @@ except ImportError:
             }
 
         def calculate_p_value(a, b):
-            """Welch's t-test for unequal variances."""
+            """Welch's t-test with Welch-Satterthwaite degrees of freedom approximation."""
             try:
                 from scipy import stats
                 _, p_val = stats.ttest_ind(a, b, equal_var=False)
                 return float(p_val)
             except Exception:
-                a_arr, b_arr = np.array(a, dtype=np.float64), np.array(b, dtype=np.float64)
-                mean_a, mean_b = np.mean(a_arr), np.mean(b_arr)
-                var_a = np.var(a_arr, ddof=1) / max(len(a_arr), 1)
-                var_b = np.var(b_arr, ddof=1) / max(len(b_arr), 1)
-                se = np.sqrt(var_a + var_b)
-                if se == 0:
+                a_arr = np.array(a, dtype=np.float64)
+                b_arr = np.array(b, dtype=np.float64)
+                n_a, n_b = len(a_arr), len(b_arr)
+
+                if n_a < 2 or n_b < 2:
                     return 1.0
-                z = abs(mean_a - mean_b) / se
-                p_val = float(2.0 * (1.0 - 0.5 * (1.0 + torch.erf(torch.tensor(z / np.sqrt(2.0))).item())))
-                return p_val
+
+                mean_a, mean_b = np.mean(a_arr), np.mean(b_arr)
+                var_a = np.var(a_arr, ddof=1)
+                var_b = np.var(b_arr, ddof=1)
+
+                vn_a = var_a / n_a
+                vn_b = var_b / n_b
+                se = np.sqrt(vn_a + vn_b)
+
+                if se <= 1e-12:
+                    return 1.0 if abs(mean_a - mean_b) < 1e-12 else 0.0
+
+                t_stat = abs(mean_a - mean_b) / se
+                
+                # Welch-Satterthwaite degrees of freedom
+                df = ((vn_a + vn_b) ** 2) / ((vn_a ** 2) / (n_a - 1) + (vn_b ** 2) / (n_b - 1)) if (vn_a + vn_b) > 0 else 1.0
+                
+                # Approximate CDF for Student's t distribution
+                x = df / (df + t_stat ** 2)
+                # Beta incomplete function approximation for p-value tail
+                p_val = float(math.pow(x, df / 2.0))
+                return min(max(p_val, 0.0), 1.0)
+
+
+def seed_worker(worker_id):
+    worker_seed = torch.initial_seed() % 2**32
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
 
 
 def reset_all_seeds(seed=42):
@@ -93,7 +117,7 @@ class AdaptiveAlphaGoLU(nn.Module):
     def __init__(self, init_alpha: float = 1.0):
         super().__init__()
         init_val = float(init_alpha)
-        # Exact inverse softplus initialization: softplus(init_raw) = init_val
+        # Inverse softplus: softplus(init_raw) = init_val
         init_raw = math.log(math.expm1(init_val)) if init_val < 20.0 else init_val
         self.raw_alpha = nn.Parameter(torch.tensor(init_raw, dtype=torch.float32))
 
@@ -134,8 +158,8 @@ class AdaptiveSwish(nn.Module):
         self.beta = nn.Parameter(torch.tensor(float(init_beta), dtype=torch.float32))
 
     @property
-    def alpha((self)) -> torch.Tensor:
-        """Alias property so extract_alphas works consistently across modules."""
+    def alpha(self) -> torch.Tensor:
+        """Alias property for consistent parameter extraction across modules."""
         return self.beta
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -202,7 +226,7 @@ class ResNet18(nn.Module):
         
         self.conv1 = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
         self.bn1 = nn.BatchNorm2d(64)
-        self.act = get_activation(act_type)
+        self.act1 = get_activation(act_type)
 
         self.layer1 = self._make_layer(64, 2, stride=1, act_type=act_type)
         self.layer2 = self._make_layer(128, 2, stride=2, act_type=act_type)
@@ -219,7 +243,7 @@ class ResNet18(nn.Module):
         return nn.Sequential(*layers)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        out = self.act(self.bn1(self.conv1(x)))
+        out = self.act1(self.bn1(self.conv1(x)))
         out = self.layer1(out)
         out = self.layer2(out)
         out = self.layer3(out)
@@ -243,8 +267,13 @@ class ResNet18(nn.Module):
 # ==========================================
 # 3. Data Pipeline & Optimization Helpers
 # ==========================================
-def get_dataloaders(dataset_name: str = "cifar10", batch_size: int = 128):
+def get_dataloaders(dataset_name: str = "cifar10", batch_size: int = 128, seed: int = 42):
     dataset_name_lower = str(dataset_name).lower().strip()
+    use_pin = torch.cuda.is_available()
+
+    g = torch.Generator()
+    g.manual_seed(seed)
+
     if dataset_name_lower == "cifar10":
         transform_train = transforms.Compose([
             transforms.RandomCrop(32, padding=4),
@@ -269,8 +298,22 @@ def get_dataloaders(dataset_name: str = "cifar10", batch_size: int = 128):
     else:
         raise ValueError(f"Unsupported dataset: {dataset_name}")
 
-    trainloader = DataLoader(trainset, batch_size=batch_size, shuffle=True, num_workers=2, pin_memory=True)
-    testloader = DataLoader(testset, batch_size=256, shuffle=False, num_workers=2, pin_memory=True)
+    trainloader = DataLoader(
+        trainset, 
+        batch_size=batch_size, 
+        shuffle=True, 
+        num_workers=2, 
+        pin_memory=use_pin,
+        worker_init_fn=seed_worker,
+        generator=g
+    )
+    testloader = DataLoader(
+        testset, 
+        batch_size=256, 
+        shuffle=False, 
+        num_workers=2, 
+        pin_memory=use_pin
+    )
     return trainloader, testloader
 
 
@@ -279,25 +322,22 @@ def get_dataloaders(dataset_name: str = "cifar10", batch_size: int = 128):
 # ==========================================
 def train_single_seed(act_type: str, dataset_name: str = "cifar10", seed: int = 42, epochs: int = 10, device: torch.device = torch.device("cuda")):
     reset_all_seeds(seed)
-    trainloader, testloader = get_dataloaders(dataset_name)
+    trainloader, testloader = get_dataloaders(dataset_name, seed=seed)
     
     model = ResNet18(num_classes=10, act_type=act_type).to(device)
     
     act_params = []
     weight_params = []
     
-    # Memory address-based parameter isolation
-    for module in model.modules():
-        if isinstance(module, (AdaptiveAlphaGoLU, AdaptiveSwish, PGELU, nn.PReLU)):
-            for p in module.parameters():
-                if p.requires_grad:
-                    act_params.append(p)
+    # Robust named parameter separation ensuring zero weight decay on activation parameters
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if any(keyword in name for keyword in ['raw_alpha', 'beta', 'weight_orig']) or ('act' in name and 'weight' in name):
+            act_params.append(param)
+        else:
+            weight_params.append(param)
 
-    act_params_ids = set(map(id, act_params))
-    for p in model.parameters():
-        if p.requires_grad and id(p) not in act_params_ids:
-            weight_params.append(p)
-    
     optimizer = torch.optim.AdamW([
         {'params': weight_params, 'lr': 1e-3, 'weight_decay': 5e-4},
         {'params': act_params, 'lr': 1e-4, 'weight_decay': 0.0}
