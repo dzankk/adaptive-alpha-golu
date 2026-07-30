@@ -7,12 +7,13 @@ multitask evaluations, and extracting statistical diagnostics
 usage examples:
     python cli.py run --task classification --activation alpha_golu --seeds 42 123 999
     python cli.py run_all --seeds 42 123 999
-    python cli.py analyze --results_dir outputs/
+    python cli.py generate_table --results_path outputs/benchmark_results.json
 """
 
 import argparse
-import sys
+import json
 import os
+import sys
 from typing import List
 
 # Import benchmark modules
@@ -63,7 +64,6 @@ def handle_run(args):
 def handle_run_all(args):
     """Runs all benchmark tasks across selected activations and seeds."""
     seeds = args.seeds
-    # Fix: Default to ALL supported activations if not provided
     activations = args.activations if args.activations else SUPPORTED_ACTIVATIONS
     
     print("\n================ Launching Full Paper Benchmark Suite ================")
@@ -71,6 +71,7 @@ def handle_run_all(args):
     print(f"Seeds ({len(seeds)}): {seeds}")
     
     all_task_results = {}
+    os.makedirs("outputs", exist_ok=True)
 
     for task_name, runner_fn in TASK_MAP.items():
         print(f"\n\n################ Task: {task_name.upper()} ################")
@@ -92,15 +93,61 @@ def handle_run_all(args):
                 "sem": stats["sem"]
             }
 
-        # Calculate p-value comparing Alpha-GoLU against Static GoLU if both present
         if "golu_static" in activations and "alpha_golu" in activations:
             p_val = calculate_p_value(
                 all_task_results[task_name]["golu_static"]["scores"],
                 all_task_results[task_name]["alpha_golu"]["scores"]
             )
+            all_task_results[task_name]["p_value_alpha_vs_static"] = p_val
             print(f"\n[Statistical Significance] Paired t-test (Alpha-GoLU vs Static): p = {p_val:.4f}")
 
+    json_path = os.path.join("outputs", "benchmark_results.json")
+    with open(json_path, "w") as f:
+        json.dump(all_task_results, f, indent=4)
+    print(f"\n[IO] Saved benchmark JSON summary to {json_path}")
     print("\n================ All Experiments Completed Successfully! ================")
+
+
+def handle_generate_table(args):
+    """Generates a LaTeX benchmark table from JSON results."""
+    json_path = args.results_path
+    if not os.path.exists(json_path):
+        print(f"[Error] Benchmark results file not found at {json_path}")
+        return
+
+    with open(json_path, "r") as f:
+        data = json.load(f)
+
+    print("\n% ===== Auto-generated LaTeX Benchmark Table =====")
+    print("\\begin{table}[h]")
+    print("\\centering")
+    print("\\begin{tabular}{l" + "c" * len(data) + "}")
+    print("\\toprule")
+    
+    tasks = list(data.keys())
+    header = "Activation & " + " & ".join([t.replace("_", " ").title() for t in tasks]) + " \\\\"
+    print(header)
+    print("\\midrule")
+
+    # Pick activations from first task entries
+    first_task = tasks[0]
+    acts = [k for k in data[first_task].keys() if k != "p_value_alpha_vs_static"]
+
+    for act in acts:
+        row = [act.upper()]
+        for t in tasks:
+            if act in data[t]:
+                m = data[t][act]["mean"]
+                s = data[t][act]["std"]
+                row.append(f"{m:.2f} $\\pm$ {s:.2f}")
+            else:
+                row.append("N/A")
+        print(" & ".join(row) + " \\\\")
+
+    print("\\bottomrule")
+    print("\\end{tabular}")
+    print("\\caption{Empirical evaluation across paper benchmark tasks.}")
+    print("\\end{table}\n")
 
 
 def main():
@@ -122,11 +169,15 @@ def main():
         "--activations", 
         type=str, 
         nargs="+", 
-        default=SUPPORTED_ACTIVATIONS,  # Fix: defaults to all 6 activations
+        default=SUPPORTED_ACTIVATIONS, 
         choices=SUPPORTED_ACTIVATIONS, 
         help="Activations to evaluate"
     )
     run_all_parser.add_argument("--seeds", type=int, nargs="+", default=[42, 123, 999], help="Random seeds for statistical testing")
+
+    # Command: generate_table
+    table_parser = subparsers.add_parser("generate_table", help="Generate LaTeX table from saved JSON results")
+    table_parser.add_argument("--results_path", type=str, default="outputs/benchmark_results.json", help="Path to JSON results file")
 
     args = parser.parse_args()
 
@@ -134,6 +185,8 @@ def main():
         handle_run(args)
     elif args.command == "run_all":
         handle_run_all(args)
+    elif args.command == "generate_table":
+        handle_generate_table(args)
     else:
         parser.print_help()
 
