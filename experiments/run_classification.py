@@ -1,7 +1,7 @@
 """
 Benchmark: Consolidated Image Classification & Trajectory Analysis
 Unified ResNet-18 runner for CIFAR-10 and Fashion-MNIST across multi-seed evaluations.
-Supports GELU, Swish, Adaptive Swish, PReLU, PGELU, Static GoLU, and Adaptive Alpha-GoLU.
+Supports ReLU, GELU, Swish, Adaptive Swish, PReLU, PGELU, Static GoLU, and Adaptive Alpha-GoLU.
 """
 
 import inspect
@@ -35,7 +35,7 @@ def reset_all_seeds(seed=42):
 
 
 # ==========================================
-# 1. Fixed Activation Implementations
+# 1. Activation Implementations
 # ==========================================
 class StaticGoLU(nn.Module):
     """Correct Gompertz Linear Unit: x * exp(-exp(-x))"""
@@ -66,6 +66,7 @@ class PGELU(nn.Module):
 
 
 class AdaptiveSwish(nn.Module):
+    """Adaptive Swish: x * sigmoid(beta * x)"""
     def __init__(self, init_beta=1.0):
         super().__init__()
         self.beta = nn.Parameter(torch.tensor(float(init_beta)))
@@ -97,12 +98,14 @@ class ResNetBlock(nn.Module):
         self.act2 = self._get_act()
 
     def _get_act(self):
-        act_type = self.act_type.lower()
-        if act_type == 'gelu':
+        act_type = str(self.act_type).lower().strip()
+        if act_type == 'relu':
+            return nn.ReLU()
+        elif act_type == 'gelu':
             return nn.GELU()
         elif act_type == 'swish':
             return nn.SiLU()
-        elif act_type == 'swish_adaptive':
+        elif act_type in ('adaptive_swish', 'swish_adaptive'):
             return AdaptiveSwish(init_beta=1.0)
         elif act_type == 'prelu':
             return nn.PReLU()
@@ -170,7 +173,8 @@ class ResNet18(nn.Module):
 
 
 def get_dataloaders(dataset_name="cifar10", batch_size=128):
-    if dataset_name.lower() == "cifar10":
+    dataset_name_lower = str(dataset_name).lower().strip()
+    if dataset_name_lower == "cifar10":
         transform_train = transforms.Compose([
             transforms.RandomCrop(32, padding=4),
             transforms.RandomHorizontalFlip(),
@@ -183,7 +187,7 @@ def get_dataloaders(dataset_name="cifar10", batch_size=128):
         ])
         trainset = torchvision.datasets.CIFAR10(root='./data', train=True, download=True, transform=transform_train)
         testset = torchvision.datasets.CIFAR10(root='./data', train=False, download=True, transform=transform_test)
-    elif dataset_name.lower() == "fashion_mnist":
+    elif dataset_name_lower == "fashion_mnist":
         transform = transforms.Compose([
             transforms.Grayscale(3),
             transforms.ToTensor(),
@@ -261,9 +265,9 @@ def train_single_seed(act_type, dataset_name="cifar10", seed=42, epochs=10, devi
     return acc, alphas
 
 
-def run_benchmark(dataset_name="cifar10", seeds=[42, 123, 999], epochs=10):
+def run_benchmark(dataset_name="cifar10", seeds=[42, 123, 999, 2024, 2025], epochs=10):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    activations = ['gelu', 'swish', 'swish_adaptive', 'prelu', 'pgelu', 'golu_static', 'alpha_golu']
+    activations = ['relu', 'gelu', 'swish', 'adaptive_swish', 'prelu', 'pgelu', 'golu_static', 'alpha_golu']
     results = {act: [] for act in activations}
 
     print(f"\n================ Running Unified ResNet-18 Benchmark on {dataset_name.upper()} (N={len(seeds)}) ================")
@@ -296,5 +300,6 @@ def train_and_eval(activation: str = 'alpha_golu', seed: int = 42, dataset_name:
 
 
 if __name__ == '__main__':
-    run_benchmark(dataset_name="cifar10", seeds=[42, 123, 999], epochs=10)
-    run_benchmark(dataset_name="fashion_mnist", seeds=[42, 123, 999], epochs=10)
+    default_seeds = [42, 123, 999, 2024, 2025]
+    run_benchmark(dataset_name="cifar10", seeds=default_seeds, epochs=10)
+    run_benchmark(dataset_name="fashion_mnist", seeds=default_seeds, epochs=10)
