@@ -10,10 +10,10 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, random_split
 
 # ==========================================
-# 1. Fixed Custom Activations
+# 1. Custom Activation Functions
 # ==========================================
 class GoLUStatic(nn.Module):
     """Gompertz Linear Unit: x * exp(-exp(-x))"""
@@ -44,6 +44,7 @@ class PGELU(nn.Module):
 
 
 class SwishAdaptive(nn.Module):
+    """Adaptive Swish: x * sigmoid(beta * x)"""
     def __init__(self, init_beta=1.0):
         super().__init__()
         self.beta = nn.Parameter(torch.tensor(float(init_beta)))
@@ -53,13 +54,15 @@ class SwishAdaptive(nn.Module):
 
 
 def get_activation(act_type: str) -> nn.Module:
-    act_type = act_type.lower()
+    act_type = str(act_type).lower().strip()
     if act_type == 'relu':
         return nn.ReLU()
     elif act_type == 'gelu':
         return nn.GELU()
     elif act_type == 'swish':
         return nn.SiLU()
+    elif act_type in ('adaptive_swish', 'swish_adaptive'):
+        return SwishAdaptive(init_beta=1.0)
     elif act_type == 'prelu':
         return nn.PReLU()
     elif act_type == 'pgelu':
@@ -68,8 +71,6 @@ def get_activation(act_type: str) -> nn.Module:
         return GoLUStatic()
     elif act_type == 'alpha_golu':
         return AdaptiveAlphaGoLU(init_alpha=1.0)
-    elif act_type == 'swish_adaptive':
-        return SwishAdaptive(init_beta=1.0)
     else:
         raise ValueError(f"Unknown activation type: {act_type}")
 
@@ -78,7 +79,7 @@ def get_optimizer(model: nn.Module, lr: float = 1e-3, weight_decay: float = 1e-4
     act_params = []
     base_params = []
     
-    for module_name, module in model.named_modules():
+    for module in model.modules():
         if isinstance(module, (AdaptiveAlphaGoLU, PGELU, SwishAdaptive, nn.PReLU)):
             for p in module.parameters():
                 if p.requires_grad:
@@ -95,6 +96,7 @@ def get_optimizer(model: nn.Module, lr: float = 1e-3, weight_decay: float = 1e-4
         param_groups.append({'params': act_params, 'lr': lr, 'weight_decay': 0.0})
 
     return optim.AdamW(param_groups, lr=lr)
+
 
 # ==========================================
 # 2. U-Net Architecture
@@ -143,17 +145,40 @@ class UNet(nn.Module):
         d1 = self.dec1(torch.cat([d1, e1], dim=1))
         return self.head(d1)
 
+
 # ==========================================
 # 3. Synthetic Dataset & Metrics
 # ==========================================
 class SyntheticSegmentationDataset(Dataset):
+    """Generates structured synthetic geometric targets for segmentation learning."""
+    def __init__(self, size=100, height=128, width=128, seed=42):
+        self.size = size
+        self.height = height
+        self.width = width
+        self.rng = np.random.RandomState(seed)
+
     def __len__(self):
-        return 100
+        return self.size
 
     def __getitem__(self, idx):
-        x = torch.randn(3, 128, 128)
-        y = (x[0:1] > 0.5).float()
-        return x, y
+        # Deterministic generation per sample index
+        sample_rng = np.random.RandomState(idx + 1000)
+        
+        # Base structured noise background
+        x = sample_rng.randn(3, self.height, self.width).astype(np.float32)
+        
+        # Draw dynamic synthetic target region (circles / boxes)
+        y = np.zeros((1, self.height, self.width), dtype=np.float32)
+        cx, cy = sample_rng.randint(32, 96, size=2)
+        r = sample_rng.randint(16, 32)
+        
+        grid_y, grid_x = np.ogrid[:self.height, :self.width]
+        mask = (grid_x - cx) ** 2 + (grid_y - cy) ** 2 <= r ** 2
+        
+        y[0, mask] = 1.0
+        x[0, mask] += 1.5  # Signal shift inside mask
+        
+        return torch.from_numpy(x), torch.from_numpy(y)
 
 
 def compute_mIoU(preds, targets, threshold=0.5):
@@ -174,14 +199,22 @@ def set_seed(seed: int):
 
 def train_single_seed_segmentation(act_type: str, seed: int, epochs: int, device: torch.device) -> float:
     set_seed(seed)
-    loader = DataLoader(SyntheticSegmentationDataset(), batch_size=8, shuffle=True)
+    
+    full_dataset = SyntheticSegmentationDataset(size=100, seed=seed)
+    train_size = int(0.8 * len(full_dataset))
+    val_size = len(full_dataset) - train_size
+    train_ds, val_ds = random_split(full_dataset, [train_size, val_size], generator=torch.Generator().manual_seed(seed))
+
+    train_loader = DataLoader(train_ds, batch_size=8, shuffle=True)
+    val_loader = DataLoader(val_ds, batch_size=8, shuffle=False)
+
     model = UNet(act_type=act_type).to(device)
     optimizer = get_optimizer(model)
     criterion = nn.BCEWithLogitsLoss()
 
     model.train()
     for epoch in range(epochs):
-        for x, y in loader:
+        for x, y in train_loader:
             x, y = x.to(device), y.to(device)
             optimizer.zero_grad()
             out = model(x)
@@ -192,22 +225,26 @@ def train_single_seed_segmentation(act_type: str, seed: int, epochs: int, device
     model.eval()
     total_iou = 0.0
     with torch.no_grad():
-        for x, y in loader:
+        for x, y in val_loader:
             x, y = x.to(device), y.to(device)
             out = model(x)
             total_iou += compute_mIoU(out, y)
 
-    return total_iou / len(loader)
+    return total_iou / len(val_loader)
 
 
-def run_segmentation_benchmark():
+def run_segmentation_benchmark(seeds=[42, 123, 999, 2024, 2025], epochs=10):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Running Segmentation Benchmark on {device}")
-    activations = ['gelu', 'swish', 'prelu', 'pgelu', 'golu_static', 'alpha_golu']
+    print(f"Running Segmentation Benchmark on {device} (N={len(seeds)})")
+    activations = ['relu', 'gelu', 'swish', 'adaptive_swish', 'prelu', 'pgelu', 'golu_static', 'alpha_golu']
 
     for act_type in activations:
-        mean_iou = train_single_seed_segmentation(act_type=act_type, seed=42, epochs=2, device=device)
-        print(f"Activation: {act_type.ljust(15)} | Validation mIoU: {mean_iou:.4f}")
+        scores = []
+        for s in seeds:
+            miou = train_single_seed_segmentation(act_type=act_type, seed=s, epochs=epochs, device=device)
+            scores.append(miou)
+            print(f"Activation: {act_type.ljust(15)} | Seed {s} | Validation mIoU: {miou:.4f}")
+        print(f"--> {act_type.upper()} Mean mIoU: {np.mean(scores):.4f} ± {np.std(scores):.4f}\n")
 
 
 def train_and_eval(activation: str = 'alpha_golu', seed: int = 42, epochs: int = 10) -> float:
@@ -218,4 +255,4 @@ def train_and_eval(activation: str = 'alpha_golu', seed: int = 42, epochs: int =
 
 
 if __name__ == '__main__':
-    run_segmentation_benchmark()
+    run_segmentation_benchmark(seeds=[42, 123, 999, 2024, 2025], epochs=10)
