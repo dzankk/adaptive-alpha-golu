@@ -6,27 +6,16 @@ Includes proper Gompertz math, deterministic PGD evaluation, and CUDA seed reset
 """
 
 import inspect
+import math
 import random
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 import torchvision
 import torchvision.transforms as transforms
 from torch.utils.data import DataLoader, Dataset
-
-try:
-    from models.alpha_golu import AlphaGoLU as AdaptiveAlphaGoLU
-except ImportError:
-    class AdaptiveAlphaGoLU(nn.Module):
-        """Fallback implementation if local module is missing"""
-        def __init__(self, init_alpha=1.0):
-            super().__init__()
-            self.alpha = nn.Parameter(torch.tensor(float(init_alpha)))
-
-        def forward(self, x):
-            scaled = torch.clamp(-self.alpha * x, min=-88.0, max=88.0)
-            return x * torch.exp(-torch.exp(scaled))
 
 
 def reset_all_seeds(seed=42):
@@ -44,9 +33,46 @@ def reset_all_seeds(seed=42):
 # ==========================================
 class StaticGoLU(nn.Module):
     """Correct & numerically stable Gompertz activation: x * exp(-exp(-x))"""
-    def forward(self, x):
-        scaled = torch.clamp(-x, min=-88.0, max=88.0)
-        return x * torch.exp(-torch.exp(scaled))
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Fixed sign consistency with AlphaGoLU
+        scaled_x = torch.clamp(-x, min=-88.0, max=88.0)
+        return x * torch.exp(-torch.exp(scaled_x))
+
+
+class AlphaGoLU(nn.Module):
+    """
+    Parameterized Adaptive Gompertz Linear Unit (Alpha-GoLU).
+    Mathematical Formulation: AlphaGoLU(x) = x * exp(-exp(-alpha * x))
+    """
+    def __init__(self, num_parameters: int = 1, init_alpha: float = 1.0):
+        super().__init__()
+        self.num_parameters = num_parameters
+        init_val = float(init_alpha)
+        init_raw = math.log(math.exp(init_val) - 1.0) if init_val < 20 else init_val
+        self.raw_alpha = nn.Parameter(torch.full((num_parameters,), init_raw, dtype=torch.float32))
+
+    @property
+    def alpha(self) -> torch.Tensor:
+        return F.softplus(self.raw_alpha)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        current_alpha = self.alpha
+        if self.num_parameters > 1:
+            if x.dim() == 4:
+                shape = (1, -1, 1, 1)
+            elif x.dim() == 3:
+                shape = (1, 1, -1)
+            else:
+                shape = (1, -1)
+            alpha_param = current_alpha.view(*shape)
+        else:
+            alpha_param = current_alpha
+
+        scaled_x = torch.clamp(-alpha_param * x, min=-88.0, max=88.0)
+        return x * torch.exp(-torch.exp(scaled_x))
+
+
+AdaptiveAlphaGoLU = AlphaGoLU
 
 
 class PGELU(nn.Module):
@@ -69,7 +95,6 @@ class SwishAdaptive(nn.Module):
         return x * torch.sigmoid(self.beta * x)
 
 
-# Alias for naming consistency across CLI tools
 AdaptiveSwish = SwishAdaptive
 
 
@@ -87,16 +112,13 @@ def get_activation(act_type: str) -> nn.Module:
     elif act_type == 'prelu':
         return nn.PReLU()
     elif act_type == 'pgelu':
-        sig = inspect.signature(PGELU)
-        return PGELU(init_alpha=1.00) if 'init_alpha' in sig.parameters else PGELU()
+        return PGELU(init_alpha=1.00)
     elif act_type == 'golu_static':
         return StaticGoLU()
     elif act_type == 'alpha_golu':
-        sig = inspect.signature(AdaptiveAlphaGoLU)
-        return AdaptiveAlphaGoLU(init_alpha=1.00) if 'init_alpha' in sig.parameters else AdaptiveAlphaGoLU()
+        return AdaptiveAlphaGoLU(init_alpha=1.00)
     elif act_type in ('swish_adaptive', 'adaptive_swish'):
-        sig = inspect.signature(SwishAdaptive)
-        return SwishAdaptive(init_beta=1.00) if 'init_beta' in sig.parameters else SwishAdaptive()
+        return SwishAdaptive(init_beta=1.00)
     else:
         raise ValueError(f"Unknown activation type: {act_type}")
 
@@ -189,7 +211,7 @@ class ResNet18(nn.Module):
 
 
 # ==========================================
-# 4. Adversarial Attack Utilities
+# 4. Optimized Adversarial Attack Utilities
 # ==========================================
 CIFAR_MEAN = torch.tensor([0.4914, 0.4822, 0.4465]).view(1, 3, 1, 1)
 CIFAR_STD = torch.tensor([0.2023, 0.1994, 0.2010]).view(1, 3, 1, 1)
@@ -203,24 +225,8 @@ def get_normalized_bounds(device):
     return min_val, max_val
 
 
-def fgsm_attack(model, images, labels, eps=8/255):
-    device = images.device
-    min_val, max_val = get_normalized_bounds(device)
-    std = CIFAR_STD.to(device)
-    
-    eps_norm = eps / std
-    images_req = images.clone().detach().requires_grad_(True)
-    outputs = model(images_req)
-    loss = nn.CrossEntropyLoss()(outputs, labels)
-    model.zero_grad()
-    loss.backward()
-
-    perturbed = images_req + eps_norm * images_req.grad.sign()
-    return torch.max(torch.min(perturbed, max_val), min_val)
-
-
 def pgd_attack(model, images, labels, eps=8/255, alpha=2/255, iters=10):
-    """Deterministic PGD Attack to prevent seed variance in robustness evaluation."""
+    """Deterministic, vectorized PGD Attack."""
     device = images.device
     min_val, max_val = get_normalized_bounds(device)
     std = CIFAR_STD.to(device)
@@ -229,47 +235,30 @@ def pgd_attack(model, images, labels, eps=8/255, alpha=2/255, iters=10):
     alpha_norm = alpha / std
 
     ori_images = images.clone().detach()
-    # Deterministic start perturbation
     perturbed = images.clone().detach() + 0.001 * torch.ones_like(images)
     perturbed = torch.max(torch.min(perturbed, max_val), min_val)
 
+    criterion = nn.CrossEntropyLoss()
+
     for _ in range(iters):
-        perturbed = perturbed.clone().detach().requires_grad_(True)
+        perturbed.requires_grad = True
         outputs = model(perturbed)
-        loss = nn.CrossEntropyLoss()(outputs, labels)
-        model.zero_grad()
-        loss.backward()
-
-        if perturbed.grad is None:
-            break
-
-        adv_images = perturbed + alpha_norm * perturbed.grad.sign()
-        diff = adv_images - ori_images
+        loss = criterion(outputs, labels)
         
-        eta = torch.max(torch.min(diff, eps_norm), -eps_norm)
-        perturbed = torch.max(torch.min(ori_images + eta, max_val), min_val).detach()
+        grad = torch.autograd.grad(loss, perturbed, retain_graph=False, create_graph=False)[0]
+        
+        adv_images = perturbed.detach() + alpha_norm * grad.sign()
+        diff = adv_images - ori_images
+        eta = torch.clamp(diff, -eps_norm, eps_norm)
+        perturbed = torch.clamp(ori_images + eta, min_val, max_val)
 
-    return perturbed
+    return perturbed.detach()
 
 
 # ==========================================
 # 5. Benchmark Execution Functions
 # ==========================================
-class SyntheticCIFAR(Dataset):
-    """Fallback synthetic dataset for headless environment testing."""
-    def __init__(self, size=200):
-        self.size = size
-
-    def __len__(self):
-        return self.size
-
-    def __getitem__(self, idx):
-        x = torch.randn(3, 32, 32)
-        y = torch.randint(0, 10, (1,)).squeeze(0)
-        return x, y
-
-
-def train_single_seed_robustness(act_type: str, seed: int, epochs: int, device: torch.device) -> float:
+def train_single_seed_robustness(act_type: str, seed: int, epochs: int, device: torch.device, fast_test: bool = False) -> float:
     reset_all_seeds(seed)
     
     transform_train = transforms.Compose([
@@ -283,15 +272,12 @@ def train_single_seed_robustness(act_type: str, seed: int, epochs: int, device: 
         transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010))
     ])
 
-    try:
-        trainset = torchvision.datasets.CIFAR10(root='./data', train=True, download=True, transform=transform_train)
-        testset = torchvision.datasets.CIFAR10(root='./data', train=False, download=True, transform=transform_test)
-    except Exception:
-        trainset = SyntheticCIFAR(size=200)
-        testset = SyntheticCIFAR(size=100)
+    trainset = torchvision.datasets.CIFAR10(root='./data', train=True, download=True, transform=transform_train)
+    testset = torchvision.datasets.CIFAR10(root='./data', train=False, download=True, transform=transform_test)
 
-    train_loader = DataLoader(trainset, batch_size=64, shuffle=True, num_workers=0)
-    test_loader = DataLoader(testset, batch_size=32, shuffle=False, num_workers=0)
+    # num_workers=2 dramatically boosts throughput
+    train_loader = DataLoader(trainset, batch_size=128, shuffle=True, num_workers=2, pin_memory=True)
+    test_loader = DataLoader(testset, batch_size=256, shuffle=False, num_workers=2, pin_memory=True)
 
     model = ResNet18(act_type=act_type).to(device)
     optimizer = get_optimizer(model, lr=1e-3)
@@ -300,7 +286,7 @@ def train_single_seed_robustness(act_type: str, seed: int, epochs: int, device: 
     for epoch in range(epochs):
         model.train()
         for idx, (inputs, targets) in enumerate(train_loader):
-            if idx > 20:  # Bound runtime for quick suite passes
+            if fast_test and idx > 20:  # Bound runtime ONLY if fast_test flag is explicitly requested
                 break
             inputs, targets = inputs.to(device), targets.to(device)
             optimizer.zero_grad()
@@ -313,7 +299,7 @@ def train_single_seed_robustness(act_type: str, seed: int, epochs: int, device: 
     pgd_correct, total = 0, 0
 
     for idx, (images, labels) in enumerate(test_loader):
-        if idx > 10:  # Fast evaluation pass
+        if fast_test and idx > 10:
             break
         images, labels = images.to(device), labels.to(device)
 
@@ -328,22 +314,15 @@ def train_single_seed_robustness(act_type: str, seed: int, epochs: int, device: 
     return (pgd_correct / total) * 100.0 if total > 0 else 0.0
 
 
-def run_benchmark():
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Running Adversarial Robustness Benchmark on {device}")
-    activations = ['relu', 'gelu', 'swish', 'prelu', 'pgelu', 'golu_static', 'alpha_golu', 'swish_adaptive']
-
-    for act_type in activations:
-        pgd_acc = train_single_seed_robustness(act_type=act_type, seed=42, epochs=3, device=device)
-        print(f"Activation: {act_type.ljust(15)} | PGD-10 Robust Accuracy: {pgd_acc:.2f}%")
-
-
 def train_and_eval(activation: str = 'alpha_golu', seed: int = 42, epochs: int = 10) -> float:
     """Returns Robust Accuracy under PGD attack."""
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    robust_acc = train_single_seed_robustness(act_type=activation, seed=seed, epochs=epochs, device=device)
+    robust_acc = train_single_seed_robustness(act_type=activation, seed=seed, epochs=epochs, device=device, fast_test=False)
     return float(robust_acc)
 
 
 if __name__ == '__main__':
-    run_benchmark()
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Running Robustness Evaluation on {device}")
+    acc = train_and_eval(activation='alpha_golu', seed=42, epochs=5)
+    print(f"Alpha-GoLU PGD Accuracy: {acc:.2f}%")
