@@ -1,6 +1,7 @@
 """
 Benchmark: Adversarial Robustness on CIFAR-10 (ResNet-18)
-Evaluates clean accuracy vs. FGSM and PGD-10 adversarial attack robustness 
+=========================================================
+Evaluates clean accuracy vs. PGD-10 adversarial attack robustness 
 across ReLU, GELU, Swish, PReLU, PGELU, Static GoLU, Adaptive Alpha-GoLU, and Adaptive Swish.
 Includes proper Gompertz math, deterministic PGD evaluation, and CUDA seed resetting.
 """
@@ -13,7 +14,7 @@ import torch.nn as nn
 import torch.optim as optim
 import torchvision
 import torchvision.transforms as transforms
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader
 
 try:
     from models.alpha_golu import AlphaGoLU as AdaptiveAlphaGoLU, StaticGoLU
@@ -105,19 +106,23 @@ def get_activation(act_type: str) -> nn.Module:
 
 
 def get_optimizer(model: nn.Module, lr: float = 1e-3, weight_decay: float = 1e-4) -> optim.Optimizer:
-    act_params = []
-    base_params = []
+    act_param_ids = set()
     
     for module in model.modules():
-        if isinstance(module, (AdaptiveAlphaGoLU, PGELU, SwishAdaptive, AdaptiveSwish, nn.PReLU)):
-            for p in module.parameters():
+        if isinstance(module, (AdaptiveAlphaGoLU, StaticGoLU, PGELU, SwishAdaptive, AdaptiveSwish, nn.PReLU)):
+            for p in module.parameters(recurse=False):
                 if p.requires_grad:
-                    act_params.append(p)
+                    act_param_ids.add(id(p))
 
-    act_param_ids = set(map(id, act_params))
+    act_params = []
+    base_params = []
+
     for p in model.parameters():
-        if p.requires_grad and id(p) not in act_param_ids:
-            base_params.append(p)
+        if p.requires_grad:
+            if id(p) in act_param_ids:
+                act_params.append(p)
+            else:
+                base_params.append(p)
 
     param_groups = [{'params': base_params, 'weight_decay': weight_decay}]
     if act_params:
@@ -207,7 +212,7 @@ def get_normalized_bounds(device):
 
 
 def pgd_attack(model, images, labels, eps=8/255, alpha=2/255, iters=10):
-    """Standard PGD-10 Attack with bounded random initialization."""
+    """Standard PGD-10 Attack with strictly bounded random initialization."""
     device = images.device
     min_val, max_val = get_normalized_bounds(device)
     std = CIFAR_STD.to(device)
@@ -217,9 +222,10 @@ def pgd_attack(model, images, labels, eps=8/255, alpha=2/255, iters=10):
 
     ori_images = images.clone().detach()
     
-    # Standard random initialization within epsilon ball
+    # Standard random initialization within epsilon ball & valid image space
     random_noise = torch.empty_like(images).uniform_(-1.0, 1.0) * eps_norm
-    perturbed = torch.max(torch.min(ori_images + random_noise, max_val), min_val).detach()
+    perturbed = torch.clamp(ori_images + random_noise, ori_images - eps_norm, ori_images + eps_norm)
+    perturbed = torch.clamp(perturbed, min_val, max_val).detach()
 
     for _ in range(iters):
         perturbed.requires_grad = True
@@ -244,7 +250,7 @@ def pgd_attack(model, images, labels, eps=8/255, alpha=2/255, iters=10):
 # ==========================================
 # 5. Benchmark Execution Functions
 # ==========================================
-def train_single_seed_robustness(act_type: str, seed: int, epochs: int, device: torch.device) -> float:
+def train_single_seed_robustness(act_type: str, seed: int, epochs: int, device: torch.device) -> tuple[float, float]:
     reset_all_seeds(seed)
     
     transform_train = transforms.Compose([
@@ -268,7 +274,6 @@ def train_single_seed_robustness(act_type: str, seed: int, epochs: int, device: 
     optimizer = get_optimizer(model, lr=1e-3)
     criterion = nn.CrossEntropyLoss()
 
-    # Full epoch training pass across complete dataset
     for epoch in range(epochs):
         model.train()
         for inputs, targets in train_loader:
@@ -280,10 +285,13 @@ def train_single_seed_robustness(act_type: str, seed: int, epochs: int, device: 
             optimizer.step()
 
     model.eval()
-    pgd_correct, total = 0, 0
+    clean_correct, pgd_correct, total = 0, 0, 0
 
     for images, labels in test_loader:
         images, labels = images.to(device), labels.to(device)
+
+        with torch.no_grad():
+            clean_correct += (model(images).argmax(1) == labels).sum().item()
 
         with torch.enable_grad():
             adv_pgd = pgd_attack(model, images, labels)
@@ -293,7 +301,9 @@ def train_single_seed_robustness(act_type: str, seed: int, epochs: int, device: 
 
         total += labels.size(0)
 
-    return (pgd_correct / total) * 100.0 if total > 0 else 0.0
+    clean_acc = (clean_correct / total) * 100.0 if total > 0 else 0.0
+    pgd_acc = (pgd_correct / total) * 100.0 if total > 0 else 0.0
+    return clean_acc, pgd_acc
 
 
 def run_benchmark():
@@ -302,14 +312,14 @@ def run_benchmark():
     activations = ['relu', 'gelu', 'swish', 'prelu', 'pgelu', 'golu_static', 'alpha_golu', 'swish_adaptive']
 
     for act_type in activations:
-        pgd_acc = train_single_seed_robustness(act_type=act_type, seed=42, epochs=5, device=device)
-        print(f"Activation: {act_type.ljust(15)} | PGD-10 Robust Accuracy: {pgd_acc:.2f}%")
+        clean_acc, pgd_acc = train_single_seed_robustness(act_type=act_type, seed=42, epochs=5, device=device)
+        print(f"Activation: {act_type.ljust(15)} | Clean Acc: {clean_acc:.2f}% | PGD-10 Robust Acc: {pgd_acc:.2f}%")
 
 
 def train_and_eval(activation: str = 'alpha_golu', seed: int = 42, epochs: int = 10) -> float:
     """Returns Robust Accuracy under PGD attack."""
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    robust_acc = train_single_seed_robustness(act_type=activation, seed=seed, epochs=epochs, device=device)
+    _, robust_acc = train_single_seed_robustness(act_type=activation, seed=seed, epochs=epochs, device=device)
     return float(robust_acc)
 
 
