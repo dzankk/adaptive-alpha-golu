@@ -5,6 +5,7 @@ Provides configurable deep architectures (CNN and MLP) for multi-dataset
 comparative evaluations under fixed parameter initialization seeds.
 """
 
+import math
 import torch
 import torch.nn as nn
 from models.alpha_golu import StaticGoLU, AlphaGoLU, LatentVarianceTracker
@@ -25,6 +26,8 @@ def get_activation_layer(act_name: str, init_alpha: float = 1.0) -> nn.Module:
         return StaticGoLU()
     elif act_name in ['alpha_golu', 'adaptive_alpha_golu']:
         return AlphaGoLU(init_alpha=init_alpha)  # or AdaptiveAlphaGoLU(init_alpha=init_alpha)
+    elif act_name in ['adaptive_swish', 'swish_adaptive']:
+        return AdaptiveSwish(init_beta=init_alpha)
     else:
         raise ValueError(f"Unsupported activation function: {act_name}")
 
@@ -36,10 +39,27 @@ class ParametricGELU(nn.Module):
     """
     def __init__(self, init_alpha=1.0):
         super().__init__()
-        self.alpha = nn.Parameter(torch.tensor(float(init_alpha)))
+        init_val = float(init_alpha)
+        init_raw = math.log(math.expm1(init_val)) if init_val < 20 else init_val
+        self.raw_alpha = nn.Parameter(torch.tensor(init_raw, dtype=torch.float32))
+
+    @property
+    def alpha(self):
+        return torch.nn.functional.softplus(self.raw_alpha)
 
     def forward(self, x):
         return x * 0.5 * (1.0 + torch.erf((self.alpha * x) / 1.41421356))
+
+
+class AdaptiveSwish(nn.Module):
+    """Adaptive Swish (SiLU): x * sigmoid(beta * x)."""
+
+    def __init__(self, init_beta=1.0):
+        super().__init__()
+        self.beta = nn.Parameter(torch.tensor(float(init_beta), dtype=torch.float32))
+
+    def forward(self, x):
+        return x * torch.sigmoid(self.beta * x)
 
 
 class DeepConvNet(nn.Module):
@@ -97,7 +117,7 @@ class DeepConvNet(nn.Module):
         return self.classifier(x)
 
     def extract_alphas(self) -> list:
-        """Returns current alpha values if using AlphaGoLU, else static scalars."""
+        """Returns the learned activation parameters present in the network."""
         extracted = []
         for module in [self.act1, self.act2, self.act3, self.act4]:
             if hasattr(module, "get_alpha_val"):
@@ -112,8 +132,6 @@ class DeepConvNet(nn.Module):
                 extracted.append(module.beta.detach().cpu())
             elif isinstance(module, nn.PReLU):
                 extracted.append(module.weight.detach().cpu())
-            else:
-                extracted.append(torch.tensor(1.0))
         return extracted
 
     def extract_latent_variances(self) -> list:

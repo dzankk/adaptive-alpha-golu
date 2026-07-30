@@ -142,6 +142,7 @@ def get_optimizer(model: nn.Module) -> torch.optim.Optimizer:
             other_params.append(p)
 
     return torch.optim.AdamW([
+        # Intentional scale separation: diffusion activation parameters use a higher LR for faster gate adaptation.
         {'params': other_params, 'lr': 2e-4, 'weight_decay': 1e-4},
         {'params': alpha_params, 'lr': 1e-3, 'weight_decay': 0.0}
     ])

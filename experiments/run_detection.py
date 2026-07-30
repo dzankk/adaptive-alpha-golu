@@ -217,13 +217,14 @@ class ActivationBoxHead(nn.Module):
     def __init__(self, in_channels: int, representation_size: int, act_type: str):
         super().__init__()
         self.fc6 = nn.Linear(in_channels, representation_size)
-        self.act = get_activation(act_type)
+        self.act6 = get_activation(act_type)
         self.fc7 = nn.Linear(representation_size, representation_size)
+        self.act7 = get_activation(act_type)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = torch.flatten(x, start_dim=1)
-        x = self.act(self.fc6(x))
-        x = self.act(self.fc7(x))
+        x = self.act6(self.fc6(x))
+        x = self.act7(self.fc7(x))
         return x
 
 

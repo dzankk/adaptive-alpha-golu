@@ -273,6 +273,7 @@ def train_single_seed(act_type: str, dataset_name: str = "cifar10", seed: int = 
             weight_params.append(param)
 
     optimizer = torch.optim.AdamW([
+        # Intentional scale separation: adaptive activation parameters use a lower LR than the backbone.
         {'params': weight_params, 'lr': 1e-3, 'weight_decay': 5e-4},
         {'params': act_params, 'lr': 1e-4, 'weight_decay': 0.0}
     ])
