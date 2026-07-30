@@ -100,8 +100,8 @@ def handle_run(args):
 def handle_run_all(args):
     """Runs all benchmark tasks across selected activations and seeds."""
     config = load_benchmark_config(args.config) if args.config else {}
-    seeds = config.get("seeds", args.seeds)
-    activations = config.get("activations", args.activations if args.activations else SUPPORTED_ACTIVATIONS)
+    seeds = args.seeds if args.seeds != DEFAULT_SEEDS else config.get("seeds", DEFAULT_SEEDS)
+    activations = args.activations if args.activations != SUPPORTED_ACTIVATIONS else config.get("activations", SUPPORTED_ACTIVATIONS)
     task_names = config.get("tasks", list(TASK_MAP.keys()))
     output_root = config.get("output_root", "outputs/runs")
     summary_path = config.get("summary_path", "outputs/benchmark_results.json")

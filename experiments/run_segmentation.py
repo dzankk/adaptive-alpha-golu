@@ -268,4 +268,20 @@ def train_and_eval(activation: str = 'alpha_golu', seed: int = 42, epochs: int =
 
 
 if __name__ == '__main__':
-    run_segmentation_benchmark(seeds=[42, 123, 999, 2024, 2025], epochs=10)
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Pascal VOC segmentation benchmark")
+    parser.add_argument("--activation", type=str, default=None, help="Optional single activation to evaluate")
+    parser.add_argument("--seeds", type=int, nargs="+", default=[42, 123, 999, 2024, 2025], help="Random seeds")
+    parser.add_argument("--epochs", type=int, default=10, help="Training epochs")
+    parser.add_argument("--benchmark", action="store_true", help="Run the full activation sweep")
+    args = parser.parse_args()
+
+    if args.benchmark or args.activation is None:
+        run_segmentation_benchmark(seeds=args.seeds, epochs=args.epochs)
+    else:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        print(f"Running Segmentation Benchmark on {device} (N={len(args.seeds)})")
+        for seed in args.seeds:
+            miou = train_and_eval(activation=args.activation, seed=seed, epochs=args.epochs)
+            print(f"Activation: {args.activation.ljust(15)} | Seed {seed} | Validation mIoU: {miou:.4f}")

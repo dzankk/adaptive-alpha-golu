@@ -370,4 +370,20 @@ def train_and_eval(activation: str = "alpha_golu", seed: int = 42, epochs: int =
 
 
 if __name__ == "__main__":
-    run_lm_benchmark()
+    import argparse
+
+    parser = argparse.ArgumentParser(description="WikiText-2 language modeling benchmark")
+    parser.add_argument("--activation", type=str, default=None, help="Optional single activation to evaluate")
+    parser.add_argument("--seeds", type=int, nargs="+", default=[42, 123, 999, 2024, 2025], help="Random seeds")
+    parser.add_argument("--epochs", type=int, default=5, help="Training epochs")
+    parser.add_argument("--benchmark", action="store_true", help="Run the full activation sweep")
+    args = parser.parse_args()
+
+    if args.benchmark or args.activation is None:
+        run_lm_benchmark(seeds=args.seeds, epochs=args.epochs)
+    else:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        print(f"Running WikiText-2 Language Model Benchmark on {device}...")
+        for seed in args.seeds:
+            ppl = train_and_eval(activation=args.activation, seed=seed, epochs=args.epochs)
+            print(f"[{args.activation.upper():<14} | Seed {seed}] Validation Perplexity: {ppl:.2f}")

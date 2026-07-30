@@ -316,14 +316,17 @@ def train_single_seed_robustness(act_type: str, seed: int, epochs: int, device: 
     return clean_acc, pgd_acc
 
 
-def run_benchmark():
+def run_benchmark(seeds=None, epochs: int = 10):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Running Full Adversarial Robustness Benchmark on {device}")
     activations = ['relu', 'gelu', 'swish', 'prelu', 'pgelu', 'golu_static', 'alpha_golu', 'swish_adaptive']
+    seeds = seeds or [42, 123, 999, 2024, 2025]
 
     for act_type in activations:
-        clean_acc, pgd_acc = train_single_seed_robustness(act_type=act_type, seed=42, epochs=5, device=device)
-        print(f"Activation: {act_type.ljust(15)} | Clean Acc: {clean_acc:.2f}% | PGD-10 Robust Acc: {pgd_acc:.2f}%")
+        print(f"\n--- Activation: {act_type.upper()} ---")
+        for seed in seeds:
+            clean_acc, pgd_acc = train_single_seed_robustness(act_type=act_type, seed=seed, epochs=epochs, device=device)
+            print(f"Seed {seed} -> Clean Acc: {clean_acc:.2f}% | PGD-10 Robust Acc: {pgd_acc:.2f}%")
 
 
 def train_and_eval(activation: str = 'alpha_golu', seed: int = 42, epochs: int = 10) -> float:
@@ -334,4 +337,20 @@ def train_and_eval(activation: str = 'alpha_golu', seed: int = 42, epochs: int =
 
 
 if __name__ == '__main__':
-    run_benchmark()
+    import argparse
+
+    parser = argparse.ArgumentParser(description="CIFAR-10 adversarial robustness benchmark")
+    parser.add_argument("--activation", type=str, default=None, help="Optional single activation to evaluate")
+    parser.add_argument("--seeds", type=int, nargs="+", default=[42, 123, 999, 2024, 2025], help="Random seeds")
+    parser.add_argument("--epochs", type=int, default=10, help="Training epochs")
+    parser.add_argument("--benchmark", action="store_true", help="Run the full activation sweep")
+    args = parser.parse_args()
+
+    if args.benchmark or args.activation is None:
+        run_benchmark(seeds=args.seeds, epochs=args.epochs)
+    else:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        print(f"Running Adversarial Robustness Benchmark on {device}")
+        for seed in args.seeds:
+            clean_acc, pgd_acc = train_and_eval(activation=args.activation, seed=seed, epochs=args.epochs)
+            print(f"Activation: {args.activation.ljust(15)} | Seed {seed} | Clean: {clean_acc:.2f}% | PGD-10: {pgd_acc:.2f}%")

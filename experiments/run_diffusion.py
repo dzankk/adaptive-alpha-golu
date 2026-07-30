@@ -227,19 +227,19 @@ def train_single_seed_diffusion(act_type: str, seed: int, epochs: int, device: t
     return float(np.mean(val_losses))
 
 
-def run_diffusion_benchmark():
+def run_diffusion_benchmark(seeds=None, epochs: int = 10):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Running CelebA DDPM Diffusion Benchmark on {device}...")
 
     activations = ['relu', 'gelu', 'swish', 'adaptive_swish', 'prelu', 'pgelu', 'golu_static', 'alpha_golu']
-    seeds = [42, 123, 999, 2024, 2025]
+    seeds = seeds or [42, 123, 999, 2024, 2025]
     results = {}
 
     print("\n================ CelebA DDPM Denoising Loss (MSE ↓) ================")
     for act in activations:
         seed_losses = []
         for s in seeds:
-            mean_val = train_single_seed_diffusion(act_type=act, seed=s, epochs=10, device=device)
+            mean_val = train_single_seed_diffusion(act_type=act, seed=s, epochs=epochs, device=device)
             seed_losses.append(mean_val)
             print(f"[{act.upper():<14} | Seed {s}] Denoising MSE: {mean_val:.6f}")
 
@@ -258,4 +258,20 @@ def train_and_eval(activation: str = 'alpha_golu', seed: int = 42, epochs: int =
 
 
 if __name__ == '__main__':
-    run_diffusion_benchmark()
+    import argparse
+
+    parser = argparse.ArgumentParser(description="CelebA diffusion benchmark")
+    parser.add_argument("--activation", type=str, default=None, help="Optional single activation to evaluate")
+    parser.add_argument("--seeds", type=int, nargs="+", default=[42, 123, 999, 2024, 2025], help="Random seeds")
+    parser.add_argument("--epochs", type=int, default=10, help="Training epochs")
+    parser.add_argument("--benchmark", action="store_true", help="Run the full activation sweep")
+    args = parser.parse_args()
+
+    if args.benchmark or args.activation is None:
+        run_diffusion_benchmark(seeds=args.seeds, epochs=args.epochs)
+    else:
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        print(f"Running CelebA DDPM Diffusion Benchmark on {device}...")
+        for seed in args.seeds:
+            loss = train_and_eval(activation=args.activation, seed=seed, epochs=args.epochs)
+            print(f"Activation: {args.activation.ljust(15)} | Seed {seed} | Denoising MSE: {loss:.6f}")

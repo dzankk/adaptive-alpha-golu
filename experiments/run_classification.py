@@ -341,6 +341,22 @@ def train_and_eval(activation: str = 'alpha_golu', seed: int = 42, dataset_name:
 
 
 if __name__ == '__main__':
-    default_seeds = [42, 123, 999, 2024, 2025]
-    run_benchmark(dataset_name="cifar10", seeds=default_seeds, epochs=10)
-    run_benchmark(dataset_name="fashion_mnist", seeds=default_seeds, epochs=10)
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Unified ResNet-18 benchmark")
+    parser.add_argument("--dataset-name", type=str, default=None, choices=["cifar10", "fashion_mnist"], help="Dataset to evaluate")
+    parser.add_argument("--seeds", type=int, nargs="+", default=[42, 123, 999, 2024, 2025], help="Random seeds")
+    parser.add_argument("--epochs", type=int, default=10, help="Training epochs")
+    parser.add_argument("--activation", type=str, default=None, help="Optional single activation to evaluate")
+    args = parser.parse_args()
+
+    if args.activation:
+        dataset_name = args.dataset_name or "cifar10"
+        print(f"Running Classification Benchmark on {dataset_name.upper()}...")
+        for seed in args.seeds:
+            acc, _ = train_single_seed(act_type=args.activation, dataset_name=dataset_name, seed=seed, epochs=args.epochs, device=torch.device("cuda" if torch.cuda.is_available() else "cpu"))
+            print(f"Activation: {args.activation.ljust(15)} | Seed {seed} | Accuracy: {acc:.2f}%")
+    else:
+        dataset_names = [args.dataset_name] if args.dataset_name else ["cifar10", "fashion_mnist"]
+        for dataset_name in dataset_names:
+            run_benchmark(dataset_name=dataset_name, seeds=args.seeds, epochs=args.epochs)
