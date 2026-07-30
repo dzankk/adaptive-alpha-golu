@@ -45,9 +45,8 @@ class StaticGoLU(nn.Module):
         super().__init__()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Clamped inside exp to prevent numerical overflow in double-exp
-        scaled_x = torch.clamp(x, min=-15.0, max=15.0)
-        gate = torch.exp(-torch.exp(-scaled_x))
+        scaled_x = torch.clamp(-x, min=-88.0, max=88.0)
+        gate = torch.exp(-torch.exp(scaled_x))
         return x * gate
 
 
@@ -58,19 +57,11 @@ class AlphaGoLU(nn.Module):
     Mathematical Formulation:
         AlphaGoLU(x) = x * exp(-exp(-alpha * x))
         where alpha = softplus(raw_alpha) > 0
-        
-    Attributes:
-        num_parameters (int): Number of learnable alpha parameters. 
-            1 for layer-wide scalar, or C for channel-wise vectors.
-        init_alpha (float): Initial target value for parameter alpha (Default: 1.0).
-        raw_alpha (nn.Parameter): Learnable raw parameter mapped through softplus.
     """
     def __init__(self, num_parameters: int = 1, init_alpha: float = 1.0):
         super().__init__()
         self.num_parameters = num_parameters
         
-        # Inverse softplus initialization: softplus(raw_alpha) == init_alpha
-        # Formula: raw = log(exp(init_alpha) - 1.0)
         init_val = float(init_alpha)
         init_raw = math.log(math.exp(init_val) - 1.0) if init_val < 20 else init_val
         
@@ -86,7 +77,6 @@ class AlphaGoLU(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         current_alpha = self.alpha
 
-        # Handle dimensional broadcasting for channel-wise vs layer-wide parameters
         if self.num_parameters > 1:
             if x.dim() == 4:     # CNN Feature Map (B, C, H, W)
                 shape = (1, -1, 1, 1)
@@ -98,8 +88,7 @@ class AlphaGoLU(nn.Module):
         else:
             alpha_param = current_alpha
 
-        # Compute double-exponential Gompertz gate with safe numerical bounds
-        scaled_x = torch.clamp(-alpha_param * x, min=-15.0, max=15.0)
+        scaled_x = torch.clamp(-alpha_param * x, min=-88.0, max=88.0)
         gate = torch.exp(-torch.exp(scaled_x))
         return x * gate
 
@@ -114,5 +103,4 @@ class AlphaGoLU(nn.Module):
         return f"num_parameters={self.num_parameters}, mean_alpha={current_a.mean().item():.4f}"
 
 
-# Alias for backward compatibility across experiment runners
 AdaptiveAlphaGoLU = AlphaGoLU
