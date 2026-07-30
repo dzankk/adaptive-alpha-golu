@@ -1,14 +1,13 @@
 """
 Benchmark: Pascal VOC 2012 Object Detection
 ===========================================
-Trains a lightweight anchor-free detector on real Pascal VOC annotations and
+Trains a standard Faster R-CNN baseline on real Pascal VOC annotations and
 reports VOC-style mAP@0.5 on a held-out validation split.
 
-This runner is intentionally grounded in a real benchmark rather than a toy or
-proxy dataset.
+The detection head uses a selectable activation function, while any learnable
+activation scalars remain isolated from weight decay.
 """
 
-import math
 import random
 from collections import defaultdict
 from typing import Dict, List, Tuple
@@ -20,7 +19,11 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader, Dataset, random_split
 from torchvision.datasets import VOCDetection
-from torchvision.ops import box_iou, nms
+from torchvision.models.detection import FasterRCNN
+from torchvision.models.detection.backbone_utils import resnet_fpn_backbone
+from torchvision.models.detection.faster_rcnn import FastRCNNPredictor, FasterRCNNPredictor
+from torchvision.models.detection.rpn import AnchorGenerator
+from torchvision.ops import box_iou
 from torchvision.transforms import functional as TF
 
 from models.alpha_golu import AlphaGoLU as AdaptiveAlphaGoLU, StaticGoLU
@@ -55,13 +58,7 @@ class PGELU(nn.Module):
 
     def __init__(self, init_alpha: float = 1.0):
         super().__init__()
-        init_val = float(init_alpha)
-        init_raw = math.log(math.expm1(init_val)) if init_val < 20 else init_val
-        self.raw_alpha = nn.Parameter(torch.tensor(init_raw, dtype=torch.float32))
-
-    @property
-    def alpha(self) -> torch.Tensor:
-        return F.softplus(self.raw_alpha)
+        self.alpha = nn.Parameter(torch.tensor(float(init_alpha), dtype=torch.float32))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return x * 0.5 * (1.0 + torch.erf((self.alpha * x) / 1.41421356237))
@@ -102,7 +99,7 @@ def get_activation(act_type: str) -> nn.Module:
     raise ValueError(f"Unknown activation type: {act_type}")
 
 
-def get_optimizer(model: nn.Module, lr: float = 1e-3, weight_decay: float = 1e-4) -> optim.Optimizer:
+def get_optimizer(model: nn.Module, lr: float = 2e-3, weight_decay: float = 1e-4) -> optim.Optimizer:
     act_params = []
     base_params = []
 
@@ -207,166 +204,40 @@ def detection_collate_fn(batch):
     return list(images), list(targets)
 
 
-class DetectionBackbone(nn.Module):
-    """Lightweight feature extractor with selectable activations."""
+class ActivationBoxHead(nn.Module):
+    """Two-layer FC box head with a selectable activation."""
 
-    def __init__(self, act_type: str = "relu"):
+    def __init__(self, in_channels: int, representation_size: int, act_type: str):
         super().__init__()
-        self.stem = nn.Sequential(
-            nn.Conv2d(3, 32, kernel_size=3, stride=2, padding=1, bias=False),
-            nn.BatchNorm2d(32),
-            get_activation(act_type),
-            nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1, bias=False),
-            nn.BatchNorm2d(64),
-            get_activation(act_type),
-            nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1, bias=False),
-            nn.BatchNorm2d(128),
-            get_activation(act_type),
-            nn.Conv2d(128, 128, kernel_size=3, stride=2, padding=1, bias=False),
-            nn.BatchNorm2d(128),
-            get_activation(act_type),
-        )
+        self.fc6 = nn.Linear(in_channels, representation_size)
+        self.act = get_activation(act_type)
+        self.fc7 = nn.Linear(representation_size, representation_size)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.stem(x)
+        x = torch.flatten(x, start_dim=1)
+        x = self.act(self.fc6(x))
+        x = self.act(self.fc7(x))
+        return x
 
 
-class DenseVOCDetector(nn.Module):
-    """Dense anchor-free detector trained on Pascal VOC."""
-
-    def __init__(self, act_type: str = "relu", num_classes: int = 21):
-        super().__init__()
-        self.num_classes = num_classes
-        self.backbone = DetectionBackbone(act_type=act_type)
-        self.cls_head = nn.Sequential(
-            nn.Conv2d(128, 128, kernel_size=3, padding=1),
-            get_activation(act_type),
-            nn.Conv2d(128, num_classes, kernel_size=1),
-        )
-        self.box_head = nn.Sequential(
-            nn.Conv2d(128, 128, kernel_size=3, padding=1),
-            get_activation(act_type),
-            nn.Conv2d(128, 4, kernel_size=1),
-        )
-
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        features = self.backbone(x)
-        return self.cls_head(features), self.box_head(features)
-
-
-def build_dense_targets(
-    targets: List[Dict[str, torch.Tensor]],
-    feat_h: int,
-    feat_w: int,
-    image_size: int,
-    device: torch.device,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    batch_size = len(targets)
-    cls_targets = torch.zeros((batch_size, feat_h, feat_w), dtype=torch.long, device=device)
-    box_targets = torch.zeros((batch_size, feat_h, feat_w, 4), dtype=torch.float32, device=device)
-    positive_mask = torch.zeros((batch_size, feat_h, feat_w), dtype=torch.bool, device=device)
-    assigned_area = torch.zeros((batch_size, feat_h, feat_w), dtype=torch.float32, device=device)
-
-    for batch_index, target in enumerate(targets):
-        boxes = target["boxes"].to(device)
-        labels = target["labels"].to(device)
-        if boxes.numel() == 0:
-            continue
-
-        centers = (boxes[:, :2] + boxes[:, 2:]) / 2.0
-        sizes = boxes[:, 2:] - boxes[:, :2]
-        x_cells = torch.clamp((centers[:, 0] / image_size * feat_w).long(), min=0, max=feat_w - 1)
-        y_cells = torch.clamp((centers[:, 1] / image_size * feat_h).long(), min=0, max=feat_h - 1)
-        areas = sizes[:, 0] * sizes[:, 1]
-
-        for obj_index in range(boxes.size(0)):
-            gx = int(x_cells[obj_index].item())
-            gy = int(y_cells[obj_index].item())
-            area = float(areas[obj_index].item())
-
-            if (not positive_mask[batch_index, gy, gx]) or area > float(assigned_area[batch_index, gy, gx].item()):
-                cls_targets[batch_index, gy, gx] = labels[obj_index]
-                cx = centers[obj_index, 0] / image_size
-                cy = centers[obj_index, 1] / image_size
-                w = sizes[obj_index, 0] / image_size
-                h = sizes[obj_index, 1] / image_size
-                box_targets[batch_index, gy, gx] = torch.tensor([cx, cy, w, h], device=device)
-                positive_mask[batch_index, gy, gx] = True
-                assigned_area[batch_index, gy, gx] = area
-
-    return cls_targets, box_targets, positive_mask
-
-
-def decode_predictions(
-    cls_logits: torch.Tensor,
-    box_logits: torch.Tensor,
-    image_size: int,
-    score_thresh: float = 0.05,
-    nms_thresh: float = 0.5,
-) -> Dict[str, torch.Tensor]:
-    probs = torch.softmax(cls_logits, dim=0)  # [C, H, W]
-    class_scores, class_labels = probs[1:].max(dim=0)
-    class_labels = class_labels + 1
-
-    box_params = torch.stack(
-        [
-            torch.sigmoid(box_logits[0]),
-            torch.sigmoid(box_logits[1]),
-            F.softplus(box_logits[2]),
-            F.softplus(box_logits[3]),
-        ],
-        dim=0,
+def build_detection_model(act_type: str, num_classes: int = 21) -> FasterRCNN:
+    backbone = resnet_fpn_backbone("resnet50", weights=None, trainable_layers=3)
+    anchor_generator = AnchorGenerator(
+        sizes=((32, 64, 128, 256, 512),),
+        aspect_ratios=((0.5, 1.0, 2.0),),
+    )
+    model = FasterRCNN(
+        backbone,
+        num_classes=num_classes,
+        rpn_anchor_generator=anchor_generator,
+        box_roi_pool=None,
     )
 
-    class_scores = class_scores.reshape(-1)
-    class_labels = class_labels.reshape(-1)
-    box_params = box_params.permute(1, 2, 0).reshape(-1, 4)
-
-    keep = class_scores > score_thresh
-    if keep.sum() == 0:
-        return {
-            "boxes": torch.zeros((0, 4), dtype=torch.float32, device=cls_logits.device),
-            "scores": torch.zeros((0,), dtype=torch.float32, device=cls_logits.device),
-            "labels": torch.zeros((0,), dtype=torch.long, device=cls_logits.device),
-        }
-
-    class_scores = class_scores[keep]
-    class_labels = class_labels[keep]
-    box_params = box_params[keep]
-
-    centers = box_params[:, :2] * image_size
-    sizes = box_params[:, 2:] * image_size
-    boxes = torch.cat([centers - sizes / 2.0, centers + sizes / 2.0], dim=1)
-    boxes[:, [0, 2]] = boxes[:, [0, 2]].clamp(0.0, float(image_size))
-    boxes[:, [1, 3]] = boxes[:, [1, 3]].clamp(0.0, float(image_size))
-
-    final_boxes = []
-    final_scores = []
-    final_labels = []
-    for label in class_labels.unique(sorted=True):
-        label_mask = class_labels == label
-        label_boxes = boxes[label_mask]
-        label_scores = class_scores[label_mask]
-        if label_boxes.numel() == 0:
-            continue
-
-        keep_indices = nms(label_boxes, label_scores, nms_thresh)
-        final_boxes.append(label_boxes[keep_indices])
-        final_scores.append(label_scores[keep_indices])
-        final_labels.append(torch.full((len(keep_indices),), int(label.item()), dtype=torch.long, device=cls_logits.device))
-
-    if not final_boxes:
-        return {
-            "boxes": torch.zeros((0, 4), dtype=torch.float32, device=cls_logits.device),
-            "scores": torch.zeros((0,), dtype=torch.float32, device=cls_logits.device),
-            "labels": torch.zeros((0,), dtype=torch.long, device=cls_logits.device),
-        }
-
-    return {
-        "boxes": torch.cat(final_boxes, dim=0),
-        "scores": torch.cat(final_scores, dim=0),
-        "labels": torch.cat(final_labels, dim=0),
-    }
+    representation_size = 1024
+    in_channels = model.roi_heads.box_head.fc6.in_features
+    model.roi_heads.box_head = ActivationBoxHead(in_channels, representation_size, act_type)
+    model.roi_heads.box_predictor = FastRCNNPredictor(representation_size, num_classes)
+    return model
 
 
 def voc_ap(recalls: np.ndarray, precisions: np.ndarray) -> float:
@@ -387,9 +258,7 @@ def evaluate_map50(
     model: nn.Module,
     dataloader: DataLoader,
     device: torch.device,
-    image_size: int,
     score_thresh: float = 0.05,
-    nms_thresh: float = 0.5,
 ) -> float:
     model.eval()
 
@@ -398,8 +267,8 @@ def evaluate_map50(
 
     with torch.no_grad():
         for images, targets in dataloader:
-            batch_images = torch.stack([image.to(device) for image in images])
-            cls_logits, box_logits = model(batch_images)
+            batch_images = [image.to(device) for image in images]
+            predictions = model(batch_images)
 
             for batch_index, target in enumerate(targets):
                 image_id = int(target["image_id"].item())
@@ -409,13 +278,13 @@ def evaluate_map50(
                 for gt_box, gt_label in zip(gt_boxes, gt_labels):
                     ground_truth_by_class[int(gt_label.item())][image_id].append(gt_box.clone())
 
-                prediction = decode_predictions(
-                    cls_logits[batch_index],
-                    box_logits[batch_index],
-                    image_size=image_size,
-                    score_thresh=score_thresh,
-                    nms_thresh=nms_thresh,
-                )
+                prediction = predictions[batch_index]
+                keep = prediction["scores"] >= score_thresh
+                prediction = {
+                    "boxes": prediction["boxes"][keep].detach().cpu(),
+                    "scores": prediction["scores"][keep].detach().cpu(),
+                    "labels": prediction["labels"][keep].detach().cpu(),
+                }
 
                 for box, score, label in zip(prediction["boxes"], prediction["scores"], prediction["labels"]):
                     detections_by_class[int(label.item())].append((float(score.item()), image_id, box.detach().cpu()))
@@ -522,50 +391,31 @@ def train_single_seed_detection(
         pin_memory=torch.cuda.is_available(),
     )
 
-    model = DenseVOCDetector(act_type=act_type, num_classes=len(VOC_CLASSES) + 1).to(device)
-    optimizer = get_optimizer(model, lr=1e-3)
+    model = build_detection_model(act_type=act_type, num_classes=len(VOC_CLASSES) + 1).to(device)
+    optimizer = get_optimizer(model, lr=2e-4, weight_decay=1e-4)
+    scheduler = optim.lr_scheduler.MultiStepLR(optimizer, milestones=[max(1, epochs // 2), max(1, (3 * epochs) // 4)], gamma=0.1)
 
     for epoch in range(epochs):
         model.train()
         for images, targets in train_loader:
-            batch_images = torch.stack([image.to(device) for image in images])
-            cls_logits, box_logits = model(batch_images)
+            images = [image.to(device) for image in images]
+            targets = [
+                {
+                    "boxes": target["boxes"].to(device),
+                    "labels": target["labels"].to(device),
+                    "image_id": target["image_id"].to(device),
+                }
+                for target in targets
+            ]
 
-            _, _, feat_h, feat_w = cls_logits.shape
-            cls_targets, box_targets, positive_mask = build_dense_targets(
-                targets,
-                feat_h=feat_h,
-                feat_w=feat_w,
-                image_size=image_size,
-                device=device,
-            )
-
-            cls_loss = F.cross_entropy(
-                cls_logits.permute(0, 2, 3, 1).reshape(-1, len(VOC_CLASSES) + 1),
-                cls_targets.reshape(-1),
-            )
-
-            pred_box = torch.stack(
-                [
-                    torch.sigmoid(box_logits[:, 0]),
-                    torch.sigmoid(box_logits[:, 1]),
-                    F.softplus(box_logits[:, 2]),
-                    F.softplus(box_logits[:, 3]),
-                ],
-                dim=1,
-            ).permute(0, 2, 3, 1)
-
-            if positive_mask.any():
-                box_loss = F.smooth_l1_loss(pred_box[positive_mask], box_targets[positive_mask])
-            else:
-                box_loss = torch.tensor(0.0, device=device)
-
-            loss = cls_loss + 2.0 * box_loss
+            loss_dict = model(images, targets)
+            loss = sum(loss_value for loss_value in loss_dict.values())
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
+        scheduler.step()
 
-    map50 = evaluate_map50(model, eval_loader, device=device, image_size=image_size)
+    map50 = evaluate_map50(model, eval_loader, device=device)
     return float(map50)
 
 
@@ -575,14 +425,21 @@ def run_detection_benchmark():
     activations = ["relu", "gelu", "swish", "prelu", "pgelu", "golu_static", "alpha_golu", "swish_adaptive"]
 
     for act_type in activations:
-        map50 = train_single_seed_detection(act_type, seed=42, epochs=3, device=device)
+        map50 = train_single_seed_detection(act_type, seed=42, epochs=8, device=device, max_train_samples=2000, max_eval_samples=400)
         print(f"Activation: {act_type.ljust(15)} | VOC mAP@0.5: {map50:.4f}")
 
 
 def train_and_eval(activation: str = "alpha_golu", seed: int = 42, epochs: int = 3) -> float:
     """Returns VOC mAP@0.5 on a held-out Pascal VOC validation split."""
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    map50 = train_single_seed_detection(act_type=activation, seed=seed, epochs=epochs, device=device)
+    map50 = train_single_seed_detection(
+        act_type=activation,
+        seed=seed,
+        epochs=max(epochs, 8),
+        device=device,
+        max_train_samples=2000,
+        max_eval_samples=400,
+    )
     return float(map50)
 
 
