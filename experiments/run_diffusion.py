@@ -1,5 +1,5 @@
 """
-Benchmark: DDPM Denoising on FashionMNIST
+Benchmark: DDPM Denoising on CelebA
 Evaluates spatial noise prediction MSE on real image manifolds.
 Tests static vs. adaptive activation dynamics across multi-step diffusion steps.
 Fully audited for parameter constraints, proper iteration counts, and deterministic evaluation.
@@ -95,7 +95,7 @@ class SinusoidalPositionEmbeddings(nn.Module):
 
 
 class DiffusionUNet(nn.Module):
-    def __init__(self, in_channels=1, act_type='alpha_golu'):
+    def __init__(self, in_channels=3, act_type='alpha_golu'):
         super().__init__()
         self.time_mlp = nn.Sequential(
             SinusoidalPositionEmbeddings(64),
@@ -144,12 +144,14 @@ def train_single_seed_diffusion(act_type: str, seed: int, epochs: int, device: t
     reset_seeds(seed)
 
     transform = transforms.Compose([
+        transforms.Resize((64, 64)),
+        transforms.CenterCrop(64),
         transforms.ToTensor(),
-        transforms.Normalize((0.5,), (0.5,))
+        transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
     ])
 
-    full_dataset = torchvision.datasets.FashionMNIST(root='./data', train=True, download=True, transform=transform)
-    test_dataset = torchvision.datasets.FashionMNIST(root='./data', train=False, download=True, transform=transform)
+    full_dataset = torchvision.datasets.CelebA(root='./data', split='train', target_type='attr', download=True, transform=transform)
+    test_dataset = torchvision.datasets.CelebA(root='./data', split='valid', target_type='attr', download=True, transform=transform)
 
     loader_g = torch.Generator().manual_seed(seed)
     eval_g = torch.Generator().manual_seed(seed + 999)
@@ -178,7 +180,7 @@ def train_single_seed_diffusion(act_type: str, seed: int, epochs: int, device: t
     alpha = 1.0 - beta
     alpha_hat = torch.cumprod(alpha, dim=0)
 
-    model = DiffusionUNet(in_channels=1, act_type=act_type).to(device)
+    model = DiffusionUNet(in_channels=3, act_type=act_type).to(device)
     optimizer = get_optimizer(model)
     criterion = nn.MSELoss()
 
@@ -220,13 +222,13 @@ def train_single_seed_diffusion(act_type: str, seed: int, epochs: int, device: t
 
 def run_diffusion_benchmark():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Running FashionMNIST DDPM Diffusion Benchmark on {device}...")
+    print(f"Running CelebA DDPM Diffusion Benchmark on {device}...")
 
     activations = ['relu', 'gelu', 'swish', 'adaptive_swish', 'prelu', 'pgelu', 'golu_static', 'alpha_golu']
     seeds = [42, 123, 999, 2024, 2025]
     results = {}
 
-    print("\n================ FashionMNIST DDPM Denoising Loss (MSE ↓) ================")
+    print("\n================ CelebA DDPM Denoising Loss (MSE ↓) ================")
     for act in activations:
         seed_losses = []
         for s in seeds:
@@ -236,7 +238,7 @@ def run_diffusion_benchmark():
 
         results[act] = (np.mean(seed_losses), np.std(seed_losses))
 
-    print("\n================ FASHIONMNIST DIFFUSION SUMMARY ================")
+    print("\n================ CELEBA DIFFUSION SUMMARY ================")
     for act, (m_loss, s_loss) in results.items():
         print(f"  {act.upper():<14}: Loss = {m_loss:.6f} ± {s_loss:.6f}")
 

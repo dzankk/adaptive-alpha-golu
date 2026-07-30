@@ -190,7 +190,7 @@ def handle_generate_table(args):
     print("\\midrule")
     
     # Render Welch t-test p-value row
-    p_row = ["\textit{$p$-value (Welch; $\alpha$ vs Static)}"]
+    p_row = ["\\textit{$p$-value (Welch; $\\alpha$ vs Static)}"]
     for t in tasks:
         p_val = data[t].get("p_value_welch_alpha_vs_static", None)
         if p_val is not None:

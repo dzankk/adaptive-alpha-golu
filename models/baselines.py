@@ -98,14 +98,23 @@ class DeepConvNet(nn.Module):
 
     def extract_alphas(self) -> list:
         """Returns current alpha values if using AlphaGoLU, else static scalars."""
-        if self.act_type in {'alpha_golu', 'adaptive_alpha_golu'}:
-            return [
-                self.act1.get_alpha_val(),
-                self.act2.get_alpha_val(),
-                self.act3.get_alpha_val(),
-                self.act4.get_alpha_val()
-            ]
-        return [torch.tensor(1.0) for _ in range(4)]
+        extracted = []
+        for module in [self.act1, self.act2, self.act3, self.act4]:
+            if hasattr(module, "get_alpha_val"):
+                extracted.append(module.get_alpha_val())
+            elif hasattr(module, "alpha"):
+                alpha_value = module.alpha
+                if isinstance(alpha_value, torch.Tensor):
+                    extracted.append(alpha_value.detach().cpu())
+                else:
+                    extracted.append(torch.tensor(float(alpha_value)))
+            elif hasattr(module, "beta"):
+                extracted.append(module.beta.detach().cpu())
+            elif isinstance(module, nn.PReLU):
+                extracted.append(module.weight.detach().cpu())
+            else:
+                extracted.append(torch.tensor(1.0))
+        return extracted
 
     def extract_latent_variances(self) -> list:
         """Returns the latest post-activation variances across layers."""

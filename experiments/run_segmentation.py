@@ -13,6 +13,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader, Dataset, random_split
+from torchvision.datasets import VOCSegmentation
+from torchvision.transforms import functional as TF
 from models.alpha_golu import AlphaGoLU as AdaptiveAlphaGoLU, StaticGoLU
 
 
@@ -110,7 +112,7 @@ class UNetBlock(nn.Module):
 
 
 class UNet(nn.Module):
-    def __init__(self, in_channels: int = 3, num_classes: int = 1, act_type: str = 'relu'):
+    def __init__(self, in_channels: int = 3, num_classes: int = 21, act_type: str = 'relu'):
         super().__init__()
         self.enc1 = UNetBlock(in_channels, 32, act_type)
         self.pool1 = nn.MaxPool2d(2)
@@ -139,45 +141,50 @@ class UNet(nn.Module):
 
 
 # ==========================================
-# 3. Synthetic Dataset & Metrics
+# 3. Real Dataset & Metrics
 # ==========================================
-class SyntheticSegmentationDataset(Dataset):
-    """Generates structured synthetic geometric targets for segmentation learning."""
-    def __init__(self, size: int = 100, height: int = 128, width: int = 128, seed: int = 42):
-        self.size = size
-        self.height = height
-        self.width = width
-        self.seed = seed
+VOC_SEG_CLASSES = 21
+
+
+class PascalVOCSegmentationDataset(Dataset):
+    """Pascal VOC segmentation wrapper returning resized tensors and masks."""
+
+    def __init__(self, root: str = './data', year: str = '2012', image_set: str = 'train', image_size: int = 256, download: bool = True):
+        self.dataset = VOCSegmentation(root=root, year=year, image_set=image_set, download=download)
+        self.image_size = image_size
 
     def __len__(self):
-        return self.size
+        return len(self.dataset)
 
     def __getitem__(self, idx: int):
-        sample_rng = np.random.RandomState(self.seed + idx)
-        
-        # Base structured noise background
-        x = sample_rng.randn(3, self.height, self.width).astype(np.float32)
-        
-        # Draw dynamic synthetic target region
-        y = np.zeros((1, self.height, self.width), dtype=np.float32)
-        cx, cy = sample_rng.randint(32, 96, size=2)
-        r = sample_rng.randint(16, 32)
-        
-        grid_y, grid_x = np.ogrid[:self.height, :self.width]
-        mask = (grid_x - cx) ** 2 + (grid_y - cy) ** 2 <= r ** 2
-        
-        y[0, mask] = 1.0
-        x[0, mask] += 1.5  # Signal shift inside target mask
-        
-        return torch.from_numpy(x), torch.from_numpy(y)
+        image, mask = self.dataset[idx]
+        image = TF.resize(image, (self.image_size, self.image_size))
+        image = TF.to_tensor(image)
+        image = TF.normalize(image, mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225))
+
+        mask = TF.resize(mask, (self.image_size, self.image_size), interpolation=TF.InterpolationMode.NEAREST)
+        mask = torch.as_tensor(np.array(mask), dtype=torch.long)
+        mask[mask == 255] = 255
+        return image, mask
 
 
-def compute_mIoU(preds: torch.Tensor, targets: torch.Tensor, threshold: float = 0.5) -> float:
-    preds_binary = (torch.sigmoid(preds) > threshold).float()
-    intersection = (preds_binary * targets).sum(dim=[2, 3])
-    union = (preds_binary + targets - preds_binary * targets).sum(dim=[2, 3])
-    iou = (intersection + 1e-6) / (union + 1e-6)
-    return iou.mean().item()
+def compute_mIoU(preds: torch.Tensor, targets: torch.Tensor, num_classes: int = 21, ignore_index: int = 255) -> float:
+    preds = preds.argmax(dim=1)
+    valid_mask = targets != ignore_index
+    iou_values = []
+
+    for class_index in range(num_classes):
+        pred_class = preds == class_index
+        target_class = targets == class_index
+        pred_class = pred_class & valid_mask
+        target_class = target_class & valid_mask
+
+        intersection = (pred_class & target_class).sum().item()
+        union = (pred_class | target_class).sum().item()
+        if union > 0:
+            iou_values.append((intersection + 1e-6) / (union + 1e-6))
+
+    return float(np.mean(iou_values)) if iou_values else 0.0
 
 
 def set_seed(seed: int):
@@ -193,20 +200,23 @@ def set_seed(seed: int):
 def train_single_seed_segmentation(act_type: str, seed: int, epochs: int, device: torch.device) -> float:
     set_seed(seed)
     
-    full_dataset = SyntheticSegmentationDataset(size=100, seed=seed)
+    full_dataset = PascalVOCSegmentationDataset(root='./data', year='2012', image_set='train', image_size=256, download=True)
+    val_dataset = PascalVOCSegmentationDataset(root='./data', year='2012', image_set='val', image_size=256, download=True)
     train_size = int(0.8 * len(full_dataset))
     val_size = len(full_dataset) - train_size
     train_ds, val_ds = random_split(
         full_dataset, [train_size, val_size], generator=torch.Generator().manual_seed(seed)
     )
+    # Use the actual Pascal VOC validation split for final reporting.
+    val_ds = val_dataset
 
     loader_g = torch.Generator().manual_seed(seed)
     train_loader = DataLoader(train_ds, batch_size=8, shuffle=True, generator=loader_g)
     val_loader = DataLoader(val_ds, batch_size=8, shuffle=False, generator=loader_g)
 
-    model = UNet(act_type=act_type).to(device)
+    model = UNet(act_type=act_type, num_classes=VOC_SEG_CLASSES).to(device)
     optimizer = get_optimizer(model, lr=1e-3, weight_decay=1e-4)
-    criterion = nn.BCEWithLogitsLoss()
+    criterion = nn.CrossEntropyLoss(ignore_index=255)
 
     for epoch in range(epochs):
         model.train()
@@ -224,7 +234,7 @@ def train_single_seed_segmentation(act_type: str, seed: int, epochs: int, device
         for x, y in val_loader:
             x, y = x.to(device), y.to(device)
             out = model(x)
-            total_iou += compute_mIoU(out, y)
+            total_iou += compute_mIoU(out, y, num_classes=VOC_SEG_CLASSES)
 
     return total_iou / len(val_loader)
 

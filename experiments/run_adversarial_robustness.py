@@ -52,6 +52,12 @@ def reset_all_seeds(seed=42):
     torch.backends.cudnn.benchmark = False
 
 
+def seed_worker(worker_id: int):
+    worker_seed = torch.initial_seed() % 2**32
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
+
+
 # ==========================================
 # 1. Custom Activation Implementations
 # ==========================================
@@ -271,8 +277,25 @@ def train_single_seed_robustness(act_type: str, seed: int, epochs: int, device: 
     trainset = torchvision.datasets.CIFAR10(root='./data', train=True, download=True, transform=transform_train)
     testset = torchvision.datasets.CIFAR10(root='./data', train=False, download=True, transform=transform_test)
 
-    train_loader = DataLoader(trainset, batch_size=128, shuffle=True, num_workers=2, pin_memory=True)
-    test_loader = DataLoader(testset, batch_size=256, shuffle=False, num_workers=2, pin_memory=True)
+    loader_g = torch.Generator().manual_seed(seed)
+    train_loader = DataLoader(
+        trainset,
+        batch_size=128,
+        shuffle=True,
+        num_workers=2,
+        pin_memory=True,
+        worker_init_fn=seed_worker,
+        generator=loader_g,
+    )
+    test_loader = DataLoader(
+        testset,
+        batch_size=256,
+        shuffle=False,
+        num_workers=2,
+        pin_memory=True,
+        worker_init_fn=seed_worker,
+        generator=loader_g,
+    )
 
     model = ResNet18(act_type=act_type).to(device)
     optimizer = get_optimizer(model, lr=1e-3)
