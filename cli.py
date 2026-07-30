@@ -5,8 +5,8 @@ Unified Command Line Interface for reproducing paper experiments, running
 multitask evaluations, and extracting statistical diagnostics
 
 usage examples:
-    python cli.py run --task classification --activation alpha_golu --seeds 42 123 999
-    python cli.py run_all --seeds 42 123 999
+    python cli.py run --task classification --activation alpha_golu --seeds 42 123 999 2024 2025
+    python cli.py run_all --seeds 42 123 999 2024 2025
     python cli.py generate_table --results_path outputs/benchmark_results.json
 """
 
@@ -35,7 +35,19 @@ TASK_MAP = {
     "robustness": run_robustness,
 }
 
-SUPPORTED_ACTIVATIONS = ["gelu", "swish", "prelu", "pgelu", "golu_static", "alpha_golu"]
+# Updated canonical set: includes standard static baselines and their parametric counterparts
+SUPPORTED_ACTIVATIONS = [
+    "relu",
+    "gelu",
+    "swish",
+    "prelu",
+    "pgelu",
+    "adaptive_swish",
+    "golu_static",
+    "alpha_golu"
+]
+
+DEFAULT_SEEDS = [42, 123, 999, 2024, 2025]
 
 
 def handle_run(args):
@@ -109,7 +121,7 @@ def handle_run_all(args):
 
 
 def handle_generate_table(args):
-    """Generates a LaTeX benchmark table from JSON results."""
+    """Generates a publication-ready LaTeX benchmark table from JSON results with bold/underline highlighting."""
     json_path = args.results_path
     if not os.path.exists(json_path):
         print(f"[Error] Benchmark results file not found at {json_path}")
@@ -118,36 +130,80 @@ def handle_generate_table(args):
     with open(json_path, "r") as f:
         data = json.load(f)
 
-    print("\n% ===== Auto-generated LaTeX Benchmark Table =====")
-    print("\\begin{table}[h]")
-    print("\\centering")
-    print("\\begin{tabular}{l" + "c" * len(data) + "}")
-    print("\\toprule")
-    
     tasks = list(data.keys())
-    header = "Activation & " + " & ".join([t.replace("_", " ").title() for t in tasks]) + " \\\\"
-    print(header)
-    print("\\midrule")
+    if not tasks:
+        print("[Error] Results file contains no tasks.")
+        return
 
-    # Pick activations from first task entries
+    # Identify all activation keys present in data
     first_task = tasks[0]
     acts = [k for k in data[first_task].keys() if k != "p_value_alpha_vs_static"]
 
+    print("\n% ===== Auto-Generated Publication LaTeX Benchmark Table =====")
+    print("\\begin{table*}[t]")
+    print("\\centering")
+    print("\\small")
+    print("\\begin{tabular}{l" + "c" * len(tasks) + "}")
+    print("\\toprule")
+    
+    header = "Activation & " + " & ".join([f"\\textbf{{{t.replace('_', ' ').title()}}}" for t in tasks]) + " \\\\"
+    print(header)
+    print("\\midrule")
+
+    # Find best (max/min) per task for formatting highlights
+    # Note: For LM and Diffusion lower score is better; for Classification, Detection, Segmentation, Robustness higher is better.
+    lower_is_better_tasks = {"language_model", "diffusion"}
+
+    best_per_task = {}
+    second_best_per_task = {}
+
+    for t in tasks:
+        means = {a: data[t][a]["mean"] for a in acts if a in data[t]}
+        if not means:
+            continue
+        
+        sorted_acts = sorted(means.keys(), key=lambda a: means[a], reverse=(t not in lower_is_better_tasks))
+        best_per_task[t] = sorted_acts[0]
+        second_best_per_task[t] = sorted_acts[1] if len(sorted_acts) > 1 else None
+
+    # Render Activation Rows
     for act in acts:
-        row = [act.upper()]
+        formatted_act_name = act.replace("_", "-").upper()
+        row = [f"\\texttt{{{formatted_act_name}}}"]
+        
         for t in tasks:
             if act in data[t]:
                 m = data[t][act]["mean"]
                 s = data[t][act]["std"]
-                row.append(f"{m:.2f} $\\pm$ {s:.2f}")
+                cell_str = f"{m:.2f} $\\pm$ {s:.2f}"
+                
+                if act == best_per_task.get(t):
+                    cell_str = f"\\textbf{{{cell_str}}}"
+                elif act == second_best_per_task.get(t):
+                    cell_str = f"\\underline{{{cell_str}}}"
+                
+                row.append(cell_str)
             else:
                 row.append("N/A")
         print(" & ".join(row) + " \\\\")
 
+    print("\\midrule")
+    
+    # Render Paired t-test p-value row
+    p_row = ["\\textit{$p$-value ($\\alpha$ vs Static)}"]
+    for t in tasks:
+        p_val = data[t].get("p_value_alpha_vs_static", None)
+        if p_val is not None:
+            p_row.append(f"\\textit{{p = {p_val:.4f}}}")
+        else:
+            p_row.append("N/A")
+    print(" & ".join(p_row) + " \\\\")
+
     print("\\bottomrule")
     print("\\end{tabular}")
-    print("\\caption{Empirical evaluation across paper benchmark tasks.}")
-    print("\\end{table}\n")
+    print("\\caption{Empirical benchmark comparison across tasks. Best performance is in \\textbf{bold}; second best is \\underline{underlined}. Statistical significance is computed via paired $t$-test between Alpha-GoLU and GoLU Static.}")
+    print("\\label{tab:benchmark_results}")
+    print("\\end{table*}\n")
 
 
 def main():
@@ -161,7 +217,7 @@ def main():
     run_parser = subparsers.add_parser("run", help="Run a single task benchmark")
     run_parser.add_argument("--task", type=str, required=True, choices=list(TASK_MAP.keys()), help="Benchmark task")
     run_parser.add_argument("--activation", type=str, default="alpha_golu", choices=SUPPORTED_ACTIVATIONS, help="Activation function")
-    run_parser.add_argument("--seeds", type=int, nargs="+", default=[42, 123, 999], help="Random seeds for statistical testing")
+    run_parser.add_argument("--seeds", type=int, nargs="+", default=DEFAULT_SEEDS, help="Random seeds for statistical testing")
 
     # Command: run_all
     run_all_parser = subparsers.add_parser("run_all", help="Reproduce all paper tables across all tasks")
@@ -173,7 +229,7 @@ def main():
         choices=SUPPORTED_ACTIVATIONS, 
         help="Activations to evaluate"
     )
-    run_all_parser.add_argument("--seeds", type=int, nargs="+", default=[42, 123, 999], help="Random seeds for statistical testing")
+    run_all_parser.add_argument("--seeds", type=int, nargs="+", default=DEFAULT_SEEDS, help="Random seeds for statistical testing")
 
     # Command: generate_table
     table_parser = subparsers.add_parser("generate_table", help="Generate LaTeX table from saved JSON results")
