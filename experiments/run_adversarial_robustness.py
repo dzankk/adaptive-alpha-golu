@@ -164,7 +164,7 @@ class ResNet18(nn.Module):
 
 
 # ==========================================
-# 4. Adversarial Attack Utilities (Fixed Clamping)
+# 4. Adversarial Attack Utilities
 # ==========================================
 CIFAR_MEAN = torch.tensor([0.4914, 0.4822, 0.4465]).view(1, 3, 1, 1)
 CIFAR_STD = torch.tensor([0.2023, 0.1994, 0.2010]).view(1, 3, 1, 1)
@@ -191,7 +191,6 @@ def fgsm_attack(model, images, labels, eps=8/255):
     loss.backward()
 
     perturbed = images_req + eps_norm * images_req.grad.sign()
-    # Element-wise tensor clamping
     return torch.max(torch.min(perturbed, max_val), min_val)
 
 
@@ -217,7 +216,6 @@ def pgd_attack(model, images, labels, eps=8/255, alpha=2/255, iters=10):
         adv_images = perturbed + alpha_norm * perturbed.grad.sign()
         diff = adv_images - ori_images
         
-        # Element-wise bounds clamping
         eta = torch.max(torch.min(diff, eps_norm), -eps_norm)
         perturbed = torch.max(torch.min(ori_images + eta, max_val), min_val).detach()
 
@@ -225,12 +223,11 @@ def pgd_attack(model, images, labels, eps=8/255, alpha=2/255, iters=10):
 
 
 # ==========================================
-# 5. Benchmark Execution
+# 5. Benchmark Execution Functions
 # ==========================================
-def run_benchmark():
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Running Adversarial Robustness Benchmark on {device}")
-
+def train_single_seed_robustness(act_type: str, seed: int, epochs: int, device: torch.device) -> float:
+    reset_all_seeds(seed)
+    
     transform_train = transforms.Compose([
         transforms.RandomCrop(32, padding=4),
         transforms.RandomHorizontalFlip(),
@@ -248,61 +245,56 @@ def run_benchmark():
     testset = torchvision.datasets.CIFAR10(root='./data', train=False, download=True, transform=transform_test)
     test_loader = DataLoader(testset, batch_size=64, shuffle=False, num_workers=2)
 
+    model = ResNet18(act_type=act_type).to(device)
+    optimizer = get_optimizer(model)
+    criterion = nn.CrossEntropyLoss()
+
+    for epoch in range(epochs):
+        model.train()
+        for inputs, targets in train_loader:
+            inputs, targets = inputs.to(device), targets.to(device)
+            optimizer.zero_grad()
+            outputs = model(inputs)
+            loss = criterion(outputs, targets)
+            loss.backward()
+            optimizer.step()
+
+    model.eval()
+    pgd_correct, total = 0, 0
+
+    for idx, (images, labels) in enumerate(test_loader):
+        if idx > 15:  # Fast evaluation pass across subset
+            break
+        images, labels = images.to(device), labels.to(device)
+
+        # Enable grad temporarily to allow PGD gradient computation during evaluation
+        with torch.enable_grad():
+            adv_pgd = pgd_attack(model, images, labels)
+
+        with torch.no_grad():
+            pgd_correct += (model(adv_pgd).argmax(1) == labels).sum().item()
+
+        total += labels.size(0)
+
+    return (pgd_correct / total) * 100.0 if total > 0 else 0.0
+
+
+def run_benchmark():
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Running Adversarial Robustness Benchmark on {device}")
     activations = ['relu', 'gelu', 'swish', 'golu_static', 'alpha_golu', 'swish_adaptive']
 
     for act_type in activations:
-        print(f"\n--- Evaluated Activation: {act_type.upper()} ---")
-        reset_all_seeds(42)
-        model = ResNet18(act_type=act_type).to(device)
-        optimizer = get_optimizer(model)
-        criterion = nn.CrossEntropyLoss()
-        
-        print("Training model for 3 epochs before robustness check...")
-        for epoch in range(3):
-            model.train()
-            running_loss = 0.0
-            for inputs, targets in train_loader:
-                inputs, targets = inputs.to(device), targets.to(device)
-                optimizer.zero_grad()
-                outputs = model(inputs)
-                loss = criterion(outputs, targets)
-                loss.backward()
-                optimizer.step()
-                running_loss += loss.item()
-            print(f"Epoch {epoch+1}/3 Loss: {running_loss/len(train_loader):.4f}")
+        pgd_acc = train_single_seed_robustness(act_type=act_type, seed=42, epochs=3, device=device)
+        print(f"Activation: {act_type.ljust(15)} | PGD-10 Robust Accuracy: {pgd_acc:.2f}%")
 
-        model.eval()
-        clean_correct, fgsm_correct, pgd_correct, total = 0, 0, 0, 0
-
-        for idx, (images, labels) in enumerate(test_loader):
-            if idx > 15: 
-                break  # Fast verification pass across ~1000 images
-            images, labels = images.to(device), labels.to(device)
-            
-            with torch.no_grad():
-                clean_outputs = model(images)
-                clean_correct += (clean_outputs.argmax(1) == labels).sum().item()
-
-            adv_fgsm = fgsm_attack(model, images, labels)
-            with torch.no_grad():
-                fgsm_correct += (model(adv_fgsm).argmax(1) == labels).sum().item()
-
-            adv_pgd = pgd_attack(model, images, labels)
-            with torch.no_grad():
-                pgd_correct += (model(adv_pgd).argmax(1) == labels).sum().item()
-
-            total += labels.size(0)
-
-        print(f"Clean Accuracy: {clean_correct / total * 100:.2f}%")
-        print(f"FGSM Robust Accuracy: {fgsm_correct / total * 100:.2f}%")
-        print(f"PGD-10 Robust Accuracy: {pgd_correct / total * 100:.2f}%")
 
 def train_and_eval(activation: str = 'alpha_golu', seed: int = 42, epochs: int = 10) -> float:
-    """Returns Robust Accuracy under PGD/FGSM attack."""
+    """Returns Robust Accuracy under PGD attack."""
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     robust_acc = train_single_seed_robustness(act_type=activation, seed=seed, epochs=epochs, device=device)
     return float(robust_acc)
-    
+
 
 if __name__ == '__main__':
     run_benchmark()
