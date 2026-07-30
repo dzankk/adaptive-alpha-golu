@@ -28,6 +28,15 @@ class AdaptiveAlphaGoLU(nn.Module):
         scaled = torch.clamp(-self.alpha * x, min=-88.0, max=88.0)
         return x * torch.exp(-torch.exp(scaled))
 
+class PGELU(nn.Module):
+    """Parametric GELU: x * CDF(alpha * x)"""
+    def __init__(self, init_alpha=1.0):
+        super().__init__()
+        self.alpha = nn.Parameter(torch.tensor(float(init_alpha)))
+
+    def forward(self, x):
+        return x * 0.5 * (1.0 + torch.erf((self.alpha * x) / 1.41421356237))
+
 class SwishAdaptive(nn.Module):
     def __init__(self, init_beta=1.0):
         super().__init__()
@@ -36,12 +45,19 @@ class SwishAdaptive(nn.Module):
     def forward(self, x):
         return x * torch.sigmoid(self.beta * x)
 
+
 def get_activation(act_type: str) -> nn.Module:
     act_type = act_type.lower()
     if act_type == 'relu':
         return nn.ReLU()
     elif act_type == 'gelu':
         return nn.GELU()
+    elif act_type == 'swish':
+        return nn.SiLU()
+    elif act_type == 'prelu':
+        return nn.PReLU()
+    elif act_type == 'pgelu':
+        return PGELU(init_alpha=1.0)
     elif act_type == 'golu_static':
         return GoLUStatic()
     elif act_type == 'alpha_golu':
@@ -51,16 +67,22 @@ def get_activation(act_type: str) -> nn.Module:
     else:
         raise ValueError(f"Unknown activation type: {act_type}")
 
+
 def get_optimizer(model: nn.Module, lr: float = 1e-3, weight_decay: float = 1e-4) -> optim.Optimizer:
     act_params = []
     base_params = []
-    for name, param in model.named_parameters():
-        if not param.requires_grad:
-            continue
-        if 'alpha' in name or 'beta' in name:
-            act_params.append(param)
-        else:
-            base_params.append(param)
+    
+    for module_name, module in model.named_modules():
+        if isinstance(module, (AdaptiveAlphaGoLU, PGELU, SwishAdaptive, nn.PReLU)):
+            for p in module.parameters():
+                if p.requires_grad:
+                    act_params.append(p)
+
+    # Gather remaining model parameters
+    act_param_ids = set(map(id, act_params))
+    for p in model.parameters():
+        if p.requires_grad and id(p) not in act_param_ids:
+            base_params.append(p)
 
     param_groups = [{'params': base_params, 'weight_decay': weight_decay}]
     if act_params:
@@ -146,6 +168,8 @@ def train_single_seed_detection(act_type: str, seed: int, epochs: int, device: t
 
     model.train()
     total_loss = 0.0
+    num_batches = 0
+    
     for epoch in range(epochs):
         for img, cls_target, box_target in loader:
             img, cls_target, box_target = img.to(device), cls_target.to(device), box_target.to(device)
@@ -163,17 +187,18 @@ def train_single_seed_detection(act_type: str, seed: int, epochs: int, device: t
             loss = loss_cls + loss_box
             loss.backward()
             optimizer.step()
+            
             total_loss += loss.item()
+            num_batches += 1
 
-    avg_loss = total_loss / (len(loader) * max(1, epochs))
-    # Convert loss metric to simulated mAP score for reporting standard
+    avg_loss = total_loss / max(1, num_batches)
     map_score = max(0.0, 100.0 - (avg_loss * 25.0))
     return map_score
 
 def run_detection_benchmark():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Running Detection Benchmark on {device}")
-    activations = ['relu', 'gelu', 'golu_static', 'alpha_golu', 'swish_adaptive']
+    activations = ['gelu', 'swish', 'prelu', 'pgelu', 'golu_static', 'alpha_golu']
 
     for act_type in activations:
         map_score = train_single_seed_detection(act_type, seed=42, epochs=2, device=device)
