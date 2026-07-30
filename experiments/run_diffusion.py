@@ -17,7 +17,8 @@ def reset_seeds(seed=42):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
@@ -108,9 +109,8 @@ class DiffusionUNet(nn.Module):
 # ==========================================
 # 3. Benchmark Execution
 # ==========================================
-def run_diffusion_benchmark():
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Running FashionMNIST DDPM Diffusion Benchmark on {device}...")
+def train_single_seed_diffusion(act_type: str, seed: int, epochs: int, device: torch.device) -> float:
+    reset_seeds(seed)
 
     transform = transforms.Compose([
         transforms.ToTensor(),
@@ -118,74 +118,81 @@ def run_diffusion_benchmark():
     ])
 
     trainset = torchvision.datasets.FashionMNIST(root='./data', train=True, download=True, transform=transform)
-    trainloader = torch.utils.data.DataLoader(trainset, batch_size=128, shuffle=True, num_workers=2, pin_memory=True)
-
-    activations = ['gelu', 'swish', 'swish_adaptive', 'golu_static', 'alpha_golu']
-    seeds = [42, 123]
-    results = {}
+    trainloader = torch.utils.data.DataLoader(trainset, batch_size=128, shuffle=True, num_workers=0, pin_memory=True)
 
     timesteps = 1000
     beta = torch.linspace(0.0001, 0.02, timesteps, device=device)
     alpha = 1.0 - beta
     alpha_hat = torch.cumprod(alpha, dim=0)
 
+    model = DiffusionUNet(in_channels=1, act_type=act_type).to(device)
+
+    alpha_params = []
+    other_params = []
+    for n, p in model.named_parameters():
+        if 'alpha' in n or 'beta' in n:
+            alpha_params.append(p)
+        else:
+            other_params.append(p)
+
+    optimizer = torch.optim.AdamW([
+        {'params': other_params, 'lr': 2e-4, 'weight_decay': 1e-4},
+        {'params': alpha_params, 'lr': 1e-3, 'weight_decay': 0.0}
+    ])
+    criterion = nn.MSELoss()
+
+    model.train()
+    target_steps = max(100, epochs * 100)
+    step_count = 0
+
+    while step_count < target_steps:
+        for x0, _ in trainloader:
+            x0 = x0.to(device)
+            t = torch.randint(0, timesteps, (x0.size(0),), device=device).long()
+            noise = torch.randn_like(x0)
+
+            a_hat_t = alpha_hat[t][:, None, None, None]
+            xt = torch.sqrt(a_hat_t) * x0 + torch.sqrt(1 - a_hat_t) * noise
+
+            predicted_noise = model(xt, t)
+            loss = criterion(predicted_noise, noise)
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            step_count += 1
+            if step_count >= target_steps:
+                break
+
+    # Evaluate Denoising Loss
+    model.eval()
+    val_losses = []
+    with torch.no_grad():
+        for idx, (x0, _) in zip(range(20), trainloader):
+            x0 = x0.to(device)
+            t = torch.randint(0, timesteps, (x0.size(0),), device=device).long()
+            noise = torch.randn_like(x0)
+            a_hat_t = alpha_hat[t][:, None, None, None]
+            xt = torch.sqrt(a_hat_t) * x0 + torch.sqrt(1 - a_hat_t) * noise
+            val_losses.append(criterion(model(xt, t), noise).item())
+
+    return float(np.mean(val_losses))
+
+
+def run_diffusion_benchmark():
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Running FashionMNIST DDPM Diffusion Benchmark on {device}...")
+
+    activations = ['gelu', 'swish', 'swish_adaptive', 'golu_static', 'alpha_golu']
+    seeds = [42, 123]
+    results = {}
+
     print("\n================ FashionMNIST DDPM Denoising Loss (MSE ↓) ================")
     for act in activations:
         seed_losses = []
         for s in seeds:
-            reset_seeds(s)
-            model = DiffusionUNet(in_channels=1, act_type=act).to(device)
-
-            alpha_params = []
-            other_params = []
-            for n, p in model.named_parameters():
-                if 'alpha' in n or 'beta' in n:
-                    alpha_params.append(p)
-                else:
-                    other_params.append(p)
-
-            optimizer = torch.optim.AdamW([
-                {'params': other_params, 'lr': 2e-4, 'weight_decay': 1e-4},
-                {'params': alpha_params, 'lr': 1e-3, 'weight_decay': 0.0}
-            ])
-            criterion = nn.MSELoss()
-
-            model.train()
-            step_count = 0
-            
-            while step_count < 1000:
-                for x0, _ in trainloader:
-                    x0 = x0.to(device)
-                    t = torch.randint(0, timesteps, (x0.size(0),), device=device).long()
-                    noise = torch.randn_like(x0)
-
-                    a_hat_t = alpha_hat[t][:, None, None, None]
-                    xt = torch.sqrt(a_hat_t) * x0 + torch.sqrt(1 - a_hat_t) * noise
-
-                    predicted_noise = model(xt, t)
-                    loss = criterion(predicted_noise, noise)
-
-                    optimizer.zero_grad()
-                    loss.backward()
-                    optimizer.step()
-
-                    step_count += 1
-                    if step_count >= 1000:
-                        break
-
-            # Evaluate Denoising Accuracy
-            model.eval()
-            val_losses = []
-            with torch.no_grad():
-                for idx, (x0, _) in zip(range(20), trainloader):
-                    x0 = x0.to(device)
-                    t = torch.randint(0, timesteps, (x0.size(0),), device=device).long()
-                    noise = torch.randn_like(x0)
-                    a_hat_t = alpha_hat[t][:, None, None, None]
-                    xt = torch.sqrt(a_hat_t) * x0 + torch.sqrt(1 - a_hat_t) * noise
-                    val_losses.append(criterion(model(xt, t), noise).item())
-
-            mean_val = np.mean(val_losses)
+            mean_val = train_single_seed_diffusion(act_type=act, seed=s, epochs=10, device=device)
             seed_losses.append(mean_val)
             print(f"[{act.upper():<14} | Seed {s}] Denoising MSE: {mean_val:.6f}")
 
@@ -195,11 +202,12 @@ def run_diffusion_benchmark():
     for act, (m_loss, s_loss) in results.items():
         print(f"  {act.upper():<14}: Loss = {m_loss:.6f} ± {s_loss:.6f}")
 
+
 def train_and_eval(activation: str = 'alpha_golu', seed: int = 42, epochs: int = 10) -> float:
-    """Returns Fréchet Inception Distance (FID) or Test Loss."""
+    """Returns Denoising Test MSE Loss."""
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    fid_or_loss = train_single_seed_diffusion(act_type=activation, seed=seed, epochs=epochs, device=device)
-    return float(fid_or_loss)
+    loss = train_single_seed_diffusion(act_type=activation, seed=seed, epochs=epochs, device=device)
+    return float(loss)
 
 
 if __name__ == '__main__':
