@@ -13,41 +13,18 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader, Dataset, random_split
+from models.alpha_golu import AlphaGoLU as AdaptiveAlphaGoLU, StaticGoLU
 
 
 # ==========================================
 # 1. Custom Activation Implementations
 # ==========================================
-class GoLUStatic(nn.Module):
-    """Static Gompertz Linear Unit: x * exp(-exp(-x))"""
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        scaled = torch.clamp(-x, min=-88.0, max=88.0)
-        return x * torch.exp(-torch.exp(scaled))
-
-
-class AdaptiveAlphaGoLU(nn.Module):
-    """Adaptive Gompertz Linear Unit with Softplus parameterization: x * exp(-exp(-alpha * x))"""
-    def __init__(self, init_alpha: float = 1.0):
-        super().__init__()
-        init_val = float(init_alpha)
-        init_raw = math.log(math.exp(init_val) - 1.0) if init_val < 20 else init_val
-        self.raw_alpha = nn.Parameter(torch.tensor(init_raw, dtype=torch.float32))
-
-    @property
-    def alpha(self) -> torch.Tensor:
-        return F.softplus(self.raw_alpha)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        scaled = torch.clamp(-self.alpha * x, min=-88.0, max=88.0)
-        return x * torch.exp(-torch.exp(scaled))
-
-
 class PGELU(nn.Module):
     """Parametric GELU: x * CDF(alpha * x)"""
     def __init__(self, init_alpha: float = 1.0):
         super().__init__()
         init_val = float(init_alpha)
-        init_raw = math.log(math.exp(init_val) - 1.0) if init_val < 20 else init_val
+        init_raw = math.log(math.expm1(init_val)) if init_val < 20 else init_val
         self.raw_alpha = nn.Parameter(torch.tensor(init_raw, dtype=torch.float32))
 
     @property
@@ -83,7 +60,7 @@ def get_activation(act_type: str) -> nn.Module:
     elif act_type == 'pgelu':
         return PGELU(init_alpha=1.0)
     elif act_type == 'golu_static':
-        return GoLUStatic()
+        return StaticGoLU()
     elif act_type == 'alpha_golu':
         return AdaptiveAlphaGoLU(init_alpha=1.0)
     else:
@@ -223,8 +200,9 @@ def train_single_seed_segmentation(act_type: str, seed: int, epochs: int, device
         full_dataset, [train_size, val_size], generator=torch.Generator().manual_seed(seed)
     )
 
-    train_loader = DataLoader(train_ds, batch_size=8, shuffle=True)
-    val_loader = DataLoader(val_ds, batch_size=8, shuffle=False)
+    loader_g = torch.Generator().manual_seed(seed)
+    train_loader = DataLoader(train_ds, batch_size=8, shuffle=True, generator=loader_g)
+    val_loader = DataLoader(val_ds, batch_size=8, shuffle=False, generator=loader_g)
 
     model = UNet(act_type=act_type).to(device)
     optimizer = get_optimizer(model, lr=1e-3, weight_decay=1e-4)

@@ -63,7 +63,7 @@ class AlphaGoLU(nn.Module):
         self.num_parameters = num_parameters
         
         init_val = float(init_alpha)
-        init_raw = math.log(math.exp(init_val) - 1.0) if init_val < 20 else init_val
+        init_raw = math.log(math.expm1(init_val)) if init_val < 20 else init_val
         
         self.raw_alpha = nn.Parameter(
             torch.full((num_parameters,), init_raw, dtype=torch.float32)

@@ -20,6 +20,7 @@ import torchvision
 import torchvision.transforms as transforms
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader
+from models.alpha_golu import AlphaGoLU as AdaptiveAlphaGoLU, StaticGoLU
 
 
 # ==========================================
@@ -94,43 +95,6 @@ def reset_all_seeds(seed=42):
 # ==========================================
 # 1. Activation Implementations
 # ==========================================
-class StaticGoLU(nn.Module):
-    """
-    Numerically stable unparameterized Gompertz Linear Unit (Das et al., 2025).
-    
-    Mathematical Formulation:
-        GoLU(x) = x * exp(-exp(-x))
-    """
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        scaled = torch.clamp(-x, min=-88.0, max=88.0)
-        return x * torch.exp(-torch.exp(scaled))
-
-
-class AdaptiveAlphaGoLU(nn.Module):
-    """
-    Adaptive Gompertz Linear Unit with softplus-constrained positive alpha parameter.
-    
-    Mathematical Formulation:
-        AlphaGoLU(x) = x * exp(-exp(-alpha * x))
-        where alpha = softplus(raw_alpha) > 0
-    """
-    def __init__(self, init_alpha: float = 1.0):
-        super().__init__()
-        init_val = float(init_alpha)
-        # Inverse softplus: softplus(init_raw) = init_val
-        init_raw = math.log(math.expm1(init_val)) if init_val < 20.0 else init_val
-        self.raw_alpha = nn.Parameter(torch.tensor(init_raw, dtype=torch.float32))
-
-    @property
-    def alpha(self) -> torch.Tensor:
-        """Ensures alpha stays strictly positive (> 0) during backpropagation."""
-        return F.softplus(self.raw_alpha)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        scaled = torch.clamp(-self.alpha * x, min=-88.0, max=88.0)
-        return x * torch.exp(-torch.exp(scaled))
-
-
 class PGELU(nn.Module):
     """
     Parametric GELU: x * CDF(alpha * x) with softplus-constrained positive alpha parameter.
@@ -312,7 +276,9 @@ def get_dataloaders(dataset_name: str = "cifar10", batch_size: int = 128, seed: 
         batch_size=256, 
         shuffle=False, 
         num_workers=2, 
-        pin_memory=use_pin
+        pin_memory=use_pin,
+        worker_init_fn=seed_worker,
+        generator=g
     )
     return trainloader, testloader
 

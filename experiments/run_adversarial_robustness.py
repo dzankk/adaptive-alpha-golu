@@ -29,7 +29,9 @@ except ImportError:
         """Fallback implementation using Softplus for alpha positivity"""
         def __init__(self, init_alpha=1.0):
             super().__init__()
-            self.raw_alpha = nn.Parameter(torch.tensor(float(init_alpha)))
+            init_val = float(init_alpha)
+            init_raw = math.log(math.expm1(init_val)) if init_val < 20 else init_val
+            self.raw_alpha = nn.Parameter(torch.tensor(init_raw, dtype=torch.float32))
 
         @property
         def alpha(self):
@@ -57,7 +59,9 @@ class PGELU(nn.Module):
     """Parametric GELU: x * CDF(alpha * x)"""
     def __init__(self, init_alpha=1.0):
         super().__init__()
-        self.raw_alpha = nn.Parameter(torch.tensor(float(init_alpha)))
+        init_val = float(init_alpha)
+        init_raw = math.log(math.expm1(init_val)) if init_val < 20 else init_val
+        self.raw_alpha = nn.Parameter(torch.tensor(init_raw, dtype=torch.float32))
 
     @property
     def alpha(self):

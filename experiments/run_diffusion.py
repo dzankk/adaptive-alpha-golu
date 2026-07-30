@@ -14,31 +14,7 @@ import torch.nn.functional as F
 import torchvision
 import torchvision.transforms as transforms
 from torch.utils.data import DataLoader
-
-try:
-    from models.alpha_golu import AlphaGoLU as AdaptiveAlphaGoLU, StaticGoLU
-except ImportError:
-    class StaticGoLU(nn.Module):
-        """Standard Gompertz Linear Unit: x * exp(-exp(-x))"""
-        def forward(self, x: torch.Tensor) -> torch.Tensor:
-            scaled = torch.clamp(-x, min=-88.0, max=88.0)
-            return x * torch.exp(-torch.exp(scaled))
-
-    class AdaptiveAlphaGoLU(nn.Module):
-        """Adaptive Gompertz Linear Unit with enforced alpha > 0 math constraint."""
-        def __init__(self, init_alpha=1.0):
-            super().__init__()
-            init_val = float(init_alpha)
-            init_raw = math.log(math.exp(init_val) - 1.0) if init_val < 20 else init_val
-            self.raw_alpha = nn.Parameter(torch.tensor(init_raw, dtype=torch.float32))
-
-        @property
-        def alpha(self) -> torch.Tensor:
-            return F.softplus(self.raw_alpha)
-
-        def forward(self, x: torch.Tensor) -> torch.Tensor:
-            scaled = torch.clamp(-self.alpha * x, min=-88.0, max=88.0)
-            return x * torch.exp(-torch.exp(scaled))
+from models.alpha_golu import AlphaGoLU as AdaptiveAlphaGoLU, StaticGoLU
 
 
 def reset_seeds(seed=42):
@@ -59,7 +35,7 @@ class PGELU(nn.Module):
     def __init__(self, init_alpha=1.0):
         super().__init__()
         init_val = float(init_alpha)
-        init_raw = math.log(math.exp(init_val) - 1.0) if init_val < 20 else init_val
+        init_raw = math.log(math.expm1(init_val)) if init_val < 20 else init_val
         self.raw_alpha = nn.Parameter(torch.tensor(init_raw, dtype=torch.float32))
 
     @property
@@ -175,8 +151,27 @@ def train_single_seed_diffusion(act_type: str, seed: int, epochs: int, device: t
     full_dataset = torchvision.datasets.FashionMNIST(root='./data', train=True, download=True, transform=transform)
     test_dataset = torchvision.datasets.FashionMNIST(root='./data', train=False, download=True, transform=transform)
 
-    trainloader = DataLoader(full_dataset, batch_size=128, shuffle=True, num_workers=2, pin_memory=True)
-    testloader = DataLoader(test_dataset, batch_size=256, shuffle=False, num_workers=2, pin_memory=True)
+    loader_g = torch.Generator().manual_seed(seed)
+    eval_g = torch.Generator().manual_seed(seed + 999)
+
+    trainloader = DataLoader(
+        full_dataset,
+        batch_size=128,
+        shuffle=True,
+        num_workers=2,
+        pin_memory=True,
+        worker_init_fn=lambda worker_id: np.random.seed((seed + worker_id) % 2**32),
+        generator=loader_g,
+    )
+    testloader = DataLoader(
+        test_dataset,
+        batch_size=256,
+        shuffle=False,
+        num_workers=2,
+        pin_memory=True,
+        worker_init_fn=lambda worker_id: np.random.seed((seed + 999 + worker_id) % 2**32),
+        generator=eval_g,
+    )
 
     timesteps = 1000
     beta = torch.linspace(0.0001, 0.02, timesteps, device=device)
@@ -205,12 +200,8 @@ def train_single_seed_diffusion(act_type: str, seed: int, epochs: int, device: t
             loss.backward()
             optimizer.step()
 
-    # Deterministic Evaluation Loop
     model.eval()
     val_losses = []
-    
-    # Fix seed during validation noise generation for consistent benchmark comparison
-    eval_g = torch.Generator(device=device).manual_seed(seed + 999)
 
     with torch.no_grad():
         for x0, _ in testloader:

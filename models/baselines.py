@@ -98,7 +98,7 @@ class DeepConvNet(nn.Module):
 
     def extract_alphas(self) -> list:
         """Returns current alpha values if using AlphaGoLU, else static scalars."""
-        if self.act_type == 'alpha_golu':
+        if self.act_type in {'alpha_golu', 'adaptive_alpha_golu'}:
             return [
                 self.act1.get_alpha_val(),
                 self.act2.get_alpha_val(),

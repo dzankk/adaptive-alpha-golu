@@ -3,6 +3,7 @@ Unit tests for AlphaGoLU module mechanics, parameter constraints, and forward pa
 """
 
 import unittest
+import math
 import torch
 from models.alpha_golu import AlphaGoLU, StaticGoLU
 
@@ -36,6 +37,18 @@ class TestAlphaGoLU(unittest.TestCase):
 
         self.assertIsNotNone(layer.raw_alpha.grad)
         self.assertFalse(torch.isnan(layer.raw_alpha.grad).any())
+
+    def test_init_alpha_round_trip(self):
+        """Verify init_alpha maps back to alpha≈1.0 through inverse softplus."""
+        layer = AlphaGoLU(init_alpha=1.0)
+        self.assertTrue(torch.isclose(layer.alpha, torch.tensor(1.0), atol=1e-4, rtol=1e-4).item())
+
+    def test_static_activation_matches_formula(self):
+        """Verify the static gate matches x * exp(-exp(-x))."""
+        layer = StaticGoLU()
+        x = torch.tensor([-2.0, 0.0, 2.0])
+        expected = x * torch.exp(-torch.exp(-x))
+        self.assertTrue(torch.allclose(layer(x), expected, atol=1e-6, rtol=1e-6))
 
 
 if __name__ == "__main__":

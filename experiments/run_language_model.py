@@ -1,49 +1,40 @@
 """
-Benchmark: Language Modeling & Autoregressive Generation (Mini-GPT)
-===================================================================
-Evaluates autoregressive sequence modeling perplexity across transformer 
-block activations (ReLU, GELU, Swish, PReLU, PGELU, Static GoLU, 
-Adaptive Alpha-GoLU, and Adaptive Swish).
+Benchmark: WikiText-2 Word-Level Language Modeling
+===================================================
+Trains a compact causal transformer on a real WikiText-2 corpus and reports
+validation perplexity.
 
-Uses Causal Multi-Head Attention with zero-weight-decay parameter splitting 
-to ensure adaptive activation parameters do not decay prematurely.
+This runner is grounded in a standard language modeling benchmark rather than a
+synthetic proxy dataset.
 """
 
 import math
 import random
+import re
+import urllib.request
+from collections import Counter
+from pathlib import Path
+from typing import Dict, List, Tuple
+
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader, Dataset, Subset
+from torch.utils.data import DataLoader, Dataset
 
-try:
-    from models.alpha_golu import AlphaGoLU as AdaptiveAlphaGoLU, StaticGoLU
-except ImportError:
-    class StaticGoLU(nn.Module):
-        """Static Gompertz Linear Unit: x * exp(-exp(-x))"""
-        def forward(self, x):
-            scaled = torch.clamp(-x, min=-88.0, max=88.0)
-            return x * torch.exp(-torch.exp(scaled))
-
-    class AdaptiveAlphaGoLU(nn.Module):
-        """Adaptive Gompertz Linear Unit: x * exp(-exp(-alpha * x)) with softplus safety constraint"""
-        def __init__(self, init_alpha=1.0):
-            super().__init__()
-            init_val = float(init_alpha)
-            init_raw = math.log(math.exp(init_val) - 1.0) if init_val < 20 else init_val
-            self.raw_alpha = nn.Parameter(torch.tensor(init_raw, dtype=torch.float32))
-
-        @property
-        def alpha(self):
-            return nn.functional.softplus(self.raw_alpha)
-
-        def forward(self, x):
-            scaled = torch.clamp(-self.alpha * x, min=-88.0, max=88.0)
-            return x * torch.exp(-torch.exp(scaled))
+from models.alpha_golu import AlphaGoLU as AdaptiveAlphaGoLU, StaticGoLU
 
 
-def reset_all_seeds(seed=42):
+WIKITEXT2_URLS = {
+    "train": "https://raw.githubusercontent.com/pytorch/examples/main/word_language_model/data/wikitext-2/train.txt",
+    "valid": "https://raw.githubusercontent.com/pytorch/examples/main/word_language_model/data/wikitext-2/valid.txt",
+    "test": "https://raw.githubusercontent.com/pytorch/examples/main/word_language_model/data/wikitext-2/test.txt",
+}
+
+TOKEN_PATTERN = re.compile(r"[A-Za-z]+(?:'[A-Za-z]+)?|\d+|[^\w\s]")
+
+
+def reset_all_seeds(seed: int = 42):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -53,15 +44,19 @@ def reset_all_seeds(seed=42):
     torch.backends.cudnn.benchmark = False
 
 
-# ==========================================
-# 1. Custom Activations
-# ==========================================
+def seed_worker(worker_id: int):
+    worker_seed = torch.initial_seed() % 2**32
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
+
+
 class PGELU(nn.Module):
-    """Parametric GELU: x * CDF(alpha * x) with softplus constraint"""
-    def __init__(self, init_alpha=1.0):
+    """Parametric GELU: x * CDF(alpha * x) with softplus-constrained alpha."""
+
+    def __init__(self, init_alpha: float = 1.0):
         super().__init__()
         init_val = float(init_alpha)
-        init_raw = math.log(math.exp(init_val) - 1.0) if init_val < 20 else init_val
+        init_raw = math.log(math.expm1(init_val)) if init_val < 20 else init_val
         self.raw_alpha = nn.Parameter(torch.tensor(init_raw, dtype=torch.float32))
 
     @property
@@ -73,8 +68,9 @@ class PGELU(nn.Module):
 
 
 class AdaptiveSwish(nn.Module):
-    """Adaptive Swish (SiLU): x * sigmoid(beta * x)"""
-    def __init__(self, init_beta=1.0):
+    """Parametric Swish (SiLU): x * sigmoid(beta * x)."""
+
+    def __init__(self, init_beta: float = 1.0):
         super().__init__()
         self.beta = nn.Parameter(torch.tensor(float(init_beta), dtype=torch.float32))
 
@@ -84,51 +80,115 @@ class AdaptiveSwish(nn.Module):
 
 def get_activation(act_type: str) -> nn.Module:
     act_type = str(act_type).lower().strip()
-    if act_type == 'relu':
+    if act_type == "relu":
         return nn.ReLU()
-    elif act_type == 'gelu':
+    if act_type == "gelu":
         return nn.GELU()
-    elif act_type in ('swish', 'silu'):
+    if act_type in ("swish", "silu"):
         return nn.SiLU()
-    elif act_type == 'prelu':
+    if act_type == "prelu":
         return nn.PReLU()
-    elif act_type == 'pgelu':
+    if act_type == "pgelu":
         return PGELU(init_alpha=1.0)
-    elif act_type in ('swish_adaptive', 'adaptive_swish'):
+    if act_type in ("swish_adaptive", "adaptive_swish"):
         return AdaptiveSwish(init_beta=1.0)
-    elif act_type == 'golu_static':
+    if act_type == "golu_static":
         return StaticGoLU()
-    elif act_type == 'alpha_golu':
+    if act_type == "alpha_golu":
         return AdaptiveAlphaGoLU(init_alpha=1.0)
-    else:
-        raise ValueError(f"Unknown activation type: {act_type}")
+    raise ValueError(f"Unknown activation type: {act_type}")
 
 
 def get_optimizer(model: nn.Module, lr: float = 1e-3, weight_decay: float = 1e-4) -> optim.Optimizer:
     act_params = []
     base_params = []
-    
+
     for module in model.modules():
         if isinstance(module, (AdaptiveAlphaGoLU, PGELU, AdaptiveSwish, nn.PReLU)):
-            for p in module.parameters():
-                if p.requires_grad:
-                    act_params.append(p)
+            for parameter in module.parameters(recurse=False):
+                if parameter.requires_grad:
+                    act_params.append(parameter)
 
     act_param_ids = set(map(id, act_params))
-    for p in model.parameters():
-        if p.requires_grad and id(p) not in act_param_ids:
-            base_params.append(p)
+    for parameter in model.parameters():
+        if parameter.requires_grad:
+            if id(parameter) in act_param_ids:
+                continue
+            base_params.append(parameter)
 
-    param_groups = [{'params': base_params, 'lr': lr, 'weight_decay': weight_decay}]
+    parameter_groups = [{"params": base_params, "lr": lr, "weight_decay": weight_decay}]
     if act_params:
-        param_groups.append({'params': act_params, 'lr': lr, 'weight_decay': 0.0})
+        parameter_groups.append({"params": act_params, "lr": lr, "weight_decay": 0.0})
 
-    return optim.AdamW(param_groups)
+    return optim.AdamW(parameter_groups)
 
 
-# ==========================================
-# 2. Mini GPT Architecture
-# ==========================================
+def download_wikitext2(root: str = "./data") -> Dict[str, Path]:
+    corpus_dir = Path(root) / "wikitext-2"
+    corpus_dir.mkdir(parents=True, exist_ok=True)
+
+    paths = {}
+    for split, url in WIKITEXT2_URLS.items():
+        path = corpus_dir / f"{split}.txt"
+        if not path.exists():
+            urllib.request.urlretrieve(url, path)
+        paths[split] = path
+    return paths
+
+
+def basic_tokenize(text: str) -> List[str]:
+    return TOKEN_PATTERN.findall(text.lower())
+
+
+def read_corpus(path: Path) -> List[str]:
+    tokens: List[str] = []
+    with path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            stripped = line.strip()
+            if not stripped:
+                continue
+            tokens.extend(basic_tokenize(stripped))
+            tokens.append("<eos>")
+    return tokens
+
+
+def build_vocab(token_lists: List[List[str]], min_freq: int = 1) -> Dict[str, int]:
+    counter = Counter()
+    for tokens in token_lists:
+        counter.update(tokens)
+
+    vocab = {"<pad>": 0, "<unk>": 1, "<eos>": 2}
+    for token, frequency in counter.items():
+        if frequency >= min_freq and token not in vocab:
+            vocab[token] = len(vocab)
+    return vocab
+
+
+def encode_tokens(tokens: List[str], vocab: Dict[str, int]) -> torch.Tensor:
+    unk_id = vocab["<unk>"]
+    return torch.tensor([vocab.get(token, unk_id) for token in tokens], dtype=torch.long)
+
+
+class BlockDataset(Dataset):
+    def __init__(self, token_ids: torch.Tensor, block_size: int = 64, stride: int | None = None):
+        self.block_size = block_size
+        self.stride = stride if stride is not None else block_size
+        self.blocks = []
+
+        for start in range(0, max(0, len(token_ids) - block_size - 1), self.stride):
+            self.blocks.append(token_ids[start : start + block_size + 1])
+
+    def __len__(self):
+        return len(self.blocks)
+
+    def __getitem__(self, idx):
+        return self.blocks[idx]
+
+
+def collate_blocks(batch):
+    return torch.stack(batch, dim=0)
+
+
 class MultiHeadAttention(nn.Module):
     def __init__(self, d_model=128, n_heads=4):
         super().__init__()
@@ -138,16 +198,16 @@ class MultiHeadAttention(nn.Module):
         self.out_proj = nn.Linear(d_model, d_model)
 
     def forward(self, x):
-        B, T, C = x.size()
-        qkv = self.qkv(x).reshape(B, T, 3, self.n_heads, self.head_dim).permute(2, 0, 3, 1, 4)
+        batch_size, time_steps, channels = x.size()
+        qkv = self.qkv(x).reshape(batch_size, time_steps, 3, self.n_heads, self.head_dim).permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]
 
         scores = (q @ k.transpose(-2, -1)) / math.sqrt(self.head_dim)
-        mask = torch.tril(torch.ones(T, T, device=x.device)).view(1, 1, T, T)
-        scores = scores.masked_fill(mask == 0, float('-inf'))
-        
-        attn = torch.softmax(scores, dim=-1)
-        context = (attn @ v).transpose(1, 2).reshape(B, T, C)
+        mask = torch.tril(torch.ones(time_steps, time_steps, device=x.device)).view(1, 1, time_steps, time_steps)
+        scores = scores.masked_fill(mask == 0, float("-inf"))
+
+        attention = torch.softmax(scores, dim=-1)
+        context = (attention @ v).transpose(1, 2).reshape(batch_size, time_steps, channels)
         return self.out_proj(context)
 
 
@@ -160,7 +220,7 @@ class TransformerBlock(nn.Module):
         self.mlp = nn.Sequential(
             nn.Linear(d_model, 4 * d_model),
             get_activation(act_type),
-            nn.Linear(4 * d_model, d_model)
+            nn.Linear(4 * d_model, d_model),
         )
 
     def forward(self, x):
@@ -170,7 +230,7 @@ class TransformerBlock(nn.Module):
 
 
 class MiniGPT(nn.Module):
-    def __init__(self, vocab_size=1000, d_model=128, n_heads=4, n_layers=2, max_seq_len=512, act_type='relu'):
+    def __init__(self, vocab_size=1000, d_model=128, n_heads=4, n_layers=2, max_seq_len=256, act_type="relu"):
         super().__init__()
         self.token_emb = nn.Embedding(vocab_size, d_model)
         self.pos_emb = nn.Parameter(torch.randn(1, max_seq_len, d_model) * 0.02)
@@ -179,55 +239,75 @@ class MiniGPT(nn.Module):
         self.head = nn.Linear(d_model, vocab_size, bias=False)
 
     def forward(self, idx):
-        B, T = idx.size()
-        x = self.token_emb(idx) + self.pos_emb[:, :T, :]
+        _, time_steps = idx.size()
+        x = self.token_emb(idx) + self.pos_emb[:, :time_steps, :]
         for block in self.blocks:
             x = block(x)
         x = self.ln_f(x)
         return self.head(x)
 
 
-# ==========================================
-# 3. Structured Synthetic Dataset
-# ==========================================
-class SyntheticTextDataset(Dataset):
-    """
-    Generates synthetic token sequences with local correlations 
-    to evaluate perplexity meaningfully.
-    """
-    def __init__(self, vocab_size=1000, seq_len=65, num_samples=500):
-        self.samples = []
-        for i in range(num_samples):
-            pattern_len = 8
-            pattern = torch.randint(0, vocab_size // 10, (pattern_len,))
-            seq = pattern.repeat((seq_len // pattern_len) + 1)[:seq_len]
-            noise_mask = torch.rand(seq_len) < 0.10
-            seq[noise_mask] = torch.randint(0, vocab_size, (noise_mask.sum().item(),))
-            self.samples.append(seq)
+def build_language_model_dataloaders(
+    dataset_name: str = "wikitext2",
+    root: str = "./data",
+    block_size: int = 64,
+    batch_size: int = 32,
+    seed: int = 42,
+) -> Tuple[DataLoader, DataLoader, Dict[str, int]]:
+    normalized_name = str(dataset_name).lower().strip()
+    if normalized_name not in {"wikitext2", "wiki_text2", "wiki-text-2"}:
+        raise ValueError(f"Unsupported language dataset: {dataset_name}")
 
-    def __len__(self):
-        return len(self.samples)
+    paths = download_wikitext2(root=root)
+    train_tokens = read_corpus(paths["train"])
+    valid_tokens = read_corpus(paths["valid"])
+    vocab = build_vocab([train_tokens])
 
-    def __getitem__(self, idx):
-        return self.samples[idx]
+    train_ids = encode_tokens(train_tokens, vocab)
+    valid_ids = encode_tokens(valid_tokens, vocab)
+
+    train_dataset = BlockDataset(train_ids, block_size=block_size)
+    valid_dataset = BlockDataset(valid_ids, block_size=block_size)
+
+    loader_g = torch.Generator().manual_seed(seed)
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        generator=loader_g,
+        worker_init_fn=seed_worker,
+        collate_fn=collate_blocks,
+    )
+    valid_loader = DataLoader(
+        valid_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        generator=loader_g,
+        worker_init_fn=seed_worker,
+        collate_fn=collate_blocks,
+    )
+    return train_loader, valid_loader, vocab
 
 
-# ==========================================
-# 4. Training & Evaluation Pipeline
-# ==========================================
-def train_single_seed_lm(act_type='alpha_golu', seed=42, epochs=10, device='cuda'):
+def train_single_seed_lm(
+    act_type: str = "alpha_golu",
+    seed: int = 42,
+    epochs: int = 5,
+    device: str = "cuda",
+    dataset_name: str = "wikitext2",
+    block_size: int = 64,
+) -> float:
     reset_all_seeds(seed)
-    dataset = SyntheticTextDataset(num_samples=500)
-    
-    # Proper 80/20 train/test split to evaluate generalization perplexity
-    train_size = int(0.8 * len(dataset))
-    test_size = len(dataset) - train_size
-    train_dataset, test_dataset = Subset(dataset, range(0, train_size)), Subset(dataset, range(train_size, len(dataset)))
 
-    train_loader = DataLoader(train_dataset, batch_size=16, shuffle=True)
-    test_loader = DataLoader(test_dataset, batch_size=16, shuffle=False)
+    train_loader, valid_loader, vocab = build_language_model_dataloaders(
+        dataset_name=dataset_name,
+        root="./data",
+        block_size=block_size,
+        batch_size=32,
+        seed=seed,
+    )
 
-    model = MiniGPT(act_type=act_type).to(device)
+    model = MiniGPT(vocab_size=len(vocab), act_type=act_type, max_seq_len=block_size).to(device)
     optimizer = get_optimizer(model, lr=1e-3)
     criterion = nn.CrossEntropyLoss()
 
@@ -236,54 +316,53 @@ def train_single_seed_lm(act_type='alpha_golu', seed=42, epochs=10, device='cuda
         for batch in train_loader:
             batch = batch.to(device)
             inputs, targets = batch[:, :-1], batch[:, 1:]
-            optimizer.zero_grad()
             logits = model(inputs)
-            loss = criterion(logits.reshape(-1, 1000), targets.reshape(-1))
+            loss = criterion(logits.reshape(-1, len(vocab)), targets.reshape(-1))
+
+            optimizer.zero_grad()
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
 
     model.eval()
     total_loss = 0.0
+    total_tokens = 0
     with torch.no_grad():
-        for batch in test_loader:
+        for batch in valid_loader:
             batch = batch.to(device)
             inputs, targets = batch[:, :-1], batch[:, 1:]
             logits = model(inputs)
-            loss = criterion(logits.reshape(-1, 1000), targets.reshape(-1))
-            total_loss += loss.item()
+            loss = criterion(logits.reshape(-1, len(vocab)), targets.reshape(-1))
+            total_loss += float(loss.item()) * targets.numel()
+            total_tokens += targets.numel()
 
-    avg_loss = total_loss / len(test_loader)
-    
-    try:
-        perplexity = math.exp(min(avg_loss, 20.0))
-    except OverflowError:
-        perplexity = float('inf')
-        
-    return perplexity
+    avg_loss = total_loss / max(total_tokens, 1)
+    perplexity = math.exp(min(avg_loss, 20.0))
+    return float(perplexity)
 
 
-def run_lm_benchmark(seeds=[42, 123, 999, 2024, 2025], epochs=10):
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Running Language Model Benchmark on {device}...")
-    activations = ['relu', 'gelu', 'swish', 'adaptive_swish', 'prelu', 'pgelu', 'golu_static', 'alpha_golu']
+def run_lm_benchmark(seeds=[42, 123, 999, 2024, 2025], epochs=5):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Running WikiText-2 Language Model Benchmark on {device}...")
+    activations = ["relu", "gelu", "swish", "adaptive_swish", "prelu", "pgelu", "golu_static", "alpha_golu"]
 
-    print("\n================ Mini-GPT Language Model Test Perplexity (PPL ↓) ================")
+    print("\n================ WikiText-2 Language Model Test Perplexity (PPL ↓) ================")
     for act_type in activations:
         ppls = []
         for s in seeds:
             ppl = train_single_seed_lm(act_type=act_type, seed=s, epochs=epochs, device=device)
             ppls.append(ppl)
-            print(f"[{act_type.upper():<14} | Seed {s}] Test Perplexity: {ppl:.2f}")
+            print(f"[{act_type.upper():<14} | Seed {s}] Validation Perplexity: {ppl:.2f}")
 
         print(f"  --> {act_type.upper():<14} Mean PPL: {np.mean(ppls):.2f} ± {np.std(ppls):.2f}\n")
 
 
-def train_and_eval(activation: str = 'alpha_golu', seed: int = 42, epochs: int = 10) -> float:
-    """Returns Test Perplexity (PPL)."""
+def train_and_eval(activation: str = "alpha_golu", seed: int = 42, epochs: int = 5) -> float:
+    """Returns validation perplexity on WikiText-2."""
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    ppl = train_single_seed_lm(act_type=activation, seed=seed, epochs=epochs, device=device)
-    return float(ppl)
+    perplexity = train_single_seed_lm(act_type=activation, seed=seed, epochs=epochs, device=device)
+    return float(perplexity)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     run_lm_benchmark()

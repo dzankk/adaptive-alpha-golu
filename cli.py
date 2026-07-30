@@ -110,8 +110,8 @@ def handle_run_all(args):
                 all_task_results[task_name]["golu_static"]["scores"],
                 all_task_results[task_name]["alpha_golu"]["scores"]
             )
-            all_task_results[task_name]["p_value_alpha_vs_static"] = p_val
-            print(f"\n[Statistical Significance] Paired t-test (Alpha-GoLU vs Static): p = {p_val:.4f}")
+            all_task_results[task_name]["p_value_welch_alpha_vs_static"] = p_val
+            print(f"\n[Statistical Significance] Welch t-test (Alpha-GoLU vs Static): p = {p_val:.4f}")
 
     json_path = os.path.join("outputs", "benchmark_results.json")
     with open(json_path, "w") as f:
@@ -137,7 +137,7 @@ def handle_generate_table(args):
 
     # Identify all activation keys present in data
     first_task = tasks[0]
-    acts = [k for k in data[first_task].keys() if k != "p_value_alpha_vs_static"]
+    acts = [k for k in data[first_task].keys() if not k.startswith("p_value_")]
 
     print("\n% ===== Auto-Generated Publication LaTeX Benchmark Table =====")
     print("\\begin{table*}[t]")
@@ -189,10 +189,10 @@ def handle_generate_table(args):
 
     print("\\midrule")
     
-    # Render Paired t-test p-value row
-    p_row = ["\\textit{$p$-value ($\\alpha$ vs Static)}"]
+    # Render Welch t-test p-value row
+    p_row = ["\textit{$p$-value (Welch; $\alpha$ vs Static)}"]
     for t in tasks:
-        p_val = data[t].get("p_value_alpha_vs_static", None)
+        p_val = data[t].get("p_value_welch_alpha_vs_static", None)
         if p_val is not None:
             p_row.append(f"\\textit{{p = {p_val:.4f}}}")
         else:
@@ -201,7 +201,7 @@ def handle_generate_table(args):
 
     print("\\bottomrule")
     print("\\end{tabular}")
-    print("\\caption{Empirical benchmark comparison across tasks. Best performance is in \\textbf{bold}; second best is \\underline{underlined}. Statistical significance is computed via paired $t$-test between Alpha-GoLU and GoLU Static.}")
+    print("\\caption{Empirical benchmark comparison across tasks. Best performance is in \\textbf{bold}; second best is \\underline{underlined}. Statistical significance is computed via Welch's $t$-test between Alpha-GoLU and GoLU Static.}")
     print("\\label{tab:benchmark_results}")
     print("\\end{table*}\n")
 
