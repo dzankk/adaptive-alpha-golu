@@ -6,6 +6,7 @@ across ReLU, GELU, Swish, PReLU, PGELU, Static GoLU, Adaptive Alpha-GoLU, and Ad
 Includes proper Gompertz math, deterministic PGD evaluation, and CUDA seed resetting.
 """
 
+import math
 import inspect
 import random
 import numpy as np

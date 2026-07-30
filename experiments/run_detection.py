@@ -8,6 +8,7 @@ The detection head uses a selectable activation function, while any learnable
 activation scalars remain isolated from weight decay.
 """
 
+import argparse
 import random
 from collections import defaultdict
 from typing import Dict, List, Tuple
@@ -21,7 +22,7 @@ from torch.utils.data import DataLoader, Dataset, random_split
 from torchvision.datasets import VOCDetection
 from torchvision.models.detection import FasterRCNN
 from torchvision.models.detection.backbone_utils import resnet_fpn_backbone
-from torchvision.models.detection.faster_rcnn import FastRCNNPredictor, FasterRCNNPredictor
+from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
 from torchvision.models.detection.rpn import AnchorGenerator
 from torchvision.ops import box_iou
 from torchvision.transforms import functional as TF
@@ -341,6 +342,7 @@ def train_single_seed_detection(
     seed: int,
     epochs: int,
     device: torch.device,
+    lr: float = 2e-4,
     image_size: int = 320,
     train_split_ratio: float = 0.9,
     max_train_samples: int | None = None,
@@ -392,7 +394,7 @@ def train_single_seed_detection(
     )
 
     model = build_detection_model(act_type=act_type, num_classes=len(VOC_CLASSES) + 1).to(device)
-    optimizer = get_optimizer(model, lr=2e-4, weight_decay=1e-4)
+    optimizer = get_optimizer(model, lr=lr, weight_decay=1e-4)
     scheduler = optim.lr_scheduler.MultiStepLR(optimizer, milestones=[max(1, epochs // 2), max(1, (3 * epochs) // 4)], gamma=0.1)
 
     for epoch in range(epochs):
@@ -419,20 +421,30 @@ def train_single_seed_detection(
     return float(map50)
 
 
-def run_detection_benchmark():
+def run_detection_benchmark(seeds: list[int] | None = None, epochs: int = 8, lr: float = 2e-4):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Running Pascal VOC 2012 Detection Benchmark on {device}")
     activations = ["relu", "gelu", "swish", "prelu", "pgelu", "golu_static", "alpha_golu", "swish_adaptive"]
+    seeds = seeds or [42, 123, 999, 2024, 2025]
 
     for act_type in activations:
-        map50 = train_single_seed_detection(act_type, seed=42, epochs=8, device=device, max_train_samples=2000, max_eval_samples=400)
-        print(f"Activation: {act_type.ljust(15)} | VOC mAP@0.5: {map50:.4f}")
+        print(f"\n--- Activation: {act_type.upper()} ---")
+        for seed in seeds:
+            map50 = train_single_seed_detection(
+                act_type,
+                seed=seed,
+                epochs=epochs,
+                device=device,
+                lr=lr,
+            )
+            print(f"Seed {seed} -> VOC mAP@0.5: {map50:.4f}")
 
 
 def train_and_eval(
     activation: str = "alpha_golu",
     seed: int = 42,
     epochs: int = 8,
+    lr: float = 2e-4,
     max_train_samples: int | None = None,
     max_eval_samples: int | None = None,
 ) -> float:
@@ -443,6 +455,7 @@ def train_and_eval(
         seed=seed,
         epochs=epochs,
         device=device,
+        lr=lr,
         max_train_samples=max_train_samples,
         max_eval_samples=max_eval_samples,
     )
@@ -450,4 +463,28 @@ def train_and_eval(
 
 
 if __name__ == "__main__":
-    run_detection_benchmark()
+    parser = argparse.ArgumentParser(description="Pascal VOC 2012 detection benchmark")
+    parser.add_argument("--activation", type=str, default="alpha_golu", help="Activation to evaluate when not running the full benchmark sweep")
+    parser.add_argument("--seeds", type=int, nargs="+", default=[42], help="Seed list for direct single-activation runs")
+    parser.add_argument("--epochs", type=int, default=8, help="Training epochs for direct single-activation runs")
+    parser.add_argument("--lr", type=float, default=2e-4, help="Learning rate for detection training")
+    parser.add_argument("--max-train-samples", type=int, default=None, help="Optional cap on training samples for quick smoke runs")
+    parser.add_argument("--max-eval-samples", type=int, default=None, help="Optional cap on evaluation samples for quick smoke runs")
+    parser.add_argument("--benchmark", action="store_true", help="Run the full activation sweep benchmark")
+    args = parser.parse_args()
+
+    if args.benchmark:
+        run_detection_benchmark(seeds=args.seeds, epochs=args.epochs, lr=args.lr)
+    else:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        print(f"Running Pascal VOC 2012 Detection Benchmark on {device}")
+        for seed in args.seeds:
+            map50 = train_and_eval(
+                activation=args.activation,
+                seed=seed,
+                epochs=args.epochs,
+                lr=args.lr,
+                max_train_samples=args.max_train_samples,
+                max_eval_samples=args.max_eval_samples,
+            )
+            print(f"Activation: {args.activation.ljust(15)} | Seed {seed} | VOC mAP@0.5: {map50:.4f}")

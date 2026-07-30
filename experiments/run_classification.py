@@ -247,12 +247,20 @@ def train_single_seed(act_type: str, dataset_name: str = "cifar10", seed: int = 
     
     act_params = []
     weight_params = []
+
+    activation_module_types = (AdaptiveAlphaGoLU, AdaptiveSwish, nn.PReLU)
+    activation_param_ids = set()
+    for module in model.modules():
+        if isinstance(module, activation_module_types):
+            for parameter in module.parameters(recurse=False):
+                if parameter.requires_grad:
+                    activation_param_ids.add(id(parameter))
     
     # Explicit parameter separation ensuring zero weight decay on activation parameters
-    for name, param in model.named_parameters():
+    for param in model.parameters():
         if not param.requires_grad:
             continue
-        if any(keyword in name for keyword in ['raw_alpha', 'beta', 'weight_orig', 'alpha', 'act1', 'act2', 'act3', 'act4']):
+        if id(param) in activation_param_ids:
             act_params.append(param)
         else:
             weight_params.append(param)
