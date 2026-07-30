@@ -1,7 +1,7 @@
 """
 Benchmark: Consolidated Image Classification & Trajectory Analysis
 Unified ResNet-18 runner for CIFAR-10 and Fashion-MNIST across multi-seed evaluations.
-Supports GELU, Swish, Adaptive Swish, PReLU, Static GoLU, and Adaptive Alpha-GoLU.
+Supports GELU, Swish, Adaptive Swish, PReLU, PGELU, Static GoLU, and Adaptive Alpha-GoLU.
 """
 
 import inspect
@@ -16,10 +16,13 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 try:
     from utils.metrics import compute_summary_statistics, calculate_p_value
 except ImportError:
-    def compute_summary_statistics(data):
-        return {'mean': float(np.mean(data)), 'std': float(np.std(data))}
-    def calculate_p_value(a, b):
-        return 0.05
+    try:
+        from utils.stats import compute_summary_statistics, calculate_p_value
+    except ImportError:
+        def compute_summary_statistics(data):
+            return {'mean': float(np.mean(data)), 'std': float(np.std(data))}
+        def calculate_p_value(a, b):
+            return 0.05
 
 
 def reset_all_seeds(seed=42):
@@ -50,6 +53,16 @@ class AdaptiveAlphaGoLU(nn.Module):
     def forward(self, x):
         scaled = torch.clamp(-self.alpha * x, min=-88.0, max=88.0)
         return x * torch.exp(-torch.exp(scaled))
+
+
+class PGELU(nn.Module):
+    """Parametric GELU: x * CDF(alpha * x)"""
+    def __init__(self, init_alpha=1.0):
+        super().__init__()
+        self.alpha = nn.Parameter(torch.tensor(float(init_alpha)))
+
+    def forward(self, x):
+        return x * 0.5 * (1.0 + torch.erf((self.alpha * x) / 1.41421356237))
 
 
 class AdaptiveSwish(nn.Module):
@@ -93,6 +106,8 @@ class ResNetBlock(nn.Module):
             return AdaptiveSwish(init_beta=1.0)
         elif act_type == 'prelu':
             return nn.PReLU()
+        elif act_type == 'pgelu':
+            return PGELU(init_alpha=1.0)
         elif act_type == 'golu_static':
             return StaticGoLU()
         elif act_type == 'alpha_golu':
@@ -147,9 +162,10 @@ class ResNet18(nn.Module):
 
     def extract_alphas(self):
         alphas = []
-        for name, param in self.named_parameters():
-            if 'alpha' in name or 'beta' in name:
-                alphas.extend(param.detach().cpu().numpy().flatten())
+        for module in self.modules():
+            if isinstance(module, (AdaptiveAlphaGoLU, AdaptiveSwish, PGELU, nn.PReLU)):
+                for p in module.parameters():
+                    alphas.extend(p.detach().cpu().numpy().flatten())
         return alphas
 
 
@@ -192,16 +208,16 @@ def train_single_seed(act_type, dataset_name="cifar10", seed=42, epochs=10, devi
     act_params = []
     weight_params = []
     
-    # Clean parameter routing logic across modules
+    # Clean parameter routing logic across modules using explicit memory IDs
     for module in model.modules():
-        if isinstance(module, (AdaptiveAlphaGoLU, AdaptiveSwish, nn.PReLU)):
+        if isinstance(module, (AdaptiveAlphaGoLU, AdaptiveSwish, PGELU, nn.PReLU)):
             for p in module.parameters():
                 if p.requires_grad:
                     act_params.append(p)
 
-    act_params_set = set(act_params)
+    act_params_ids = set(map(id, act_params))
     for p in model.parameters():
-        if p.requires_grad and p not in act_params_set:
+        if p.requires_grad and id(p) not in act_params_ids:
             weight_params.append(p)
     
     optimizer = torch.optim.AdamW([
@@ -247,7 +263,7 @@ def train_single_seed(act_type, dataset_name="cifar10", seed=42, epochs=10, devi
 
 def run_benchmark(dataset_name="cifar10", seeds=[42, 123, 999], epochs=10):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    activations = ['gelu', 'swish', 'swish_adaptive', 'prelu', 'golu_static', 'alpha_golu']
+    activations = ['gelu', 'swish', 'swish_adaptive', 'prelu', 'pgelu', 'golu_static', 'alpha_golu']
     results = {act: [] for act in activations}
 
     print(f"\n================ Running Unified ResNet-18 Benchmark on {dataset_name.upper()} (N={len(seeds)}) ================")
