@@ -33,6 +33,16 @@ class AdaptiveAlphaGoLU(nn.Module):
         return x * torch.exp(-torch.exp(scaled))
 
 
+class PGELU(nn.Module):
+    """Parametric GELU: x * CDF(alpha * x)"""
+    def __init__(self, init_alpha=1.0):
+        super().__init__()
+        self.alpha = nn.Parameter(torch.tensor(float(init_alpha)))
+
+    def forward(self, x):
+        return x * 0.5 * (1.0 + torch.erf((self.alpha * x) / 1.41421356237))
+
+
 class SwishAdaptive(nn.Module):
     def __init__(self, init_beta=1.0):
         super().__init__()
@@ -48,6 +58,12 @@ def get_activation(act_type: str) -> nn.Module:
         return nn.ReLU()
     elif act_type == 'gelu':
         return nn.GELU()
+    elif act_type == 'swish':
+        return nn.SiLU()
+    elif act_type == 'prelu':
+        return nn.PReLU()
+    elif act_type == 'pgelu':
+        return PGELU(init_alpha=1.0)
     elif act_type == 'golu_static':
         return GoLUStatic()
     elif act_type == 'alpha_golu':
@@ -61,13 +77,17 @@ def get_activation(act_type: str) -> nn.Module:
 def get_optimizer(model: nn.Module, lr: float = 1e-3, weight_decay: float = 1e-4) -> optim.Optimizer:
     act_params = []
     base_params = []
-    for name, param in model.named_parameters():
-        if not param.requires_grad:
-            continue
-        if 'alpha' in name or 'beta' in name:
-            act_params.append(param)
-        else:
-            base_params.append(param)
+    
+    for module_name, module in model.named_modules():
+        if isinstance(module, (AdaptiveAlphaGoLU, PGELU, SwishAdaptive, nn.PReLU)):
+            for p in module.parameters():
+                if p.requires_grad:
+                    act_params.append(p)
+
+    act_param_ids = set(map(id, act_params))
+    for p in model.parameters():
+        if p.requires_grad and id(p) not in act_param_ids:
+            base_params.append(p)
 
     param_groups = [{'params': base_params, 'weight_decay': weight_decay}]
     if act_params:
@@ -183,7 +203,7 @@ def train_single_seed_segmentation(act_type: str, seed: int, epochs: int, device
 def run_segmentation_benchmark():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Running Segmentation Benchmark on {device}")
-    activations = ['relu', 'gelu', 'golu_static', 'alpha_golu', 'swish_adaptive']
+    activations = ['gelu', 'swish', 'prelu', 'pgelu', 'golu_static', 'alpha_golu']
 
     for act_type in activations:
         mean_iou = train_single_seed_segmentation(act_type=act_type, seed=42, epochs=2, device=device)
