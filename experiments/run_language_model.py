@@ -1,6 +1,10 @@
 """
 Benchmark: Language Modeling & Autoregressive Generation (Mini-GPT)
-Evaluates autoregressive sequence modeling perplexity across transformer block activations.
+===================================================================
+Evaluates autoregressive sequence modeling perplexity across transformer 
+block activations (ReLU, GELU, Swish, PReLU, PGELU, Static GoLU, 
+Adaptive Alpha-GoLU, and Adaptive Swish).
+
 Uses Causal Multi-Head Attention with zero-weight-decay parameter splitting 
 to ensure adaptive activation parameters do not decay prematurely.
 """
@@ -11,7 +15,32 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, Subset
+
+try:
+    from models.alpha_golu import AlphaGoLU as AdaptiveAlphaGoLU, StaticGoLU
+except ImportError:
+    class StaticGoLU(nn.Module):
+        """Static Gompertz Linear Unit: x * exp(-exp(-x))"""
+        def forward(self, x):
+            scaled = torch.clamp(-x, min=-88.0, max=88.0)
+            return x * torch.exp(-torch.exp(scaled))
+
+    class AdaptiveAlphaGoLU(nn.Module):
+        """Adaptive Gompertz Linear Unit: x * exp(-exp(-alpha * x)) with softplus safety constraint"""
+        def __init__(self, init_alpha=1.0):
+            super().__init__()
+            init_val = float(init_alpha)
+            init_raw = math.log(math.exp(init_val) - 1.0) if init_val < 20 else init_val
+            self.raw_alpha = nn.Parameter(torch.tensor(init_raw, dtype=torch.float32))
+
+        @property
+        def alpha(self):
+            return nn.functional.softplus(self.raw_alpha)
+
+        def forward(self, x):
+            scaled = torch.clamp(-self.alpha * x, min=-88.0, max=88.0)
+            return x * torch.exp(-torch.exp(scaled))
 
 
 def reset_all_seeds(seed=42):
@@ -27,39 +56,27 @@ def reset_all_seeds(seed=42):
 # ==========================================
 # 1. Custom Activations
 # ==========================================
-class StaticGoLU(nn.Module):
-    """Static Gompertz Linear Unit: x * exp(-exp(-x))"""
-    def forward(self, x):
-        scaled = torch.clamp(-x, min=-88.0, max=88.0)
-        return x * torch.exp(-torch.exp(scaled))
-
-
-class AdaptiveAlphaGoLU(nn.Module):
-    """Adaptive Gompertz Linear Unit: x * exp(-exp(-alpha * x))"""
-    def __init__(self, init_alpha=1.0):
-        super().__init__()
-        self.alpha = nn.Parameter(torch.tensor(float(init_alpha)))
-
-    def forward(self, x):
-        scaled = torch.clamp(-self.alpha * x, min=-88.0, max=88.0)
-        return x * torch.exp(-torch.exp(scaled))
-
-
 class PGELU(nn.Module):
-    """Parametric GELU: x * CDF(alpha * x)"""
+    """Parametric GELU: x * CDF(alpha * x) with softplus constraint"""
     def __init__(self, init_alpha=1.0):
         super().__init__()
-        self.alpha = nn.Parameter(torch.tensor(float(init_alpha)))
+        init_val = float(init_alpha)
+        init_raw = math.log(math.exp(init_val) - 1.0) if init_val < 20 else init_val
+        self.raw_alpha = nn.Parameter(torch.tensor(init_raw, dtype=torch.float32))
+
+    @property
+    def alpha(self):
+        return nn.functional.softplus(self.raw_alpha)
 
     def forward(self, x):
         return x * 0.5 * (1.0 + torch.erf((self.alpha * x) / 1.41421356237))
 
 
 class AdaptiveSwish(nn.Module):
-    """Adaptive Swish: x * sigmoid(beta * x)"""
+    """Adaptive Swish (SiLU): x * sigmoid(beta * x)"""
     def __init__(self, init_beta=1.0):
         super().__init__()
-        self.beta = nn.Parameter(torch.tensor(float(init_beta)))
+        self.beta = nn.Parameter(torch.tensor(float(init_beta), dtype=torch.float32))
 
     def forward(self, x):
         return x * torch.sigmoid(self.beta * x)
@@ -71,7 +88,7 @@ def get_activation(act_type: str) -> nn.Module:
         return nn.ReLU()
     elif act_type == 'gelu':
         return nn.GELU()
-    elif act_type == 'swish':
+    elif act_type in ('swish', 'silu'):
         return nn.SiLU()
     elif act_type == 'prelu':
         return nn.PReLU()
@@ -153,10 +170,10 @@ class TransformerBlock(nn.Module):
 
 
 class MiniGPT(nn.Module):
-    def __init__(self, vocab_size=1000, d_model=128, n_heads=4, n_layers=2, act_type='relu'):
+    def __init__(self, vocab_size=1000, d_model=128, n_heads=4, n_layers=2, max_seq_len=512, act_type='relu'):
         super().__init__()
         self.token_emb = nn.Embedding(vocab_size, d_model)
-        self.pos_emb = nn.Parameter(torch.randn(1, 64, d_model) * 0.02)
+        self.pos_emb = nn.Parameter(torch.randn(1, max_seq_len, d_model) * 0.02)
         self.blocks = nn.ModuleList([TransformerBlock(d_model, n_heads, act_type) for _ in range(n_layers)])
         self.ln_f = nn.LayerNorm(d_model)
         self.head = nn.Linear(d_model, vocab_size, bias=False)
@@ -178,9 +195,9 @@ class SyntheticTextDataset(Dataset):
     Generates synthetic token sequences with local correlations 
     to evaluate perplexity meaningfully.
     """
-    def __init__(self, vocab_size=1000, seq_len=65, num_samples=200):
+    def __init__(self, vocab_size=1000, seq_len=65, num_samples=500):
         self.samples = []
-        for _ in range(num_samples):
+        for i in range(num_samples):
             pattern_len = 8
             pattern = torch.randint(0, vocab_size // 10, (pattern_len,))
             seq = pattern.repeat((seq_len // pattern_len) + 1)[:seq_len]
@@ -195,10 +212,20 @@ class SyntheticTextDataset(Dataset):
         return self.samples[idx]
 
 
+# ==========================================
+# 4. Training & Evaluation Pipeline
+# ==========================================
 def train_single_seed_lm(act_type='alpha_golu', seed=42, epochs=10, device='cuda'):
     reset_all_seeds(seed)
-    dataset = SyntheticTextDataset()
-    loader = DataLoader(dataset, batch_size=16, shuffle=True)
+    dataset = SyntheticTextDataset(num_samples=500)
+    
+    # Proper 80/20 train/test split to evaluate generalization perplexity
+    train_size = int(0.8 * len(dataset))
+    test_size = len(dataset) - train_size
+    train_dataset, test_dataset = Subset(dataset, range(0, train_size)), Subset(dataset, range(train_size, len(dataset)))
+
+    train_loader = DataLoader(train_dataset, batch_size=16, shuffle=True)
+    test_loader = DataLoader(test_dataset, batch_size=16, shuffle=False)
 
     model = MiniGPT(act_type=act_type).to(device)
     optimizer = get_optimizer(model, lr=1e-3)
@@ -206,7 +233,7 @@ def train_single_seed_lm(act_type='alpha_golu', seed=42, epochs=10, device='cuda
 
     for epoch in range(epochs):
         model.train()
-        for batch in loader:
+        for batch in train_loader:
             batch = batch.to(device)
             inputs, targets = batch[:, :-1], batch[:, 1:]
             optimizer.zero_grad()
@@ -218,14 +245,14 @@ def train_single_seed_lm(act_type='alpha_golu', seed=42, epochs=10, device='cuda
     model.eval()
     total_loss = 0.0
     with torch.no_grad():
-        for batch in loader:
+        for batch in test_loader:
             batch = batch.to(device)
             inputs, targets = batch[:, :-1], batch[:, 1:]
             logits = model(inputs)
             loss = criterion(logits.reshape(-1, 1000), targets.reshape(-1))
             total_loss += loss.item()
 
-    avg_loss = total_loss / len(loader)
+    avg_loss = total_loss / len(test_loader)
     
     try:
         perplexity = math.exp(min(avg_loss, 20.0))
@@ -240,19 +267,19 @@ def run_lm_benchmark(seeds=[42, 123, 999, 2024, 2025], epochs=10):
     print(f"Running Language Model Benchmark on {device}...")
     activations = ['relu', 'gelu', 'swish', 'adaptive_swish', 'prelu', 'pgelu', 'golu_static', 'alpha_golu']
 
-    print("\n================ Mini-GPT Language Model Perplexity (PPL ↓) ================")
+    print("\n================ Mini-GPT Language Model Test Perplexity (PPL ↓) ================")
     for act_type in activations:
         ppls = []
         for s in seeds:
             ppl = train_single_seed_lm(act_type=act_type, seed=s, epochs=epochs, device=device)
             ppls.append(ppl)
-            print(f"[{act_type.upper():<14} | Seed {s}] Perplexity: {ppl:.2f}")
+            print(f"[{act_type.upper():<14} | Seed {s}] Test Perplexity: {ppl:.2f}")
 
         print(f"  --> {act_type.upper():<14} Mean PPL: {np.mean(ppls):.2f} ± {np.std(ppls):.2f}\n")
 
 
 def train_and_eval(activation: str = 'alpha_golu', seed: int = 42, epochs: int = 10) -> float:
-    """Returns Perplexity (PPL)."""
+    """Returns Test Perplexity (PPL)."""
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     ppl = train_single_seed_lm(act_type=activation, seed=seed, epochs=epochs, device=device)
     return float(ppl)
