@@ -191,10 +191,17 @@ def train_single_seed(act_type, dataset_name="cifar10", seed=42, epochs=10, devi
     
     act_params = []
     weight_params = []
-    for n, p in model.named_parameters():
-        if 'alpha' in n or 'beta' in n or ('weight' in n and isinstance(dict(model.named_modules())[n.rsplit('.', 1)[0]], nn.PReLU)):
-            act_params.append(p)
-        else:
+    
+    # Clean parameter routing logic across modules
+    for module in model.modules():
+        if isinstance(module, (AdaptiveAlphaGoLU, AdaptiveSwish, nn.PReLU)):
+            for p in module.parameters():
+                if p.requires_grad:
+                    act_params.append(p)
+
+    act_params_set = set(act_params)
+    for p in model.parameters():
+        if p.requires_grad and p not in act_params_set:
             weight_params.append(p)
     
     optimizer = torch.optim.AdamW([
