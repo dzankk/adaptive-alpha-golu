@@ -5,51 +5,66 @@ Demonstrates layer skip-connections combined with parameter-group optimization
 (disabling weight decay for trainable activation variables like alpha and beta).
 """
 
+import math
 import random
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader, Dataset, random_split
 
+
 # ==========================================
-# 1. Custom Activation Functions
+# 1. Custom Activation Implementations
 # ==========================================
 class GoLUStatic(nn.Module):
-    """Gompertz Linear Unit: x * exp(-exp(-x))"""
-    def forward(self, x):
+    """Static Gompertz Linear Unit: x * exp(-exp(-x))"""
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         scaled = torch.clamp(-x, min=-88.0, max=88.0)
         return x * torch.exp(-torch.exp(scaled))
 
 
 class AdaptiveAlphaGoLU(nn.Module):
-    """Adaptive Gompertz Linear Unit: x * exp(-exp(-alpha * x))"""
-    def __init__(self, init_alpha=1.0):
+    """Adaptive Gompertz Linear Unit with Softplus parameterization: x * exp(-exp(-alpha * x))"""
+    def __init__(self, init_alpha: float = 1.0):
         super().__init__()
-        self.alpha = nn.Parameter(torch.tensor(float(init_alpha)))
+        init_val = float(init_alpha)
+        init_raw = math.log(math.exp(init_val) - 1.0) if init_val < 20 else init_val
+        self.raw_alpha = nn.Parameter(torch.tensor(init_raw, dtype=torch.float32))
 
-    def forward(self, x):
+    @property
+    def alpha(self) -> torch.Tensor:
+        return F.softplus(self.raw_alpha)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         scaled = torch.clamp(-self.alpha * x, min=-88.0, max=88.0)
         return x * torch.exp(-torch.exp(scaled))
 
 
 class PGELU(nn.Module):
     """Parametric GELU: x * CDF(alpha * x)"""
-    def __init__(self, init_alpha=1.0):
+    def __init__(self, init_alpha: float = 1.0):
         super().__init__()
-        self.alpha = nn.Parameter(torch.tensor(float(init_alpha)))
+        init_val = float(init_alpha)
+        init_raw = math.log(math.exp(init_val) - 1.0) if init_val < 20 else init_val
+        self.raw_alpha = nn.Parameter(torch.tensor(init_raw, dtype=torch.float32))
 
-    def forward(self, x):
+    @property
+    def alpha(self) -> torch.Tensor:
+        return F.softplus(self.raw_alpha)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         return x * 0.5 * (1.0 + torch.erf((self.alpha * x) / 1.41421356237))
 
 
 class SwishAdaptive(nn.Module):
-    """Adaptive Swish: x * sigmoid(beta * x)"""
-    def __init__(self, init_beta=1.0):
+    """Adaptive Swish (SiLU): x * sigmoid(beta * x)"""
+    def __init__(self, init_beta: float = 1.0):
         super().__init__()
-        self.beta = nn.Parameter(torch.tensor(float(init_beta)))
+        self.beta = nn.Parameter(torch.tensor(float(init_beta), dtype=torch.float32))
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         return x * torch.sigmoid(self.beta * x)
 
 
@@ -59,7 +74,7 @@ def get_activation(act_type: str) -> nn.Module:
         return nn.ReLU()
     elif act_type == 'gelu':
         return nn.GELU()
-    elif act_type == 'swish':
+    elif act_type in ('swish', 'silu'):
         return nn.SiLU()
     elif act_type in ('adaptive_swish', 'swish_adaptive'):
         return SwishAdaptive(init_beta=1.0)
@@ -92,7 +107,7 @@ def get_optimizer(model: nn.Module, lr: float = 1e-3, weight_decay: float = 1e-4
 
     param_groups = [{'params': base_params, 'weight_decay': weight_decay}]
     if act_params:
-        # Zero weight-decay applied to trainable activation variables
+        # Zero weight-decay applied strictly to trainable activation parameters
         param_groups.append({'params': act_params, 'lr': lr, 'weight_decay': 0.0})
 
     return optim.AdamW(param_groups, lr=lr)
@@ -102,23 +117,23 @@ def get_optimizer(model: nn.Module, lr: float = 1e-3, weight_decay: float = 1e-4
 # 2. U-Net Architecture
 # ==========================================
 class UNetBlock(nn.Module):
-    def __init__(self, in_ch, out_ch, act_type):
+    def __init__(self, in_ch: int, out_ch: int, act_type: str):
         super().__init__()
         self.conv = nn.Sequential(
-            nn.Conv2d(in_ch, out_ch, 3, padding=1),
+            nn.Conv2d(in_ch, out_ch, 3, padding=1, bias=False),
             nn.BatchNorm2d(out_ch),
             get_activation(act_type),
-            nn.Conv2d(out_ch, out_ch, 3, padding=1),
+            nn.Conv2d(out_ch, out_ch, 3, padding=1, bias=False),
             nn.BatchNorm2d(out_ch),
             get_activation(act_type)
         )
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.conv(x)
 
 
 class UNet(nn.Module):
-    def __init__(self, in_channels=3, num_classes=1, act_type='relu'):
+    def __init__(self, in_channels: int = 3, num_classes: int = 1, act_type: str = 'relu'):
         super().__init__()
         self.enc1 = UNetBlock(in_channels, 32, act_type)
         self.pool1 = nn.MaxPool2d(2)
@@ -134,7 +149,7 @@ class UNet(nn.Module):
 
         self.head = nn.Conv2d(32, num_classes, 1)
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         e1 = self.enc1(x)
         e2 = self.enc2(self.pool1(e1))
         b = self.bottleneck(self.pool2(e2))
@@ -151,23 +166,22 @@ class UNet(nn.Module):
 # ==========================================
 class SyntheticSegmentationDataset(Dataset):
     """Generates structured synthetic geometric targets for segmentation learning."""
-    def __init__(self, size=100, height=128, width=128, seed=42):
+    def __init__(self, size: int = 100, height: int = 128, width: int = 128, seed: int = 42):
         self.size = size
         self.height = height
         self.width = width
-        self.rng = np.random.RandomState(seed)
+        self.seed = seed
 
     def __len__(self):
         return self.size
 
-    def __getitem__(self, idx):
-        # Deterministic generation per sample index
-        sample_rng = np.random.RandomState(idx + 1000)
+    def __getitem__(self, idx: int):
+        sample_rng = np.random.RandomState(self.seed + idx)
         
         # Base structured noise background
         x = sample_rng.randn(3, self.height, self.width).astype(np.float32)
         
-        # Draw dynamic synthetic target region (circles / boxes)
+        # Draw dynamic synthetic target region
         y = np.zeros((1, self.height, self.width), dtype=np.float32)
         cx, cy = sample_rng.randint(32, 96, size=2)
         r = sample_rng.randint(16, 32)
@@ -176,12 +190,12 @@ class SyntheticSegmentationDataset(Dataset):
         mask = (grid_x - cx) ** 2 + (grid_y - cy) ** 2 <= r ** 2
         
         y[0, mask] = 1.0
-        x[0, mask] += 1.5  # Signal shift inside mask
+        x[0, mask] += 1.5  # Signal shift inside target mask
         
         return torch.from_numpy(x), torch.from_numpy(y)
 
 
-def compute_mIoU(preds, targets, threshold=0.5):
+def compute_mIoU(preds: torch.Tensor, targets: torch.Tensor, threshold: float = 0.5) -> float:
     preds_binary = (torch.sigmoid(preds) > threshold).float()
     intersection = (preds_binary * targets).sum(dim=[2, 3])
     union = (preds_binary + targets - preds_binary * targets).sum(dim=[2, 3])
@@ -195,6 +209,8 @@ def set_seed(seed: int):
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 
 def train_single_seed_segmentation(act_type: str, seed: int, epochs: int, device: torch.device) -> float:
@@ -203,17 +219,19 @@ def train_single_seed_segmentation(act_type: str, seed: int, epochs: int, device
     full_dataset = SyntheticSegmentationDataset(size=100, seed=seed)
     train_size = int(0.8 * len(full_dataset))
     val_size = len(full_dataset) - train_size
-    train_ds, val_ds = random_split(full_dataset, [train_size, val_size], generator=torch.Generator().manual_seed(seed))
+    train_ds, val_ds = random_split(
+        full_dataset, [train_size, val_size], generator=torch.Generator().manual_seed(seed)
+    )
 
     train_loader = DataLoader(train_ds, batch_size=8, shuffle=True)
     val_loader = DataLoader(val_ds, batch_size=8, shuffle=False)
 
     model = UNet(act_type=act_type).to(device)
-    optimizer = get_optimizer(model)
+    optimizer = get_optimizer(model, lr=1e-3, weight_decay=1e-4)
     criterion = nn.BCEWithLogitsLoss()
 
-    model.train()
     for epoch in range(epochs):
+        model.train()
         for x, y in train_loader:
             x, y = x.to(device), y.to(device)
             optimizer.zero_grad()
