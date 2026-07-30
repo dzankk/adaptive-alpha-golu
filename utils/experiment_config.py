@@ -9,6 +9,9 @@ from pathlib import Path
 from typing import Any, Dict
 
 
+REQUIRED_BENCHMARK_KEYS = {"tasks", "activations", "seeds", "output_root", "summary_path"}
+
+
 def load_benchmark_config(config_path: str) -> Dict[str, Any]:
     raw_path = Path(config_path)
     repo_root = Path(__file__).resolve().parents[1]
@@ -32,5 +35,11 @@ def load_benchmark_config(config_path: str) -> Dict[str, Any]:
 
     if not isinstance(data, dict):
         raise ValueError("Benchmark config must be a JSON object")
+
+    missing = sorted(REQUIRED_BENCHMARK_KEYS - set(data.keys()))
+    if missing:
+        raise ValueError(
+            f"Benchmark config is missing required keys: {', '.join(missing)}"
+        )
 
     return data

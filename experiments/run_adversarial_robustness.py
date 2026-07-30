@@ -22,31 +22,7 @@ from torch.utils.data import DataLoader
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
-
-try:
-    from models.alpha_golu import AlphaGoLU as AdaptiveAlphaGoLU, StaticGoLU
-except ImportError:
-    class StaticGoLU(nn.Module):
-        """Correct & numerically stable Gompertz activation: x * exp(-exp(-x))"""
-        def forward(self, x):
-            scaled = torch.clamp(-x, min=-88.0, max=88.0)
-            return x * torch.exp(-torch.exp(scaled))
-
-    class AdaptiveAlphaGoLU(nn.Module):
-        """Fallback implementation using Softplus for alpha positivity"""
-        def __init__(self, init_alpha=1.0):
-            super().__init__()
-            init_val = float(init_alpha)
-            init_raw = math.log(math.expm1(init_val)) if init_val < 20 else init_val
-            self.raw_alpha = nn.Parameter(torch.tensor(init_raw, dtype=torch.float32))
-
-        @property
-        def alpha(self):
-            return nn.functional.softplus(self.raw_alpha)
-
-        def forward(self, x):
-            scaled = torch.clamp(-self.alpha * x, min=-88.0, max=88.0)
-            return x * torch.exp(-torch.exp(scaled))
+from models.alpha_golu import AlphaGoLU as AdaptiveAlphaGoLU, StaticGoLU
 
 
 def reset_all_seeds(seed=42):
