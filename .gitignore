@@ -19,3 +19,9 @@ data/
 *.pt
 *.checkpoint
 outputs/
+
+# Ignore raw datasets
+data/
+*.tar.gz
+*.zip
+*.txt
