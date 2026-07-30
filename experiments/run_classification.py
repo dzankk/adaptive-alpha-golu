@@ -348,16 +348,17 @@ if __name__ == '__main__':
     parser.add_argument("--dataset-name", type=str, default=None, choices=["cifar10", "fashion_mnist"], help="Dataset to evaluate")
     parser.add_argument("--seeds", type=int, nargs="+", default=[42, 123, 999, 2024, 2025], help="Random seeds")
     parser.add_argument("--epochs", type=int, default=10, help="Training epochs")
-    parser.add_argument("--activation", type=str, default=None, help="Optional single activation to evaluate")
+    parser.add_argument("--activation", type=str, default="alpha_golu", help="Single activation to evaluate")
+    parser.add_argument("--benchmark", action="store_true", help="Run the full benchmark sweep")
     args = parser.parse_args()
 
-    if args.activation:
+    if args.benchmark:
+        dataset_names = [args.dataset_name] if args.dataset_name else ["cifar10", "fashion_mnist"]
+        for dataset_name in dataset_names:
+            run_benchmark(dataset_name=dataset_name, seeds=args.seeds, epochs=args.epochs)
+    else:
         dataset_name = args.dataset_name or "cifar10"
         print(f"Running Classification Benchmark on {dataset_name.upper()}...")
         for seed in args.seeds:
             acc, _ = train_single_seed(act_type=args.activation, dataset_name=dataset_name, seed=seed, epochs=args.epochs, device=torch.device("cuda" if torch.cuda.is_available() else "cpu"))
             print(f"Activation: {args.activation.ljust(15)} | Seed {seed} | Accuracy: {acc:.2f}%")
-    else:
-        dataset_names = [args.dataset_name] if args.dataset_name else ["cifar10", "fashion_mnist"]
-        for dataset_name in dataset_names:
-            run_benchmark(dataset_name=dataset_name, seeds=args.seeds, epochs=args.epochs)

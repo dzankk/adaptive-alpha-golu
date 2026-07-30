@@ -262,13 +262,13 @@ if __name__ == '__main__':
     import argparse
 
     parser = argparse.ArgumentParser(description="CelebA diffusion benchmark")
-    parser.add_argument("--activation", type=str, default=None, help="Optional single activation to evaluate")
+    parser.add_argument("--activation", type=str, default="alpha_golu", help="Single activation to evaluate")
     parser.add_argument("--seeds", type=int, nargs="+", default=[42, 123, 999, 2024, 2025], help="Random seeds")
     parser.add_argument("--epochs", type=int, default=10, help="Training epochs")
     parser.add_argument("--benchmark", action="store_true", help="Run the full activation sweep")
     args = parser.parse_args()
 
-    if args.benchmark or args.activation is None:
+    if args.benchmark:
         run_diffusion_benchmark(seeds=args.seeds, epochs=args.epochs)
     else:
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
