@@ -4,6 +4,7 @@ Evaluates autoregressive sequence modeling perplexity across transformer block a
 Uses Causal Multi-Head Attention with zero-weight-decay parameter splitting 
 to ensure adaptive activation parameters do not decay prematurely.
 """
+
 import math
 import random
 import numpy as np
@@ -26,13 +27,15 @@ def reset_all_seeds(seed=42):
 # ==========================================
 # 1. Custom Activations
 # ==========================================
-class GoLUStatic(nn.Module):
+class StaticGoLU(nn.Module):
+    """Static Gompertz Linear Unit: x * exp(-exp(-x))"""
     def forward(self, x):
         scaled = torch.clamp(-x, min=-88.0, max=88.0)
         return x * torch.exp(-torch.exp(scaled))
 
 
 class AdaptiveAlphaGoLU(nn.Module):
+    """Adaptive Gompertz Linear Unit: x * exp(-exp(-alpha * x))"""
     def __init__(self, init_alpha=1.0):
         super().__init__()
         self.alpha = nn.Parameter(torch.tensor(float(init_alpha)))
@@ -52,7 +55,8 @@ class PGELU(nn.Module):
         return x * 0.5 * (1.0 + torch.erf((self.alpha * x) / 1.41421356237))
 
 
-class SwishAdaptive(nn.Module):
+class AdaptiveSwish(nn.Module):
+    """Adaptive Swish: x * sigmoid(beta * x)"""
     def __init__(self, init_beta=1.0):
         super().__init__()
         self.beta = nn.Parameter(torch.tensor(float(init_beta)))
@@ -62,7 +66,7 @@ class SwishAdaptive(nn.Module):
 
 
 def get_activation(act_type: str) -> nn.Module:
-    act_type = act_type.lower()
+    act_type = str(act_type).lower().strip()
     if act_type == 'relu':
         return nn.ReLU()
     elif act_type == 'gelu':
@@ -73,12 +77,12 @@ def get_activation(act_type: str) -> nn.Module:
         return nn.PReLU()
     elif act_type == 'pgelu':
         return PGELU(init_alpha=1.0)
+    elif act_type in ('swish_adaptive', 'adaptive_swish'):
+        return AdaptiveSwish(init_beta=1.0)
     elif act_type == 'golu_static':
-        return GoLUStatic()
+        return StaticGoLU()
     elif act_type == 'alpha_golu':
         return AdaptiveAlphaGoLU(init_alpha=1.0)
-    elif act_type == 'swish_adaptive':
-        return SwishAdaptive(init_beta=1.0)
     else:
         raise ValueError(f"Unknown activation type: {act_type}")
 
@@ -88,7 +92,7 @@ def get_optimizer(model: nn.Module, lr: float = 1e-3, weight_decay: float = 1e-4
     base_params = []
     
     for module in model.modules():
-        if isinstance(module, (AdaptiveAlphaGoLU, PGELU, SwishAdaptive, nn.PReLU)):
+        if isinstance(module, (AdaptiveAlphaGoLU, PGELU, AdaptiveSwish, nn.PReLU)):
             for p in module.parameters():
                 if p.requires_grad:
                     act_params.append(p)
@@ -231,14 +235,20 @@ def train_single_seed_lm(act_type='alpha_golu', seed=42, epochs=10, device='cuda
     return perplexity
 
 
-def run_lm_benchmark():
+def run_lm_benchmark(seeds=[42, 123, 999, 2024, 2025], epochs=10):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Running Language Model Benchmark on {device}")
-    activations = ['gelu', 'swish', 'prelu', 'pgelu', 'golu_static', 'alpha_golu']
+    print(f"Running Language Model Benchmark on {device}...")
+    activations = ['relu', 'gelu', 'swish', 'adaptive_swish', 'prelu', 'pgelu', 'golu_static', 'alpha_golu']
 
+    print("\n================ Mini-GPT Language Model Perplexity (PPL ↓) ================")
     for act_type in activations:
-        perplexity = train_single_seed_lm(act_type=act_type, seed=42, epochs=2, device=device)
-        print(f"Activation: {act_type.ljust(15)} | Test Perplexity: {perplexity:.2f}")
+        ppls = []
+        for s in seeds:
+            ppl = train_single_seed_lm(act_type=act_type, seed=s, epochs=epochs, device=device)
+            ppls.append(ppl)
+            print(f"[{act_type.upper():<14} | Seed {s}] Perplexity: {ppl:.2f}")
+
+        print(f"  --> {act_type.upper():<14} Mean PPL: {np.mean(ppls):.2f} ± {np.std(ppls):.2f}\n")
 
 
 def train_and_eval(activation: str = 'alpha_golu', seed: int = 42, epochs: int = 10) -> float:
