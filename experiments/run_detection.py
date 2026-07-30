@@ -229,10 +229,10 @@ class ActivationBoxHead(nn.Module):
 
 
 def build_detection_model(act_type: str, num_classes: int = 21) -> FasterRCNN:
-    backbone = resnet_fpn_backbone("resnet50", weights=None, trainable_layers=3)
+    backbone = resnet_fpn_backbone(backbone_name="resnet50", weights=None, trainable_layers=3)
     anchor_generator = AnchorGenerator(
-        sizes=((32, 64, 128, 256, 512),),
-        aspect_ratios=((0.5, 1.0, 2.0),),
+        sizes=((32,), (64,), (128,), (256,), (512,)),
+        aspect_ratios=((0.5, 1.0, 2.0),) * 5,
     )
     model = FasterRCNN(
         backbone,

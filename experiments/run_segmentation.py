@@ -246,8 +246,9 @@ def train_single_seed_segmentation(act_type: str, seed: int, epochs: int, device
     return total_iou / len(val_loader)
 
 
-def run_segmentation_benchmark(seeds=[42, 123, 999, 2024, 2025], epochs=10):
+def run_segmentation_benchmark(seeds=None, epochs=10):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    seeds = seeds or [42, 123, 999, 2024, 2025]
     print(f"Running Segmentation Benchmark on {device} (N={len(seeds)})")
     activations = ['relu', 'gelu', 'swish', 'adaptive_swish', 'prelu', 'pgelu', 'golu_static', 'alpha_golu']
 

@@ -346,8 +346,9 @@ def train_single_seed_lm(
     return float(perplexity)
 
 
-def run_lm_benchmark(seeds=[42, 123, 999, 2024, 2025], epochs=5):
+def run_lm_benchmark(seeds=None, epochs=5):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    seeds = seeds or [42, 123, 999, 2024, 2025]
     print(f"Running WikiText-2 Language Model Benchmark on {device}...")
     activations = ["relu", "gelu", "swish", "adaptive_swish", "prelu", "pgelu", "golu_static", "alpha_golu"]
 
