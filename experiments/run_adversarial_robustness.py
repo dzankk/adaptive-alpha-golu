@@ -1,7 +1,7 @@
 """
 Benchmark: Adversarial Robustness on CIFAR-10 (ResNet-18)
 Evaluates clean accuracy vs. FGSM and PGD-10 adversarial attack robustness 
-across GELU, Swish, PReLU, PGELU, Static GoLU, and Adaptive Alpha-GoLU.
+across ReLU, GELU, Swish, PReLU, PGELU, Static GoLU, Adaptive Alpha-GoLU, and Adaptive Swish.
 Includes proper Gompertz math, deterministic PGD evaluation, and CUDA seed resetting.
 """
 
@@ -69,11 +69,15 @@ class SwishAdaptive(nn.Module):
         return x * torch.sigmoid(self.beta * x)
 
 
+# Alias for naming consistency across CLI tools
+AdaptiveSwish = SwishAdaptive
+
+
 # ==========================================
 # 2. Helpers & Factory
 # ==========================================
 def get_activation(act_type: str) -> nn.Module:
-    act_type = act_type.lower()
+    act_type = str(act_type).lower().strip()
     if act_type == 'relu':
         return nn.ReLU()
     elif act_type == 'gelu':
@@ -90,7 +94,7 @@ def get_activation(act_type: str) -> nn.Module:
     elif act_type == 'alpha_golu':
         sig = inspect.signature(AdaptiveAlphaGoLU)
         return AdaptiveAlphaGoLU(init_alpha=1.00) if 'init_alpha' in sig.parameters else AdaptiveAlphaGoLU()
-    elif act_type == 'swish_adaptive':
+    elif act_type in ('swish_adaptive', 'adaptive_swish'):
         sig = inspect.signature(SwishAdaptive)
         return SwishAdaptive(init_beta=1.00) if 'init_beta' in sig.parameters else SwishAdaptive()
     else:
@@ -102,7 +106,7 @@ def get_optimizer(model: nn.Module, lr: float = 1e-3, weight_decay: float = 1e-4
     base_params = []
     
     for module in model.modules():
-        if isinstance(module, (AdaptiveAlphaGoLU, PGELU, SwishAdaptive, nn.PReLU)):
+        if isinstance(module, (AdaptiveAlphaGoLU, PGELU, SwishAdaptive, AdaptiveSwish, nn.PReLU)):
             for p in module.parameters():
                 if p.requires_grad:
                     act_params.append(p)
