@@ -352,6 +352,7 @@ def train_single_seed_detection(
     seed: int,
     epochs: int,
     device: torch.device,
+    data_root: str = "./data",
     lr: float = 2e-4,
     image_size: int = 320,
     train_split_ratio: float = 0.9,
@@ -362,7 +363,7 @@ def train_single_seed_detection(
     set_seed(seed)
 
     full_dataset = PascalVOCDataset(
-        root="./data",
+        root=data_root,
         year="2012",
         image_set="trainval",
         image_size=image_size,
@@ -450,6 +451,7 @@ def train_single_seed_detection(
             {
                 "task": "detection",
                 "dataset_name": "pascal_voc_2012",
+                "data_root": data_root,
                 "activation": act_type,
                 "seed": seed,
                 "epochs": epochs,
@@ -476,6 +478,7 @@ def train_single_seed_detection(
                 activations=[act_type],
                 extra_config={
                     "dataset_name": "pascal_voc_2012",
+                    "data_root": data_root,
                     "epochs": epochs,
                     "seed": seed,
                     "lr": lr,
@@ -492,7 +495,7 @@ def train_single_seed_detection(
     return float(map50)
 
 
-def run_detection_benchmark(seeds: list[int] | None = None, epochs: int = 8, lr: float = 2e-4):
+def run_detection_benchmark(seeds: list[int] | None = None, epochs: int = 8, lr: float = 2e-4, data_root: str = "./data"):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Running Pascal VOC 2012 Detection Benchmark on {device}")
     activations = ["relu", "gelu", "swish", "prelu", "pgelu", "golu_static", "alpha_golu", "swish_adaptive"]
@@ -506,6 +509,7 @@ def run_detection_benchmark(seeds: list[int] | None = None, epochs: int = 8, lr:
                 seed=seed,
                 epochs=epochs,
                 device=device,
+                data_root=data_root,
                 lr=lr,
                 save_artifacts=True,
             )
@@ -517,6 +521,7 @@ def train_and_eval(
     seed: int = 42,
     epochs: int = 8,
     lr: float = 2e-4,
+    data_root: str = "./data",
     max_train_samples: int | None = None,
     max_eval_samples: int | None = None,
     save_artifacts: bool = False,
@@ -528,6 +533,7 @@ def train_and_eval(
         seed=seed,
         epochs=epochs,
         device=device,
+        data_root=data_root,
         lr=lr,
         max_train_samples=max_train_samples,
         max_eval_samples=max_eval_samples,
@@ -542,13 +548,14 @@ if __name__ == "__main__":
     parser.add_argument("--seeds", type=int, nargs="+", default=[42], help="Seed list for direct single-activation runs")
     parser.add_argument("--epochs", type=int, default=8, help="Training epochs for direct single-activation runs")
     parser.add_argument("--lr", type=float, default=2e-4, help="Learning rate for detection training")
+    parser.add_argument("--data-root", type=str, default="./data", help="Dataset cache root")
     parser.add_argument("--max-train-samples", type=int, default=None, help="Optional cap on training samples for quick smoke runs")
     parser.add_argument("--max-eval-samples", type=int, default=None, help="Optional cap on evaluation samples for quick smoke runs")
     parser.add_argument("--benchmark", action="store_true", help="Run the full activation sweep benchmark")
     args = parser.parse_args()
 
     if args.benchmark:
-        run_detection_benchmark(seeds=args.seeds, epochs=args.epochs, lr=args.lr)
+        run_detection_benchmark(seeds=args.seeds, epochs=args.epochs, lr=args.lr, data_root=args.data_root)
     else:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"Running Pascal VOC 2012 Detection Benchmark on {device}")
@@ -557,6 +564,7 @@ if __name__ == "__main__":
                 activation=args.activation,
                 seed=seed,
                 epochs=args.epochs,
+                data_root=args.data_root,
                 lr=args.lr,
                 max_train_samples=args.max_train_samples,
                 max_eval_samples=args.max_eval_samples,

@@ -148,7 +148,7 @@ def get_optimizer(model: nn.Module) -> torch.optim.Optimizer:
     ])
 
 
-def train_single_seed_diffusion(act_type: str, seed: int, epochs: int, device: torch.device) -> float:
+def train_single_seed_diffusion(act_type: str, seed: int, epochs: int, device: torch.device, data_root: str = './data') -> float:
     reset_seeds(seed)
 
     transform = transforms.Compose([
@@ -158,8 +158,8 @@ def train_single_seed_diffusion(act_type: str, seed: int, epochs: int, device: t
         transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
     ])
 
-    full_dataset = torchvision.datasets.CelebA(root='./data', split='train', target_type='attr', download=True, transform=transform)
-    test_dataset = torchvision.datasets.CelebA(root='./data', split='valid', target_type='attr', download=True, transform=transform)
+    full_dataset = torchvision.datasets.CelebA(root=data_root, split='train', target_type='attr', download=True, transform=transform)
+    test_dataset = torchvision.datasets.CelebA(root=data_root, split='valid', target_type='attr', download=True, transform=transform)
 
     loader_g = torch.Generator().manual_seed(seed)
     eval_g = torch.Generator().manual_seed(seed + 999)
@@ -236,7 +236,7 @@ def train_single_seed_diffusion(act_type: str, seed: int, epochs: int, device: t
     return float(np.mean(val_losses)) if val_losses else 0.0
 
 
-def run_diffusion_benchmark(seeds=None, epochs: int = 10):
+def run_diffusion_benchmark(seeds=None, epochs: int = 10, data_root: str = './data'):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Running CelebA DDPM Diffusion Benchmark on {device}...")
 
@@ -248,7 +248,7 @@ def run_diffusion_benchmark(seeds=None, epochs: int = 10):
     for act in activations:
         seed_losses = []
         for s in seeds:
-            mean_val = train_single_seed_diffusion(act_type=act, seed=s, epochs=epochs, device=device)
+            mean_val = train_single_seed_diffusion(act_type=act, seed=s, epochs=epochs, device=device, data_root=data_root)
             seed_losses.append(mean_val)
             print(f"[{act.upper():<14} | Seed {s}] Denoising MSE: {mean_val:.6f}")
 
@@ -259,10 +259,10 @@ def run_diffusion_benchmark(seeds=None, epochs: int = 10):
         print(f"  {act.upper():<14}: Loss = {m_loss:.6f} ± {s_loss:.6f}")
 
 
-def train_and_eval(activation: str = 'alpha_golu', seed: int = 42, epochs: int = 10) -> float:
+def train_and_eval(activation: str = 'alpha_golu', seed: int = 42, epochs: int = 10, data_root: str = './data') -> float:
     """Returns Denoising Test MSE Loss."""
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    loss = train_single_seed_diffusion(act_type=activation, seed=seed, epochs=epochs, device=device)
+    loss = train_single_seed_diffusion(act_type=activation, seed=seed, epochs=epochs, device=device, data_root=data_root)
     return float(loss)
 
 
@@ -273,14 +273,15 @@ if __name__ == '__main__':
     parser.add_argument("--activation", type=str, default="alpha_golu", help="Single activation to evaluate")
     parser.add_argument("--seeds", type=int, nargs="+", default=[42, 123, 999, 2024, 2025], help="Random seeds")
     parser.add_argument("--epochs", type=int, default=10, help="Training epochs")
+    parser.add_argument("--data-root", type=str, default="./data", help="Dataset cache root")
     parser.add_argument("--benchmark", action="store_true", help="Run the full activation sweep")
     args = parser.parse_args()
 
     if args.benchmark:
-        run_diffusion_benchmark(seeds=args.seeds, epochs=args.epochs)
+        run_diffusion_benchmark(seeds=args.seeds, epochs=args.epochs, data_root=args.data_root)
     else:
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         print(f"Running CelebA DDPM Diffusion Benchmark on {device}...")
         for seed in args.seeds:
-            loss = train_and_eval(activation=args.activation, seed=seed, epochs=args.epochs)
+            loss = train_and_eval(activation=args.activation, seed=seed, epochs=args.epochs, data_root=args.data_root)
             print(f"Activation: {args.activation.ljust(15)} | Seed {seed} | Denoising MSE: {loss:.6f}")

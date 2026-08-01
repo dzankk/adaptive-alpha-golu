@@ -204,11 +204,11 @@ def set_seed(seed: int):
     torch.backends.cudnn.benchmark = False
 
 
-def train_single_seed_segmentation(act_type: str, seed: int, epochs: int, device: torch.device) -> float:
+def train_single_seed_segmentation(act_type: str, seed: int, epochs: int, device: torch.device, data_root: str = './data') -> float:
     set_seed(seed)
     
-    full_dataset = PascalVOCSegmentationDataset(root='./data', year='2012', image_set='train', image_size=256, download=True)
-    val_dataset = PascalVOCSegmentationDataset(root='./data', year='2012', image_set='val', image_size=256, download=True)
+    full_dataset = PascalVOCSegmentationDataset(root=data_root, year='2012', image_set='train', image_size=256, download=True)
+    val_dataset = PascalVOCSegmentationDataset(root=data_root, year='2012', image_set='val', image_size=256, download=True)
     train_size = int(0.8 * len(full_dataset))
     val_size = len(full_dataset) - train_size
     train_ds, val_ds = random_split(
@@ -249,7 +249,7 @@ def train_single_seed_segmentation(act_type: str, seed: int, epochs: int, device
     return total_iou / total_samples if total_samples > 0 else 0.0
 
 
-def run_segmentation_benchmark(seeds=None, epochs=10):
+def run_segmentation_benchmark(seeds=None, epochs=10, data_root: str = './data'):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     seeds = seeds or [42, 123, 999, 2024, 2025]
     print(f"Running Segmentation Benchmark on {device} (N={len(seeds)})")
@@ -258,16 +258,16 @@ def run_segmentation_benchmark(seeds=None, epochs=10):
     for act_type in activations:
         scores = []
         for s in seeds:
-            miou = train_single_seed_segmentation(act_type=act_type, seed=s, epochs=epochs, device=device)
+            miou = train_single_seed_segmentation(act_type=act_type, seed=s, epochs=epochs, device=device, data_root=data_root)
             scores.append(miou)
             print(f"Activation: {act_type.ljust(15)} | Seed {s} | Validation mIoU: {miou:.4f}")
         print(f"--> {act_type.upper()} Mean mIoU: {np.mean(scores):.4f} ± {np.std(scores):.4f}\n")
 
 
-def train_and_eval(activation: str = 'alpha_golu', seed: int = 42, epochs: int = 10) -> float:
+def train_and_eval(activation: str = 'alpha_golu', seed: int = 42, epochs: int = 10, data_root: str = './data') -> float:
     """Returns Mean Intersection over Union (mIoU)."""
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    miou = train_single_seed_segmentation(act_type=activation, seed=seed, epochs=epochs, device=device)
+    miou = train_single_seed_segmentation(act_type=activation, seed=seed, epochs=epochs, device=device, data_root=data_root)
     return float(miou)
 
 
@@ -278,14 +278,15 @@ if __name__ == '__main__':
     parser.add_argument("--activation", type=str, default="alpha_golu", help="Single activation to evaluate")
     parser.add_argument("--seeds", type=int, nargs="+", default=[42, 123, 999, 2024, 2025], help="Random seeds")
     parser.add_argument("--epochs", type=int, default=10, help="Training epochs")
+    parser.add_argument("--data-root", type=str, default="./data", help="Dataset cache root")
     parser.add_argument("--benchmark", action="store_true", help="Run the full activation sweep")
     args = parser.parse_args()
 
     if args.benchmark:
-        run_segmentation_benchmark(seeds=args.seeds, epochs=args.epochs)
+        run_segmentation_benchmark(seeds=args.seeds, epochs=args.epochs, data_root=args.data_root)
     else:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"Running Segmentation Benchmark on {device} (N={len(args.seeds)})")
         for seed in args.seeds:
-            miou = train_and_eval(activation=args.activation, seed=seed, epochs=args.epochs)
+            miou = train_and_eval(activation=args.activation, seed=seed, epochs=args.epochs, data_root=args.data_root)
             print(f"Activation: {args.activation.ljust(15)} | Seed {seed} | Validation mIoU: {miou:.4f}")

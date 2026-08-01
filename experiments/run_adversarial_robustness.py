@@ -251,6 +251,7 @@ def train_single_seed_robustness(
     seed: int,
     epochs: int,
     device: torch.device,
+    data_root: str = "./data",
     save_artifacts: bool = False,
 ) -> tuple[float, float]:
     reset_all_seeds(seed)
@@ -266,8 +267,8 @@ def train_single_seed_robustness(
         transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010))
     ])
 
-    trainset = torchvision.datasets.CIFAR10(root='./data', train=True, download=True, transform=transform_train)
-    testset = torchvision.datasets.CIFAR10(root='./data', train=False, download=True, transform=transform_test)
+    trainset = torchvision.datasets.CIFAR10(root=data_root, train=True, download=True, transform=transform_train)
+    testset = torchvision.datasets.CIFAR10(root=data_root, train=False, download=True, transform=transform_test)
 
     loader_g = torch.Generator().manual_seed(seed)
     train_loader = DataLoader(
@@ -342,6 +343,7 @@ def train_single_seed_robustness(
             run_dir / "results.json",
             {
                 "activation": act_type,
+                "data_root": data_root,
                 "seed": seed,
                 "epochs": epochs,
                 "clean_acc": clean_acc,
@@ -361,6 +363,7 @@ def train_single_seed_robustness(
                 extra_config={
                     "epochs": epochs,
                     "activation": act_type,
+                    "data_root": data_root,
                     "seed": seed,
                     "attack": {
                         "eps": 8 / 255,
@@ -374,9 +377,7 @@ def train_single_seed_robustness(
             alpha_logger.plot_trajectories(str(run_dir / "alpha_trajectories.png"))
 
     return clean_acc, pgd_acc
-
-
-def run_benchmark(seeds=None, epochs: int = 10):
+def run_benchmark(seeds=None, epochs: int = 10, data_root: str = './data'):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Running Full Adversarial Robustness Benchmark on {device}")
     activations = ['relu', 'gelu', 'swish', 'prelu', 'pgelu', 'golu_static', 'alpha_golu', 'swish_adaptive']
@@ -390,12 +391,13 @@ def run_benchmark(seeds=None, epochs: int = 10):
                 seed=seed,
                 epochs=epochs,
                 device=device,
+                data_root=data_root,
                 save_artifacts=True,
             )
             print(f"Seed {seed} -> Clean Acc: {clean_acc:.2f}% | PGD-10 Robust Acc: {pgd_acc:.2f}%")
 
 
-def train_and_eval(activation: str = 'alpha_golu', seed: int = 42, epochs: int = 10, save_artifacts: bool = False) -> float:
+def train_and_eval(activation: str = 'alpha_golu', seed: int = 42, epochs: int = 10, data_root: str = './data', save_artifacts: bool = False) -> float:
     """Returns Robust Accuracy under PGD attack."""
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     _, robust_acc = train_single_seed_robustness(
@@ -403,6 +405,7 @@ def train_and_eval(activation: str = 'alpha_golu', seed: int = 42, epochs: int =
         seed=seed,
         epochs=epochs,
         device=device,
+        data_root=data_root,
         save_artifacts=save_artifacts,
     )
     return float(robust_acc)
@@ -415,11 +418,12 @@ if __name__ == '__main__':
     parser.add_argument("--activation", type=str, default="alpha_golu", help="Single activation to evaluate")
     parser.add_argument("--seeds", type=int, nargs="+", default=[42, 123, 999, 2024, 2025], help="Random seeds")
     parser.add_argument("--epochs", type=int, default=10, help="Training epochs")
+    parser.add_argument("--data-root", type=str, default="./data", help="Dataset cache root")
     parser.add_argument("--benchmark", action="store_true", help="Run the full activation sweep")
     args = parser.parse_args()
 
     if args.benchmark:
-        run_benchmark(seeds=args.seeds, epochs=args.epochs)
+        run_benchmark(seeds=args.seeds, epochs=args.epochs, data_root=args.data_root)
     else:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"Running Adversarial Robustness Benchmark on {device}")
@@ -428,6 +432,7 @@ if __name__ == '__main__':
                 activation=args.activation,
                 seed=seed,
                 epochs=args.epochs,
+                data_root=args.data_root,
                 save_artifacts=True,
             )
             print(f"Activation: {args.activation.ljust(15)} | Seed {seed} | PGD-10 Robust Acc: {robust_acc:.2f}%")

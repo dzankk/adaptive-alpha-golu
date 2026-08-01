@@ -30,6 +30,7 @@ from experiments.run_adversarial_robustness import train_and_eval as run_robustn
 from utils.experiment_config import load_benchmark_config
 from utils.run_artifacts import build_run_manifest, create_run_directory, write_json
 from utils.preflight import run_preflight_checks, save_preflight_report
+from utils.data_prep import prepare_all_datasets
 from utils.stats import compute_summary_statistics, calculate_p_value
 
 TASK_MAP = {
@@ -133,7 +134,7 @@ def handle_run(args):
             continue
 
         print(f"\n---> Running Seed: {seed}")
-        metric = TASK_MAP[task](act, seed=seed)
+        metric = TASK_MAP[task](act, seed=seed, data_root=args.data_root)
         results.append(metric)
         print(f"Seed {seed} Output Metric: {metric:.4f}")
         saved_scores[seed_key] = metric
@@ -183,7 +184,8 @@ def handle_run_all(args):
     task_names = config.get("tasks", list(TASK_MAP.keys()))
     output_root = config.get("output_root", "outputs/runs")
     summary_path = config.get("summary_path", "outputs/benchmark_results.json")
-    _run_preflight_or_abort(config.get("data_root", "./data"), output_root, args.min_free_gb)
+    data_root = config.get("data_root", args.data_root)
+    _run_preflight_or_abort(data_root, output_root, args.min_free_gb)
 
     selected_tasks = []
     for task_name in task_names:
@@ -226,7 +228,7 @@ def handle_run_all(args):
                     print(f"Seed {seed} -> Score: {float(completed_scores[seed_key]):.4f} (already completed)")
                     continue
 
-                acc = runner_fn(act, seed=seed)
+                acc = runner_fn(act, seed=seed, data_root=data_root)
                 accs.append(acc)
                 print(f"Seed {seed} -> Score: {acc:.4f}")
 
@@ -419,6 +421,7 @@ def main():
     )
     run_all_parser.add_argument("--seeds", type=int, nargs="+", default=DEFAULT_SEEDS, help="Random seeds for statistical testing")
     run_all_parser.add_argument("--config", type=str, default=None, help="Path to a JSON benchmark config file")
+    run_all_parser.add_argument("--data-root", type=str, default="./data", help="Dataset cache root used when config does not specify one")
     run_all_parser.add_argument("--min-free-gb", type=float, default=20.0, help="Minimum free disk space required before launching")
 
     # Command: preflight
@@ -426,6 +429,10 @@ def main():
     preflight_parser.add_argument("--data-root", type=str, default="./data", help="Dataset cache root to check")
     preflight_parser.add_argument("--output-root", type=str, default="outputs/preflight", help="Directory where the preflight report will be saved")
     preflight_parser.add_argument("--min-free-gb", type=float, default=20.0, help="Minimum free disk space required")
+
+    # Command: prepare_data
+    prep_parser = subparsers.add_parser("prepare_data", help="Download and cache all benchmark datasets without training")
+    prep_parser.add_argument("--data-root", type=str, default="./data", help="Dataset cache root")
 
     # Command: generate_table
     table_parser = subparsers.add_parser("generate_table", help="Generate LaTeX table from saved JSON results")
@@ -441,6 +448,9 @@ def main():
         handle_generate_table(args)
     elif args.command == "preflight":
         _run_preflight_or_abort(args.data_root, args.output_root, args.min_free_gb)
+    elif args.command == "prepare_data":
+        report = prepare_all_datasets(args.data_root)
+        print(f"\n[IO] Prepared datasets at {report['root']}: {', '.join(report['datasets'])}")
     else:
         parser.print_help()
 

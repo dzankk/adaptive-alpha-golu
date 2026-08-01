@@ -19,6 +19,7 @@
         "alpha_golu"
     ],
     "seeds": [42, 123, 999, 2024, 2025],
+    "data_root": "./data",
     "output_root": "outputs/runs",
     "summary_path": "outputs/benchmark_results.json"
 }

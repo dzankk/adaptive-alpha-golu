@@ -194,7 +194,7 @@ class ResNet18(nn.Module):
 # ==========================================
 # 3. Data Pipeline & Optimization Helpers
 # ==========================================
-def get_dataloaders(dataset_name: str = "cifar10", batch_size: int = 128, seed: int = 42):
+def get_dataloaders(dataset_name: str = "cifar10", batch_size: int = 128, seed: int = 42, root: str = "./data"):
     dataset_name_lower = str(dataset_name).lower().strip()
     use_pin = torch.cuda.is_available()
 
@@ -212,16 +212,16 @@ def get_dataloaders(dataset_name: str = "cifar10", batch_size: int = 128, seed: 
             transforms.ToTensor(),
             transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010))
         ])
-        trainset = torchvision.datasets.CIFAR10(root='./data', train=True, download=True, transform=transform_train)
-        testset = torchvision.datasets.CIFAR10(root='./data', train=False, download=True, transform=transform_test)
+        trainset = torchvision.datasets.CIFAR10(root=root, train=True, download=True, transform=transform_train)
+        testset = torchvision.datasets.CIFAR10(root=root, train=False, download=True, transform=transform_test)
     elif dataset_name_lower == "fashion_mnist":
         transform = transforms.Compose([
             transforms.Grayscale(3),
             transforms.ToTensor(),
             transforms.Normalize((0.5,), (0.5,))
         ])
-        trainset = torchvision.datasets.FashionMNIST(root='./data', train=True, download=True, transform=transform)
-        testset = torchvision.datasets.FashionMNIST(root='./data', train=False, download=True, transform=transform)
+        trainset = torchvision.datasets.FashionMNIST(root=root, train=True, download=True, transform=transform)
+        testset = torchvision.datasets.FashionMNIST(root=root, train=False, download=True, transform=transform)
     else:
         raise ValueError(f"Unsupported dataset: {dataset_name}")
 
@@ -255,10 +255,11 @@ def train_single_seed(
     seed: int = 42,
     epochs: int = 10,
     device: torch.device = torch.device("cuda"),
+    data_root: str = "./data",
     save_artifacts: bool = False,
 ):
     reset_all_seeds(seed)
-    trainloader, testloader = get_dataloaders(dataset_name, seed=seed)
+    trainloader, testloader = get_dataloaders(dataset_name, seed=seed, root=data_root)
     
     model = ResNet18(num_classes=10, act_type=act_type).to(device)
     
@@ -332,6 +333,7 @@ def train_single_seed(
             {
                 "task": "classification",
                 "dataset_name": dataset_name,
+                "data_root": data_root,
                 "activation": act_type,
                 "seed": seed,
                 "epochs": epochs,
@@ -351,6 +353,7 @@ def train_single_seed(
                 activations=[act_type],
                 extra_config={
                     "dataset_name": dataset_name,
+                    "data_root": data_root,
                     "epochs": epochs,
                     "seed": seed,
                 },
@@ -362,7 +365,7 @@ def train_single_seed(
     return acc, alphas
 
 
-def run_benchmark(dataset_name: str = "cifar10", seeds: list = [42, 123, 999, 2024, 2025], epochs: int = 10):
+def run_benchmark(dataset_name: str = "cifar10", seeds: list = [42, 123, 999, 2024, 2025], epochs: int = 10, data_root: str = "./data"):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     activations = ['relu', 'gelu', 'swish', 'adaptive_swish', 'prelu', 'pgelu', 'golu_static', 'alpha_golu']
     results = {act: [] for act in activations}
@@ -378,6 +381,7 @@ def run_benchmark(dataset_name: str = "cifar10", seeds: list = [42, 123, 999, 20
                 seed=s,
                 epochs=epochs,
                 device=device,
+                data_root=data_root,
                 save_artifacts=True,
             )
             results[act].append(acc)
@@ -397,9 +401,9 @@ def run_benchmark(dataset_name: str = "cifar10", seeds: list = [42, 123, 999, 20
         print(f"\nStatistical Significance (Alpha-GoLU vs Static GoLU p-value): {p_val:.4f}")
 
 
-def train_and_eval(activation: str = 'alpha_golu', seed: int = 42, dataset_name: str = 'cifar10', epochs: int = 10) -> float:
+def train_and_eval(activation: str = 'alpha_golu', seed: int = 42, dataset_name: str = 'cifar10', epochs: int = 10, data_root: str = './data') -> float:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    acc, _ = train_single_seed(act_type=activation, dataset_name=dataset_name, seed=seed, epochs=epochs, device=device, save_artifacts=False)
+    acc, _ = train_single_seed(act_type=activation, dataset_name=dataset_name, seed=seed, epochs=epochs, device=device, data_root=data_root, save_artifacts=False)
     return float(acc)
 
 
@@ -411,13 +415,14 @@ if __name__ == '__main__':
     parser.add_argument("--seeds", type=int, nargs="+", default=[42, 123, 999, 2024, 2025], help="Random seeds")
     parser.add_argument("--epochs", type=int, default=10, help="Training epochs")
     parser.add_argument("--activation", type=str, default="alpha_golu", help="Single activation to evaluate")
+    parser.add_argument("--data-root", type=str, default="./data", help="Dataset cache root")
     parser.add_argument("--benchmark", action="store_true", help="Run the full benchmark sweep")
     args = parser.parse_args()
 
     if args.benchmark:
         dataset_names = [args.dataset_name] if args.dataset_name else ["cifar10", "fashion_mnist"]
         for dataset_name in dataset_names:
-            run_benchmark(dataset_name=dataset_name, seeds=args.seeds, epochs=args.epochs)
+            run_benchmark(dataset_name=dataset_name, seeds=args.seeds, epochs=args.epochs, data_root=args.data_root)
     else:
         dataset_name = args.dataset_name or "cifar10"
         print(f"Running Classification Benchmark on {dataset_name.upper()}...")
@@ -428,6 +433,7 @@ if __name__ == '__main__':
                 seed=seed,
                 epochs=args.epochs,
                 device=torch.device("cuda" if torch.cuda.is_available() else "cpu"),
+                data_root=args.data_root,
                 save_artifacts=True,
             )
             print(f"Activation: {args.activation.ljust(15)} | Seed {seed} | Accuracy: {acc:.2f}%")

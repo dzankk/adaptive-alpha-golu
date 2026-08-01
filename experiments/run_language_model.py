@@ -304,13 +304,14 @@ def train_single_seed_lm(
     device: str = "cuda",
     dataset_name: str = "wikitext2",
     block_size: int = 64,
+    data_root: str = "./data",
     save_artifacts: bool = False,
 ) -> float:
     reset_all_seeds(seed)
 
     train_loader, valid_loader, vocab = build_language_model_dataloaders(
         dataset_name=dataset_name,
-        root="./data",
+        root=data_root,
         block_size=block_size,
         batch_size=32,
         seed=seed,
@@ -366,6 +367,7 @@ def train_single_seed_lm(
             {
                 "task": "language_model",
                 "dataset_name": dataset_name,
+                "data_root": data_root,
                 "activation": act_type,
                 "seed": seed,
                 "epochs": epochs,
@@ -386,6 +388,7 @@ def train_single_seed_lm(
                 activations=[act_type],
                 extra_config={
                     "dataset_name": dataset_name,
+                    "data_root": data_root,
                     "epochs": epochs,
                     "seed": seed,
                     "block_size": block_size,
@@ -398,7 +401,7 @@ def train_single_seed_lm(
     return float(perplexity)
 
 
-def run_lm_benchmark(seeds=None, epochs=5):
+def run_lm_benchmark(seeds=None, epochs=5, data_root: str = "./data"):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     seeds = seeds or [42, 123, 999, 2024, 2025]
     print(f"Running WikiText-2 Language Model Benchmark on {device}...")
@@ -408,17 +411,17 @@ def run_lm_benchmark(seeds=None, epochs=5):
     for act_type in activations:
         ppls = []
         for s in seeds:
-            ppl = train_single_seed_lm(act_type=act_type, seed=s, epochs=epochs, device=device, save_artifacts=True)
+            ppl = train_single_seed_lm(act_type=act_type, seed=s, epochs=epochs, device=device, data_root=data_root, save_artifacts=True)
             ppls.append(ppl)
             print(f"[{act_type.upper():<14} | Seed {s}] Validation Perplexity: {ppl:.2f}")
 
         print(f"  --> {act_type.upper():<14} Mean PPL: {np.mean(ppls):.2f} ± {np.std(ppls):.2f}\n")
 
 
-def train_and_eval(activation: str = "alpha_golu", seed: int = 42, epochs: int = 5) -> float:
+def train_and_eval(activation: str = "alpha_golu", seed: int = 42, epochs: int = 5, data_root: str = "./data") -> float:
     """Returns validation perplexity on WikiText-2."""
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    perplexity = train_single_seed_lm(act_type=activation, seed=seed, epochs=epochs, device=device, save_artifacts=False)
+    perplexity = train_single_seed_lm(act_type=activation, seed=seed, epochs=epochs, device=device, data_root=data_root, save_artifacts=False)
     return float(perplexity)
 
 
@@ -429,14 +432,15 @@ if __name__ == "__main__":
     parser.add_argument("--activation", type=str, default="alpha_golu", help="Single activation to evaluate")
     parser.add_argument("--seeds", type=int, nargs="+", default=[42, 123, 999, 2024, 2025], help="Random seeds")
     parser.add_argument("--epochs", type=int, default=5, help="Training epochs")
+    parser.add_argument("--data-root", type=str, default="./data", help="Dataset cache root")
     parser.add_argument("--benchmark", action="store_true", help="Run the full activation sweep")
     args = parser.parse_args()
 
     if args.benchmark:
-        run_lm_benchmark(seeds=args.seeds, epochs=args.epochs)
+        run_lm_benchmark(seeds=args.seeds, epochs=args.epochs, data_root=args.data_root)
     else:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"Running WikiText-2 Language Model Benchmark on {device}...")
         for seed in args.seeds:
-            ppl = train_and_eval(activation=args.activation, seed=seed, epochs=args.epochs)
+            ppl = train_and_eval(activation=args.activation, seed=seed, epochs=args.epochs, data_root=args.data_root)
             print(f"[{args.activation.upper():<14} | Seed {seed}] Validation Perplexity: {ppl:.2f}")
