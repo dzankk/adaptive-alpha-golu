@@ -10,6 +10,7 @@ import math
 import inspect
 import sys
 import random
+import time
 from pathlib import Path
 import numpy as np
 import torch
@@ -22,7 +23,9 @@ from torch.utils.data import DataLoader
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
+from diagnostics.trajectory_logger import AlphaTrajectoryLogger
 from models.alpha_golu import AlphaGoLU as AdaptiveAlphaGoLU, StaticGoLU
+from utils.run_artifacts import build_run_manifest, create_run_directory, write_json
 
 
 def reset_all_seeds(seed=42):
@@ -243,7 +246,13 @@ def pgd_attack(model, images, labels, eps=8/255, alpha=2/255, iters=10):
 # ==========================================
 # 5. Benchmark Execution Functions
 # ==========================================
-def train_single_seed_robustness(act_type: str, seed: int, epochs: int, device: torch.device) -> tuple[float, float]:
+def train_single_seed_robustness(
+    act_type: str,
+    seed: int,
+    epochs: int,
+    device: torch.device,
+    save_artifacts: bool = False,
+) -> tuple[float, float]:
     reset_all_seeds(seed)
     
     transform_train = transforms.Compose([
@@ -283,8 +292,12 @@ def train_single_seed_robustness(act_type: str, seed: int, epochs: int, device: 
     model = ResNet18(act_type=act_type).to(device)
     optimizer = get_optimizer(model, lr=1e-3)
     criterion = nn.CrossEntropyLoss()
+    alpha_logger = AlphaTrajectoryLogger(model)
+    epoch_seconds = []
+    train_start = time.perf_counter()
 
     for epoch in range(epochs):
+        epoch_start = time.perf_counter()
         model.train()
         for inputs, targets in train_loader:
             inputs, targets = inputs.to(device), targets.to(device)
@@ -293,6 +306,10 @@ def train_single_seed_robustness(act_type: str, seed: int, epochs: int, device: 
             loss = criterion(outputs, targets)
             loss.backward()
             optimizer.step()
+        epoch_seconds.append(time.perf_counter() - epoch_start)
+        alpha_logger.step()
+
+    train_seconds = time.perf_counter() - train_start
 
     model.eval()
     clean_correct, pgd_correct, total = 0, 0, 0
@@ -313,6 +330,49 @@ def train_single_seed_robustness(act_type: str, seed: int, epochs: int, device: 
 
     clean_acc = (clean_correct / total) * 100.0 if total > 0 else 0.0
     pgd_acc = (pgd_correct / total) * 100.0 if total > 0 else 0.0
+
+    if save_artifacts:
+        run_dir = create_run_directory(
+            str(PROJECT_ROOT / "outputs" / "runs" / "adversarial_robustness"),
+            "robustness",
+            act_type,
+            [seed],
+        )
+        write_json(
+            run_dir / "results.json",
+            {
+                "activation": act_type,
+                "seed": seed,
+                "epochs": epochs,
+                "clean_acc": clean_acc,
+                "pgd_acc": pgd_acc,
+                "train_seconds": train_seconds,
+                "epoch_seconds": epoch_seconds,
+                "alpha_history": alpha_logger.alpha_history,
+            },
+        )
+        write_json(
+            run_dir / "run_manifest.json",
+            build_run_manifest(
+                command=f"python {Path(__file__).name} --activation {act_type} --seeds {seed} --epochs {epochs}",
+                task="robustness",
+                seeds=[seed],
+                activations=[act_type],
+                extra_config={
+                    "epochs": epochs,
+                    "activation": act_type,
+                    "seed": seed,
+                    "attack": {
+                        "eps": 8 / 255,
+                        "alpha": 2 / 255,
+                        "iters": 10,
+                    },
+                },
+            ),
+        )
+        if alpha_logger.alpha_history:
+            alpha_logger.plot_trajectories(str(run_dir / "alpha_trajectories.png"))
+
     return clean_acc, pgd_acc
 
 
@@ -325,14 +385,26 @@ def run_benchmark(seeds=None, epochs: int = 10):
     for act_type in activations:
         print(f"\n--- Activation: {act_type.upper()} ---")
         for seed in seeds:
-            clean_acc, pgd_acc = train_single_seed_robustness(act_type=act_type, seed=seed, epochs=epochs, device=device)
+            clean_acc, pgd_acc = train_single_seed_robustness(
+                act_type=act_type,
+                seed=seed,
+                epochs=epochs,
+                device=device,
+                save_artifacts=True,
+            )
             print(f"Seed {seed} -> Clean Acc: {clean_acc:.2f}% | PGD-10 Robust Acc: {pgd_acc:.2f}%")
 
 
-def train_and_eval(activation: str = 'alpha_golu', seed: int = 42, epochs: int = 10) -> float:
+def train_and_eval(activation: str = 'alpha_golu', seed: int = 42, epochs: int = 10, save_artifacts: bool = False) -> float:
     """Returns Robust Accuracy under PGD attack."""
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    _, robust_acc = train_single_seed_robustness(act_type=activation, seed=seed, epochs=epochs, device=device)
+    _, robust_acc = train_single_seed_robustness(
+        act_type=activation,
+        seed=seed,
+        epochs=epochs,
+        device=device,
+        save_artifacts=save_artifacts,
+    )
     return float(robust_acc)
 
 
@@ -352,5 +424,10 @@ if __name__ == '__main__':
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"Running Adversarial Robustness Benchmark on {device}")
         for seed in args.seeds:
-            clean_acc, pgd_acc = train_and_eval(activation=args.activation, seed=seed, epochs=args.epochs)
-            print(f"Activation: {args.activation.ljust(15)} | Seed {seed} | Clean: {clean_acc:.2f}% | PGD-10: {pgd_acc:.2f}%")
+            robust_acc = train_and_eval(
+                activation=args.activation,
+                seed=seed,
+                epochs=args.epochs,
+                save_artifacts=True,
+            )
+            print(f"Activation: {args.activation.ljust(15)} | Seed {seed} | PGD-10 Robust Acc: {robust_acc:.2f}%")

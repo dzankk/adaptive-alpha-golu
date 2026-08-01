@@ -212,6 +212,8 @@ def train_single_seed_diffusion(act_type: str, seed: int, epochs: int, device: t
 
     model.eval()
     val_losses = []
+    total_loss = 0.0
+    total_examples = 0
 
     with torch.no_grad():
         for x0, _ in testloader:
@@ -223,9 +225,15 @@ def train_single_seed_diffusion(act_type: str, seed: int, epochs: int, device: t
             xt = torch.sqrt(a_hat_t) * x0 + torch.sqrt(1 - a_hat_t) * noise
 
             pred_noise = model(xt, t)
-            val_losses.append(criterion(pred_noise, noise).item())
+            batch_loss = criterion(pred_noise, noise).item()
+            batch_size = x0.size(0)
+            val_losses.append(batch_loss)
+            total_loss += batch_loss * batch_size
+            total_examples += batch_size
 
-    return float(np.mean(val_losses))
+    if total_examples > 0:
+        return float(total_loss / total_examples)
+    return float(np.mean(val_losses)) if val_losses else 0.0
 
 
 def run_diffusion_benchmark(seeds=None, epochs: int = 10):

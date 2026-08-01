@@ -237,13 +237,16 @@ def train_single_seed_segmentation(act_type: str, seed: int, epochs: int, device
 
     model.eval()
     total_iou = 0.0
+    total_samples = 0
     with torch.no_grad():
         for x, y in val_loader:
             x, y = x.to(device), y.to(device)
             out = model(x)
-            total_iou += compute_mIoU(out, y, num_classes=VOC_SEG_CLASSES)
+            batch_size = x.size(0)
+            total_iou += compute_mIoU(out, y, num_classes=VOC_SEG_CLASSES) * batch_size
+            total_samples += batch_size
 
-    return total_iou / len(val_loader)
+    return total_iou / total_samples if total_samples > 0 else 0.0
 
 
 def run_segmentation_benchmark(seeds=None, epochs=10):
