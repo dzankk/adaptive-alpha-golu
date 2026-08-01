@@ -11,6 +11,7 @@ activation scalars remain isolated from weight decay.
 import argparse
 import random
 import sys
+import time
 from collections import defaultdict
 from pathlib import Path
 from typing import Dict, List, Tuple
@@ -34,6 +35,8 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from models.alpha_golu import AlphaGoLU as AdaptiveAlphaGoLU, StaticGoLU
+from diagnostics.trajectory_logger import AlphaTrajectoryLogger
+from utils.run_artifacts import build_run_manifest, create_run_directory, write_json
 
 
 VOC_CLASSES = [
@@ -354,6 +357,7 @@ def train_single_seed_detection(
     train_split_ratio: float = 0.9,
     max_train_samples: int | None = None,
     max_eval_samples: int | None = None,
+    save_artifacts: bool = False,
 ) -> float:
     set_seed(seed)
 
@@ -403,8 +407,12 @@ def train_single_seed_detection(
     model = build_detection_model(act_type=act_type, num_classes=len(VOC_CLASSES) + 1).to(device)
     optimizer = get_optimizer(model, lr=lr, weight_decay=1e-4)
     scheduler = optim.lr_scheduler.MultiStepLR(optimizer, milestones=[max(1, epochs // 2), max(1, (3 * epochs) // 4)], gamma=0.1)
+    alpha_logger = AlphaTrajectoryLogger(model)
+    train_start = time.perf_counter()
+    epoch_seconds = []
 
     for epoch in range(epochs):
+        epoch_start = time.perf_counter()
         model.train()
         for images, targets in train_loader:
             images = [image.to(device) for image in images]
@@ -423,8 +431,64 @@ def train_single_seed_detection(
             loss.backward()
             optimizer.step()
         scheduler.step()
+        epoch_seconds.append(time.perf_counter() - epoch_start)
+        alpha_logger.step()
+
+    train_seconds = time.perf_counter() - train_start
 
     map50 = evaluate_map50(model, eval_loader, device=device)
+
+    if save_artifacts:
+        run_dir = create_run_directory(
+            str(PROJECT_ROOT / "outputs" / "runs" / "detection"),
+            "detection",
+            act_type,
+            [seed],
+        )
+        write_json(
+            run_dir / "results.json",
+            {
+                "task": "detection",
+                "dataset_name": "pascal_voc_2012",
+                "activation": act_type,
+                "seed": seed,
+                "epochs": epochs,
+                "lr": lr,
+                "image_size": image_size,
+                "train_split_ratio": train_split_ratio,
+                "max_train_samples": max_train_samples,
+                "max_eval_samples": max_eval_samples,
+                "map50": float(map50),
+                "train_seconds": train_seconds,
+                "epoch_seconds": epoch_seconds,
+                "alpha_history": alpha_logger.alpha_history,
+            },
+        )
+        write_json(
+            run_dir / "run_manifest.json",
+            build_run_manifest(
+                command=(
+                    f"python {Path(__file__).name} --activation {act_type} --seeds {seed} "
+                    f"--epochs {epochs} --lr {lr}"
+                ),
+                task="detection",
+                seeds=[seed],
+                activations=[act_type],
+                extra_config={
+                    "dataset_name": "pascal_voc_2012",
+                    "epochs": epochs,
+                    "seed": seed,
+                    "lr": lr,
+                    "image_size": image_size,
+                    "train_split_ratio": train_split_ratio,
+                    "max_train_samples": max_train_samples,
+                    "max_eval_samples": max_eval_samples,
+                },
+            ),
+        )
+        if alpha_logger.alpha_history:
+            alpha_logger.plot_trajectories(str(run_dir / "alpha_trajectories.png"))
+
     return float(map50)
 
 
@@ -443,6 +507,7 @@ def run_detection_benchmark(seeds: list[int] | None = None, epochs: int = 8, lr:
                 epochs=epochs,
                 device=device,
                 lr=lr,
+                save_artifacts=True,
             )
             print(f"Seed {seed} -> VOC mAP@0.5: {map50:.4f}")
 
@@ -454,6 +519,7 @@ def train_and_eval(
     lr: float = 2e-4,
     max_train_samples: int | None = None,
     max_eval_samples: int | None = None,
+    save_artifacts: bool = False,
 ) -> float:
     """Returns VOC mAP@0.5 on a held-out Pascal VOC validation split."""
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -465,6 +531,7 @@ def train_and_eval(
         lr=lr,
         max_train_samples=max_train_samples,
         max_eval_samples=max_eval_samples,
+        save_artifacts=save_artifacts,
     )
     return float(map50)
 
@@ -493,5 +560,6 @@ if __name__ == "__main__":
                 lr=args.lr,
                 max_train_samples=args.max_train_samples,
                 max_eval_samples=args.max_eval_samples,
+                save_artifacts=True,
             )
             print(f"Activation: {args.activation.ljust(15)} | Seed {seed} | VOC mAP@0.5: {map50:.4f}")

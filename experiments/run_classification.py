@@ -13,6 +13,7 @@ import inspect
 import math
 import sys
 import random
+import time
 from pathlib import Path
 import numpy as np
 import torch
@@ -28,12 +29,14 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from models.alpha_golu import AlphaGoLU as AdaptiveAlphaGoLU, StaticGoLU
+from diagnostics.trajectory_logger import AlphaTrajectoryLogger
 
 
 # ==========================================
 # 0. Statistical Rigor & Utilities
 # ==========================================
 from utils.stats import compute_summary_statistics, calculate_p_value
+from utils.run_artifacts import build_run_manifest, create_run_directory, write_json
 
 
 def seed_worker(worker_id):
@@ -246,7 +249,14 @@ def get_dataloaders(dataset_name: str = "cifar10", batch_size: int = 128, seed: 
 # ==========================================
 # 4. Training & Benchmark Execution
 # ==========================================
-def train_single_seed(act_type: str, dataset_name: str = "cifar10", seed: int = 42, epochs: int = 10, device: torch.device = torch.device("cuda")):
+def train_single_seed(
+    act_type: str,
+    dataset_name: str = "cifar10",
+    seed: int = 42,
+    epochs: int = 10,
+    device: torch.device = torch.device("cuda"),
+    save_artifacts: bool = False,
+):
     reset_all_seeds(seed)
     trainloader, testloader = get_dataloaders(dataset_name, seed=seed)
     
@@ -279,8 +289,12 @@ def train_single_seed(act_type: str, dataset_name: str = "cifar10", seed: int = 
     ])
     scheduler = CosineAnnealingLR(optimizer, T_max=epochs)
     criterion = nn.CrossEntropyLoss()
+    alpha_logger = AlphaTrajectoryLogger(model)
+    train_start = time.perf_counter()
+    epoch_seconds = []
 
     for epoch in range(epochs):
+        epoch_start = time.perf_counter()
         model.train()
         for inputs, labels in trainloader:
             inputs, labels = inputs.to(device), labels.to(device)
@@ -290,6 +304,8 @@ def train_single_seed(act_type: str, dataset_name: str = "cifar10", seed: int = 
             loss.backward()
             optimizer.step()
         scheduler.step()
+        epoch_seconds.append(time.perf_counter() - epoch_start)
+        alpha_logger.step()
 
     model.eval()
     correct, total = 0, 0
@@ -303,6 +319,45 @@ def train_single_seed(act_type: str, dataset_name: str = "cifar10", seed: int = 
 
     acc = 100.0 * correct / total
     alphas = model.extract_alphas()
+
+    if save_artifacts:
+        run_dir = create_run_directory(
+            str(PROJECT_ROOT / "outputs" / "runs" / "classification"),
+            "classification",
+            act_type,
+            [seed],
+        )
+        write_json(
+            run_dir / "results.json",
+            {
+                "task": "classification",
+                "dataset_name": dataset_name,
+                "activation": act_type,
+                "seed": seed,
+                "epochs": epochs,
+                "accuracy": acc,
+                "alpha_values": alphas,
+                "alpha_history": alpha_logger.alpha_history,
+                "train_seconds": time.perf_counter() - train_start,
+                "epoch_seconds": epoch_seconds,
+            },
+        )
+        write_json(
+            run_dir / "run_manifest.json",
+            build_run_manifest(
+                command=f"python {Path(__file__).name} --activation {act_type} --dataset-name {dataset_name} --seeds {seed} --epochs {epochs}",
+                task="classification",
+                seeds=[seed],
+                activations=[act_type],
+                extra_config={
+                    "dataset_name": dataset_name,
+                    "epochs": epochs,
+                    "seed": seed,
+                },
+            ),
+        )
+        if alpha_logger.alpha_history:
+            alpha_logger.plot_trajectories(str(run_dir / "alpha_trajectories.png"))
     
     return acc, alphas
 
@@ -317,7 +372,14 @@ def run_benchmark(dataset_name: str = "cifar10", seeds: list = [42, 123, 999, 20
     for act in activations:
         print(f"\n--- Activation: {act.upper()} ---")
         for s in seeds:
-            acc, alphas = train_single_seed(act, dataset_name=dataset_name, seed=s, epochs=epochs, device=device)
+            acc, alphas = train_single_seed(
+                act,
+                dataset_name=dataset_name,
+                seed=s,
+                epochs=epochs,
+                device=device,
+                save_artifacts=True,
+            )
             results[act].append(acc)
             if 'golu' in act and alphas:
                 mean_alpha = np.mean(alphas)
@@ -337,7 +399,7 @@ def run_benchmark(dataset_name: str = "cifar10", seeds: list = [42, 123, 999, 20
 
 def train_and_eval(activation: str = 'alpha_golu', seed: int = 42, dataset_name: str = 'cifar10', epochs: int = 10) -> float:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    acc, _ = train_single_seed(act_type=activation, dataset_name=dataset_name, seed=seed, epochs=epochs, device=device)
+    acc, _ = train_single_seed(act_type=activation, dataset_name=dataset_name, seed=seed, epochs=epochs, device=device, save_artifacts=False)
     return float(acc)
 
 
@@ -360,5 +422,12 @@ if __name__ == '__main__':
         dataset_name = args.dataset_name or "cifar10"
         print(f"Running Classification Benchmark on {dataset_name.upper()}...")
         for seed in args.seeds:
-            acc, _ = train_single_seed(act_type=args.activation, dataset_name=dataset_name, seed=seed, epochs=args.epochs, device=torch.device("cuda" if torch.cuda.is_available() else "cpu"))
+            acc, _ = train_single_seed(
+                act_type=args.activation,
+                dataset_name=dataset_name,
+                seed=seed,
+                epochs=args.epochs,
+                device=torch.device("cuda" if torch.cuda.is_available() else "cpu"),
+                save_artifacts=True,
+            )
             print(f"Activation: {args.activation.ljust(15)} | Seed {seed} | Accuracy: {acc:.2f}%")

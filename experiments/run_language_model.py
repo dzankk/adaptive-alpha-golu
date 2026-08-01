@@ -13,6 +13,7 @@ import sys
 import random
 import re
 import urllib.request
+import time
 from collections import Counter
 from pathlib import Path
 from typing import Dict, List, Tuple
@@ -28,6 +29,8 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from models.alpha_golu import AlphaGoLU as AdaptiveAlphaGoLU, StaticGoLU
+from diagnostics.trajectory_logger import AlphaTrajectoryLogger
+from utils.run_artifacts import build_run_manifest, create_run_directory, write_json
 
 
 WIKITEXT2_URLS = {
@@ -301,6 +304,7 @@ def train_single_seed_lm(
     device: str = "cuda",
     dataset_name: str = "wikitext2",
     block_size: int = 64,
+    save_artifacts: bool = False,
 ) -> float:
     reset_all_seeds(seed)
 
@@ -315,8 +319,12 @@ def train_single_seed_lm(
     model = MiniGPT(vocab_size=len(vocab), act_type=act_type, max_seq_len=block_size).to(device)
     optimizer = get_optimizer(model, lr=1e-3)
     criterion = nn.CrossEntropyLoss()
+    alpha_logger = AlphaTrajectoryLogger(model)
+    train_start = time.perf_counter()
+    epoch_seconds = []
 
     for epoch in range(epochs):
+        epoch_start = time.perf_counter()
         model.train()
         for batch in train_loader:
             batch = batch.to(device)
@@ -328,6 +336,8 @@ def train_single_seed_lm(
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
+        epoch_seconds.append(time.perf_counter() - epoch_start)
+        alpha_logger.step()
 
     model.eval()
     total_loss = 0.0
@@ -343,6 +353,48 @@ def train_single_seed_lm(
 
     avg_loss = total_loss / max(total_tokens, 1)
     perplexity = math.exp(min(avg_loss, 20.0))
+
+    if save_artifacts:
+        run_dir = create_run_directory(
+            str(PROJECT_ROOT / "outputs" / "runs" / "language_model"),
+            "language_model",
+            act_type,
+            [seed],
+        )
+        write_json(
+            run_dir / "results.json",
+            {
+                "task": "language_model",
+                "dataset_name": dataset_name,
+                "activation": act_type,
+                "seed": seed,
+                "epochs": epochs,
+                "block_size": block_size,
+                "perplexity": float(perplexity),
+                "avg_loss": float(avg_loss),
+                "alpha_history": alpha_logger.alpha_history,
+                "train_seconds": time.perf_counter() - train_start,
+                "epoch_seconds": epoch_seconds,
+            },
+        )
+        write_json(
+            run_dir / "run_manifest.json",
+            build_run_manifest(
+                command=f"python {Path(__file__).name} --activation {act_type} --seeds {seed} --epochs {epochs}",
+                task="language_model",
+                seeds=[seed],
+                activations=[act_type],
+                extra_config={
+                    "dataset_name": dataset_name,
+                    "epochs": epochs,
+                    "seed": seed,
+                    "block_size": block_size,
+                },
+            ),
+        )
+        if alpha_logger.alpha_history:
+            alpha_logger.plot_trajectories(str(run_dir / "alpha_trajectories.png"))
+
     return float(perplexity)
 
 
@@ -356,7 +408,7 @@ def run_lm_benchmark(seeds=None, epochs=5):
     for act_type in activations:
         ppls = []
         for s in seeds:
-            ppl = train_single_seed_lm(act_type=act_type, seed=s, epochs=epochs, device=device)
+            ppl = train_single_seed_lm(act_type=act_type, seed=s, epochs=epochs, device=device, save_artifacts=True)
             ppls.append(ppl)
             print(f"[{act_type.upper():<14} | Seed {s}] Validation Perplexity: {ppl:.2f}")
 
@@ -366,7 +418,7 @@ def run_lm_benchmark(seeds=None, epochs=5):
 def train_and_eval(activation: str = "alpha_golu", seed: int = 42, epochs: int = 5) -> float:
     """Returns validation perplexity on WikiText-2."""
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    perplexity = train_single_seed_lm(act_type=activation, seed=seed, epochs=epochs, device=device)
+    perplexity = train_single_seed_lm(act_type=activation, seed=seed, epochs=epochs, device=device, save_artifacts=False)
     return float(perplexity)
 
 
