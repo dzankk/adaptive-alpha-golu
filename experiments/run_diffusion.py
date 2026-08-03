@@ -6,9 +6,11 @@ Fully audited for parameter constraints, proper iteration counts, and determinis
 """
 
 import math
+import time
 import sys
 import random
 from pathlib import Path
+from typing import Callable
 import numpy as np
 import torch
 import torch.nn as nn
@@ -22,6 +24,10 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from models.alpha_golu import AlphaGoLU as AdaptiveAlphaGoLU, StaticGoLU
+from diagnostics.trajectory_logger import AlphaTrajectoryLogger
+from utils.overhead_tracker import OverheadTracker
+from utils.run_artifacts import build_run_manifest, create_run_directory, write_json
+from utils.train_tuning import build_adamw_with_activation_groups, clip_activation_gradients, default_loader_kwargs, resolve_task_alpha_hparams
 
 
 def reset_seeds(seed=42):
@@ -125,30 +131,18 @@ class DiffusionUNet(nn.Module):
 # ==========================================
 # 3. Benchmark Execution Functions
 # ==========================================
-def get_optimizer(model: nn.Module) -> torch.optim.Optimizer:
-    alpha_params = []
-    other_params = []
-
-    # Safely isolate adaptive activation parameters (including nn.PReLU)
-    for module in model.modules():
-        if isinstance(module, (AdaptiveAlphaGoLU, PGELU, AdaptiveSwish, nn.PReLU)):
-            for p in module.parameters():
-                if p.requires_grad:
-                    alpha_params.append(p)
-
-    alpha_param_ids = set(map(id, alpha_params))
-    for p in model.parameters():
-        if p.requires_grad and id(p) not in alpha_param_ids:
-            other_params.append(p)
-
-    return torch.optim.AdamW([
-        # Intentional scale separation: diffusion activation parameters use a higher LR for faster gate adaptation.
-        {'params': other_params, 'lr': 2e-4, 'weight_decay': 1e-4},
-        {'params': alpha_params, 'lr': 1e-3, 'weight_decay': 0.0}
-    ])
+def get_optimizer(model: nn.Module, lr: float = 2e-4, alpha_lr: float | None = None, warmup_epochs: int = 1) -> tuple[torch.optim.Optimizer, Callable[[int], float], list[nn.Parameter]]:
+    return build_adamw_with_activation_groups(
+        model,
+        base_lr=lr,
+        base_weight_decay=1e-4,
+        activation_lr=alpha_lr,
+        activation_weight_decay=0.0,
+        warmup_epochs=warmup_epochs,
+    )
 
 
-def train_single_seed_diffusion(act_type: str, seed: int, epochs: int, device: torch.device, data_root: str = './data') -> float:
+def train_single_seed_diffusion(act_type: str, seed: int, epochs: int, device: torch.device, data_root: str = './data', alpha_lr: float | None = None, config_path: str | None = "configs/paper_benchmark.json") -> float:
     reset_seeds(seed)
 
     transform = transforms.Compose([
@@ -164,23 +158,22 @@ def train_single_seed_diffusion(act_type: str, seed: int, epochs: int, device: t
     loader_g = torch.Generator().manual_seed(seed)
     eval_g = torch.Generator().manual_seed(seed + 999)
 
+    loader_kwargs = default_loader_kwargs()
     trainloader = DataLoader(
         full_dataset,
         batch_size=128,
         shuffle=True,
-        num_workers=2,
-        pin_memory=True,
         worker_init_fn=lambda worker_id: np.random.seed((seed + worker_id) % 2**32),
         generator=loader_g,
+        **loader_kwargs,
     )
     testloader = DataLoader(
         test_dataset,
         batch_size=256,
         shuffle=False,
-        num_workers=2,
-        pin_memory=True,
         worker_init_fn=lambda worker_id: np.random.seed((seed + 999 + worker_id) % 2**32),
         generator=eval_g,
+        **loader_kwargs,
     )
 
     timesteps = 1000
@@ -189,12 +182,23 @@ def train_single_seed_diffusion(act_type: str, seed: int, epochs: int, device: t
     alpha_hat = torch.cumprod(alpha, dim=0)
 
     model = DiffusionUNet(in_channels=3, act_type=act_type).to(device)
-    optimizer = get_optimizer(model)
+    overhead_tracker = OverheadTracker(task_name="diffusion", activation_name=act_type, model=model, device=device)
+    alpha_logger = AlphaTrajectoryLogger(model)
+    alpha_lr, alpha_warmup_epochs, alpha_grad_clip_norm = resolve_task_alpha_hparams(
+        "diffusion",
+        alpha_lr,
+        config_path=config_path,
+    )
+    optimizer, set_alpha_lr, act_params = get_optimizer(model, alpha_lr=alpha_lr, warmup_epochs=alpha_warmup_epochs)
     criterion = nn.MSELoss()
+    epoch_seconds = []
+    train_start = time.perf_counter()
 
     # Complete Epoch Training Run
     for epoch in range(epochs):
+        epoch_start = time.perf_counter()
         model.train()
+        current_alpha_lr = set_alpha_lr(epoch)
         for x0, _ in trainloader:
             x0 = x0.to(device)
             t = torch.randint(0, timesteps, (x0.size(0),), device=device).long()
@@ -203,12 +207,20 @@ def train_single_seed_diffusion(act_type: str, seed: int, epochs: int, device: t
             a_hat_t = alpha_hat[t][:, None, None, None]
             xt = torch.sqrt(a_hat_t) * x0 + torch.sqrt(1 - a_hat_t) * noise
 
+            overhead_tracker.start_forward()
             predicted_noise = model(xt, t)
+            overhead_tracker.end_forward(batch_size=x0.size(0))
             loss = criterion(predicted_noise, noise)
 
             optimizer.zero_grad()
+            overhead_tracker.start_backward()
             loss.backward()
+            overhead_tracker.end_backward()
+            clip_activation_gradients(model, max_norm=alpha_grad_clip_norm)
             optimizer.step()
+        epoch_seconds.append(time.perf_counter() - epoch_start)
+        alpha_logger.step()
+        train_seconds = time.perf_counter() - train_start
 
     model.eval()
     val_losses = []
@@ -231,12 +243,47 @@ def train_single_seed_diffusion(act_type: str, seed: int, epochs: int, device: t
             total_loss += batch_loss * batch_size
             total_examples += batch_size
 
-    if total_examples > 0:
-        return float(total_loss / total_examples)
-    return float(np.mean(val_losses)) if val_losses else 0.0
+    overhead = overhead_tracker.save()
+    loss = float(total_loss / total_examples) if total_examples > 0 else float(np.mean(val_losses)) if val_losses else 0.0
+
+    run_dir = create_run_directory(
+        str(PROJECT_ROOT / "outputs" / "runs" / "diffusion"),
+        "diffusion",
+        act_type,
+        [seed],
+    )
+    write_json(
+        run_dir / "results.json",
+        {
+            "task": "diffusion",
+            "activation": act_type,
+            "data_root": data_root,
+            "seed": seed,
+            "epochs": epochs,
+            "alpha_lr": alpha_lr if alpha_lr is not None else 2e-4,
+            "alpha_lr_final": current_alpha_lr if act_params else None,
+            "mse": float(loss),
+            "alpha_history": alpha_logger.alpha_history,
+            **overhead,
+        },
+    )
+    write_json(
+        run_dir / "run_manifest.json",
+        build_run_manifest(
+            command=f"python {Path(__file__).name} --activation {act_type} --seeds {seed} --epochs {epochs}",
+            task="diffusion",
+            seeds=[seed],
+            activations=[act_type],
+            extra_config={
+                "data_root": data_root,
+                "epochs": epochs,
+            },
+        ),
+    )
+    return loss
 
 
-def run_diffusion_benchmark(seeds=None, epochs: int = 10, data_root: str = './data'):
+def run_diffusion_benchmark(seeds=None, epochs: int = 10, data_root: str = './data', alpha_lr: float | None = None, config_path: str | None = "configs/paper_benchmark.json"):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Running CelebA DDPM Diffusion Benchmark on {device}...")
 
@@ -248,7 +295,7 @@ def run_diffusion_benchmark(seeds=None, epochs: int = 10, data_root: str = './da
     for act in activations:
         seed_losses = []
         for s in seeds:
-            mean_val = train_single_seed_diffusion(act_type=act, seed=s, epochs=epochs, device=device, data_root=data_root)
+            mean_val = train_single_seed_diffusion(act_type=act, seed=s, epochs=epochs, device=device, data_root=data_root, alpha_lr=alpha_lr, config_path=config_path)
             seed_losses.append(mean_val)
             print(f"[{act.upper():<14} | Seed {s}] Denoising MSE: {mean_val:.6f}")
 
@@ -259,10 +306,10 @@ def run_diffusion_benchmark(seeds=None, epochs: int = 10, data_root: str = './da
         print(f"  {act.upper():<14}: Loss = {m_loss:.6f} ± {s_loss:.6f}")
 
 
-def train_and_eval(activation: str = 'alpha_golu', seed: int = 42, epochs: int = 10, data_root: str = './data') -> float:
+def train_and_eval(activation: str = 'alpha_golu', seed: int = 42, epochs: int = 10, data_root: str = './data', alpha_lr: float | None = None, config_path: str | None = "configs/paper_benchmark.json") -> float:
     """Returns Denoising Test MSE Loss."""
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    loss = train_single_seed_diffusion(act_type=activation, seed=seed, epochs=epochs, device=device, data_root=data_root)
+    loss = train_single_seed_diffusion(act_type=activation, seed=seed, epochs=epochs, device=device, data_root=data_root, alpha_lr=alpha_lr, config_path=config_path)
     return float(loss)
 
 
@@ -274,14 +321,16 @@ if __name__ == '__main__':
     parser.add_argument("--seeds", type=int, nargs="+", default=[42, 123, 999, 2024, 2025], help="Random seeds")
     parser.add_argument("--epochs", type=int, default=10, help="Training epochs")
     parser.add_argument("--data-root", type=str, default="./data", help="Dataset cache root")
+    parser.add_argument("--alpha-lr", type=float, default=None, help="Learning rate for activation parameters; defaults to configs/paper_benchmark.json")
+    parser.add_argument("--config", type=str, default="configs/paper_benchmark.json", help="Benchmark config file used for task alpha hyperparameters")
     parser.add_argument("--benchmark", action="store_true", help="Run the full activation sweep")
     args = parser.parse_args()
 
     if args.benchmark:
-        run_diffusion_benchmark(seeds=args.seeds, epochs=args.epochs, data_root=args.data_root)
+        run_diffusion_benchmark(seeds=args.seeds, epochs=args.epochs, data_root=args.data_root, alpha_lr=args.alpha_lr, config_path=args.config)
     else:
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         print(f"Running CelebA DDPM Diffusion Benchmark on {device}...")
         for seed in args.seeds:
-            loss = train_and_eval(activation=args.activation, seed=seed, epochs=args.epochs, data_root=args.data_root)
+            loss = train_and_eval(activation=args.activation, seed=seed, epochs=args.epochs, data_root=args.data_root, alpha_lr=args.alpha_lr, config_path=args.config)
             print(f"Activation: {args.activation.ljust(15)} | Seed {seed} | Denoising MSE: {loss:.6f}")

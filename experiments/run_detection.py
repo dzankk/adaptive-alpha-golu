@@ -37,6 +37,8 @@ if str(PROJECT_ROOT) not in sys.path:
 from models.alpha_golu import AlphaGoLU as AdaptiveAlphaGoLU, StaticGoLU
 from diagnostics.trajectory_logger import AlphaTrajectoryLogger
 from utils.run_artifacts import build_run_manifest, create_run_directory, write_json
+from utils.overhead_tracker import OverheadTracker
+from utils.train_tuning import build_adamw_with_activation_groups, clip_activation_gradients, default_loader_kwargs, resolve_task_alpha_hparams
 
 
 VOC_CLASSES = [
@@ -109,7 +111,7 @@ def get_activation(act_type: str) -> nn.Module:
     raise ValueError(f"Unknown activation type: {act_type}")
 
 
-def get_optimizer(model: nn.Module, lr: float = 2e-3, weight_decay: float = 1e-4) -> optim.Optimizer:
+def get_optimizer(model: nn.Module, lr: float = 2e-3, alpha_lr: float | None = None, weight_decay: float = 1e-4) -> optim.Optimizer:
     act_params = []
     base_params = []
 
@@ -126,7 +128,7 @@ def get_optimizer(model: nn.Module, lr: float = 2e-3, weight_decay: float = 1e-4
 
     parameter_groups = [{"params": base_params, "weight_decay": weight_decay}]
     if act_params:
-        parameter_groups.append({"params": act_params, "lr": lr, "weight_decay": 0.0})
+        parameter_groups.append({"params": act_params, "lr": alpha_lr if alpha_lr is not None else lr, "weight_decay": 0.0})
 
     return optim.AdamW(parameter_groups, lr=lr)
 
@@ -354,6 +356,8 @@ def train_single_seed_detection(
     device: torch.device,
     data_root: str = "./data",
     lr: float = 2e-4,
+    alpha_lr: float | None = None,
+    config_path: str | None = "configs/paper_benchmark.json",
     image_size: int = 320,
     train_split_ratio: float = 0.9,
     max_train_samples: int | None = None,
@@ -384,29 +388,41 @@ def train_single_seed_detection(
     train_dataset, eval_dataset = random_split(full_dataset, [train_length, eval_length], generator=generator)
 
     loader_g = torch.Generator().manual_seed(seed)
+    loader_kwargs = default_loader_kwargs()
     train_loader = DataLoader(
         train_dataset,
         batch_size=8,
         shuffle=True,
-        num_workers=2,
         collate_fn=detection_collate_fn,
         worker_init_fn=seed_worker,
         generator=loader_g,
-        pin_memory=torch.cuda.is_available(),
+        **loader_kwargs,
     )
     eval_loader = DataLoader(
         eval_dataset,
         batch_size=8,
         shuffle=False,
-        num_workers=2,
         collate_fn=detection_collate_fn,
         worker_init_fn=seed_worker,
         generator=loader_g,
-        pin_memory=torch.cuda.is_available(),
+        **loader_kwargs,
     )
 
     model = build_detection_model(act_type=act_type, num_classes=len(VOC_CLASSES) + 1).to(device)
-    optimizer = get_optimizer(model, lr=lr, weight_decay=1e-4)
+    overhead_tracker = OverheadTracker(task_name="detection", activation_name=act_type, model=model, device=device)
+    alpha_lr, alpha_warmup_epochs, alpha_grad_clip_norm = resolve_task_alpha_hparams(
+        "detection",
+        alpha_lr,
+        config_path=config_path,
+    )
+    optimizer, set_alpha_lr, act_params = build_adamw_with_activation_groups(
+        model,
+        base_lr=lr,
+        base_weight_decay=1e-4,
+        activation_lr=alpha_lr,
+        activation_weight_decay=0.0,
+        warmup_epochs=alpha_warmup_epochs,
+    )
     scheduler = optim.lr_scheduler.MultiStepLR(optimizer, milestones=[max(1, epochs // 2), max(1, (3 * epochs) // 4)], gamma=0.1)
     alpha_logger = AlphaTrajectoryLogger(model)
     train_start = time.perf_counter()
@@ -414,6 +430,7 @@ def train_single_seed_detection(
 
     for epoch in range(epochs):
         epoch_start = time.perf_counter()
+        current_alpha_lr = set_alpha_lr(epoch)
         model.train()
         for images, targets in train_loader:
             images = [image.to(device) for image in images]
@@ -426,10 +443,15 @@ def train_single_seed_detection(
                 for target in targets
             ]
 
+            overhead_tracker.start_forward()
             loss_dict = model(images, targets)
+            overhead_tracker.end_forward(batch_size=len(images))
             loss = sum(loss_value for loss_value in loss_dict.values())
             optimizer.zero_grad()
+            overhead_tracker.start_backward()
             loss.backward()
+            overhead_tracker.end_backward()
+            clip_activation_gradients(model, max_norm=alpha_grad_clip_norm)
             optimizer.step()
         scheduler.step()
         epoch_seconds.append(time.perf_counter() - epoch_start)
@@ -438,6 +460,7 @@ def train_single_seed_detection(
     train_seconds = time.perf_counter() - train_start
 
     map50 = evaluate_map50(model, eval_loader, device=device)
+    overhead = overhead_tracker.save()
 
     if save_artifacts:
         run_dir = create_run_directory(
@@ -456,14 +479,15 @@ def train_single_seed_detection(
                 "seed": seed,
                 "epochs": epochs,
                 "lr": lr,
+                "alpha_lr": alpha_lr if alpha_lr is not None else lr,
+                "alpha_lr_final": current_alpha_lr if act_params else None,
                 "image_size": image_size,
                 "train_split_ratio": train_split_ratio,
                 "max_train_samples": max_train_samples,
                 "max_eval_samples": max_eval_samples,
                 "map50": float(map50),
-                "train_seconds": train_seconds,
-                "epoch_seconds": epoch_seconds,
                 "alpha_history": alpha_logger.alpha_history,
+                **overhead,
             },
         )
         write_json(
@@ -482,6 +506,7 @@ def train_single_seed_detection(
                     "epochs": epochs,
                     "seed": seed,
                     "lr": lr,
+                    "alpha_lr": alpha_lr if alpha_lr is not None else lr,
                     "image_size": image_size,
                     "train_split_ratio": train_split_ratio,
                     "max_train_samples": max_train_samples,
@@ -495,7 +520,7 @@ def train_single_seed_detection(
     return float(map50)
 
 
-def run_detection_benchmark(seeds: list[int] | None = None, epochs: int = 8, lr: float = 2e-4, data_root: str = "./data"):
+def run_detection_benchmark(seeds: list[int] | None = None, epochs: int = 8, lr: float = 2e-4, alpha_lr: float | None = None, data_root: str = "./data", config_path: str | None = "configs/paper_benchmark.json"):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Running Pascal VOC 2012 Detection Benchmark on {device}")
     activations = ["relu", "gelu", "swish", "prelu", "pgelu", "golu_static", "alpha_golu", "swish_adaptive"]
@@ -511,6 +536,8 @@ def run_detection_benchmark(seeds: list[int] | None = None, epochs: int = 8, lr:
                 device=device,
                 data_root=data_root,
                 lr=lr,
+                alpha_lr=alpha_lr,
+                config_path=config_path,
                 save_artifacts=True,
             )
             print(f"Seed {seed} -> VOC mAP@0.5: {map50:.4f}")
@@ -521,9 +548,11 @@ def train_and_eval(
     seed: int = 42,
     epochs: int = 8,
     lr: float = 2e-4,
+    alpha_lr: float | None = None,
     data_root: str = "./data",
     max_train_samples: int | None = None,
     max_eval_samples: int | None = None,
+    config_path: str | None = "configs/paper_benchmark.json",
     save_artifacts: bool = False,
 ) -> float:
     """Returns VOC mAP@0.5 on a held-out Pascal VOC validation split."""
@@ -535,6 +564,8 @@ def train_and_eval(
         device=device,
         data_root=data_root,
         lr=lr,
+        alpha_lr=alpha_lr,
+        config_path=config_path,
         max_train_samples=max_train_samples,
         max_eval_samples=max_eval_samples,
         save_artifacts=save_artifacts,
@@ -548,14 +579,16 @@ if __name__ == "__main__":
     parser.add_argument("--seeds", type=int, nargs="+", default=[42], help="Seed list for direct single-activation runs")
     parser.add_argument("--epochs", type=int, default=8, help="Training epochs for direct single-activation runs")
     parser.add_argument("--lr", type=float, default=2e-4, help="Learning rate for detection training")
+    parser.add_argument("--alpha-lr", type=float, default=None, help="Learning rate for detection activation parameters; defaults to configs/paper_benchmark.json")
     parser.add_argument("--data-root", type=str, default="./data", help="Dataset cache root")
     parser.add_argument("--max-train-samples", type=int, default=None, help="Optional cap on training samples for quick smoke runs")
     parser.add_argument("--max-eval-samples", type=int, default=None, help="Optional cap on evaluation samples for quick smoke runs")
+    parser.add_argument("--config", type=str, default="configs/paper_benchmark.json", help="Benchmark config file used for task alpha hyperparameters")
     parser.add_argument("--benchmark", action="store_true", help="Run the full activation sweep benchmark")
     args = parser.parse_args()
 
     if args.benchmark:
-        run_detection_benchmark(seeds=args.seeds, epochs=args.epochs, lr=args.lr, data_root=args.data_root)
+        run_detection_benchmark(seeds=args.seeds, epochs=args.epochs, lr=args.lr, alpha_lr=args.alpha_lr, data_root=args.data_root, config_path=args.config)
     else:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"Running Pascal VOC 2012 Detection Benchmark on {device}")
@@ -566,8 +599,10 @@ if __name__ == "__main__":
                 epochs=args.epochs,
                 data_root=args.data_root,
                 lr=args.lr,
+                alpha_lr=args.alpha_lr,
                 max_train_samples=args.max_train_samples,
                 max_eval_samples=args.max_eval_samples,
+                config_path=args.config,
                 save_artifacts=True,
             )
             print(f"Activation: {args.activation.ljust(15)} | Seed {seed} | VOC mAP@0.5: {map50:.4f}")

@@ -12,6 +12,7 @@ import sys
 import random
 import time
 from pathlib import Path
+from typing import Callable
 import numpy as np
 import torch
 import torch.nn as nn
@@ -26,6 +27,8 @@ if str(PROJECT_ROOT) not in sys.path:
 from diagnostics.trajectory_logger import AlphaTrajectoryLogger
 from models.alpha_golu import AlphaGoLU as AdaptiveAlphaGoLU, StaticGoLU
 from utils.run_artifacts import build_run_manifest, create_run_directory, write_json
+from utils.overhead_tracker import OverheadTracker
+from utils.train_tuning import build_adamw_with_activation_groups, clip_activation_gradients, default_loader_kwargs, resolve_task_alpha_hparams
 
 
 def reset_all_seeds(seed=42):
@@ -101,30 +104,21 @@ def get_activation(act_type: str) -> nn.Module:
         raise ValueError(f"Unknown activation type: {act_type}")
 
 
-def get_optimizer(model: nn.Module, lr: float = 1e-3, weight_decay: float = 1e-4) -> optim.Optimizer:
-    act_param_ids = set()
-    
-    for module in model.modules():
-        if isinstance(module, (AdaptiveAlphaGoLU, StaticGoLU, PGELU, SwishAdaptive, AdaptiveSwish, nn.PReLU)):
-            for p in module.parameters(recurse=False):
-                if p.requires_grad:
-                    act_param_ids.add(id(p))
-
-    act_params = []
-    base_params = []
-
-    for p in model.parameters():
-        if p.requires_grad:
-            if id(p) in act_param_ids:
-                act_params.append(p)
-            else:
-                base_params.append(p)
-
-    param_groups = [{'params': base_params, 'weight_decay': weight_decay}]
-    if act_params:
-        param_groups.append({'params': act_params, 'lr': lr, 'weight_decay': 0.0})
-
-    return optim.AdamW(param_groups, lr=lr)
+def get_optimizer(
+    model: nn.Module,
+    lr: float = 1e-3,
+    alpha_lr: float | None = None,
+    weight_decay: float = 1e-4,
+    warmup_epochs: int = 1,
+) -> tuple[optim.Optimizer, Callable[[int], float], list[nn.Parameter]]:
+    return build_adamw_with_activation_groups(
+        model,
+        base_lr=lr,
+        base_weight_decay=weight_decay,
+        activation_lr=alpha_lr,
+        activation_weight_decay=0.0,
+        warmup_epochs=warmup_epochs,
+    )
 
 
 # ==========================================
@@ -252,6 +246,8 @@ def train_single_seed_robustness(
     epochs: int,
     device: torch.device,
     data_root: str = "./data",
+    alpha_lr: float | None = None,
+    config_path: str | None = "configs/paper_benchmark.json",
     save_artifacts: bool = False,
 ) -> tuple[float, float]:
     reset_all_seeds(seed)
@@ -271,27 +267,32 @@ def train_single_seed_robustness(
     testset = torchvision.datasets.CIFAR10(root=data_root, train=False, download=True, transform=transform_test)
 
     loader_g = torch.Generator().manual_seed(seed)
+    loader_kwargs = default_loader_kwargs()
     train_loader = DataLoader(
         trainset,
         batch_size=128,
         shuffle=True,
-        num_workers=2,
-        pin_memory=True,
         worker_init_fn=seed_worker,
         generator=loader_g,
+        **loader_kwargs,
     )
     test_loader = DataLoader(
         testset,
         batch_size=256,
         shuffle=False,
-        num_workers=2,
-        pin_memory=True,
         worker_init_fn=seed_worker,
         generator=loader_g,
+        **loader_kwargs,
     )
 
     model = ResNet18(act_type=act_type).to(device)
-    optimizer = get_optimizer(model, lr=1e-3)
+    overhead_tracker = OverheadTracker(task_name="robustness", activation_name=act_type, model=model, device=device)
+    alpha_lr, alpha_warmup_epochs, alpha_grad_clip_norm = resolve_task_alpha_hparams(
+        "robustness",
+        alpha_lr,
+        config_path=config_path,
+    )
+    optimizer, set_alpha_lr, act_params = get_optimizer(model, lr=1e-3, alpha_lr=alpha_lr, warmup_epochs=alpha_warmup_epochs)
     criterion = nn.CrossEntropyLoss()
     alpha_logger = AlphaTrajectoryLogger(model)
     epoch_seconds = []
@@ -300,12 +301,18 @@ def train_single_seed_robustness(
     for epoch in range(epochs):
         epoch_start = time.perf_counter()
         model.train()
+        current_alpha_lr = set_alpha_lr(epoch)
         for inputs, targets in train_loader:
             inputs, targets = inputs.to(device), targets.to(device)
             optimizer.zero_grad()
+            overhead_tracker.start_forward()
             outputs = model(inputs)
+            overhead_tracker.end_forward(batch_size=inputs.size(0))
             loss = criterion(outputs, targets)
+            overhead_tracker.start_backward()
             loss.backward()
+            overhead_tracker.end_backward()
+            clip_activation_gradients(model, max_norm=alpha_grad_clip_norm)
             optimizer.step()
         epoch_seconds.append(time.perf_counter() - epoch_start)
         alpha_logger.step()
@@ -331,6 +338,7 @@ def train_single_seed_robustness(
 
     clean_acc = (clean_correct / total) * 100.0 if total > 0 else 0.0
     pgd_acc = (pgd_correct / total) * 100.0 if total > 0 else 0.0
+    overhead = overhead_tracker.save()
 
     if save_artifacts:
         run_dir = create_run_directory(
@@ -346,11 +354,12 @@ def train_single_seed_robustness(
                 "data_root": data_root,
                 "seed": seed,
                 "epochs": epochs,
+                "alpha_lr": alpha_lr if alpha_lr is not None else 1e-3,
+                "alpha_lr_final": current_alpha_lr if act_params else None,
                 "clean_acc": clean_acc,
                 "pgd_acc": pgd_acc,
-                "train_seconds": train_seconds,
-                "epoch_seconds": epoch_seconds,
                 "alpha_history": alpha_logger.alpha_history,
+                **overhead,
             },
         )
         write_json(
@@ -397,7 +406,7 @@ def run_benchmark(seeds=None, epochs: int = 10, data_root: str = './data'):
             print(f"Seed {seed} -> Clean Acc: {clean_acc:.2f}% | PGD-10 Robust Acc: {pgd_acc:.2f}%")
 
 
-def train_and_eval(activation: str = 'alpha_golu', seed: int = 42, epochs: int = 10, data_root: str = './data', save_artifacts: bool = False) -> float:
+def train_and_eval(activation: str = 'alpha_golu', seed: int = 42, epochs: int = 10, data_root: str = './data', alpha_lr: float | None = None, save_artifacts: bool = False) -> float:
     """Returns Robust Accuracy under PGD attack."""
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     _, robust_acc = train_single_seed_robustness(
@@ -406,6 +415,8 @@ def train_and_eval(activation: str = 'alpha_golu', seed: int = 42, epochs: int =
         epochs=epochs,
         device=device,
         data_root=data_root,
+        alpha_lr=alpha_lr,
+        config_path="configs/paper_benchmark.json",
         save_artifacts=save_artifacts,
     )
     return float(robust_acc)
@@ -419,6 +430,8 @@ if __name__ == '__main__':
     parser.add_argument("--seeds", type=int, nargs="+", default=[42, 123, 999, 2024, 2025], help="Random seeds")
     parser.add_argument("--epochs", type=int, default=10, help="Training epochs")
     parser.add_argument("--data-root", type=str, default="./data", help="Dataset cache root")
+    parser.add_argument("--alpha-lr", type=float, default=None, help="Learning rate for activation parameters; defaults to configs/paper_benchmark.json")
+    parser.add_argument("--config", type=str, default="configs/paper_benchmark.json", help="Benchmark config file used for task alpha hyperparameters")
     parser.add_argument("--benchmark", action="store_true", help="Run the full activation sweep")
     args = parser.parse_args()
 
@@ -433,6 +446,8 @@ if __name__ == '__main__':
                 seed=seed,
                 epochs=args.epochs,
                 data_root=args.data_root,
+                alpha_lr=args.alpha_lr,
+                config_path=args.config,
                 save_artifacts=True,
             )
             print(f"Activation: {args.activation.ljust(15)} | Seed {seed} | PGD-10 Robust Acc: {robust_acc:.2f}%")

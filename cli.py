@@ -15,8 +15,10 @@ import json
 import os
 import hashlib
 import sys
+from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
+from statistics import mean
 from typing import List
 
 # Import benchmark modules
@@ -80,6 +82,158 @@ def _save_json_file(path: Path, payload: dict) -> None:
         json.dump(payload, handle, indent=4, sort_keys=True)
 
 
+def _load_overhead_records(overhead_root: str) -> list[dict]:
+    root_path = Path(overhead_root)
+    if not root_path.exists():
+        return []
+
+    records = []
+    for json_path in sorted(root_path.rglob("*.json")):
+        try:
+            with json_path.open("r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+        except (OSError, json.JSONDecodeError):
+            continue
+
+        if isinstance(payload, dict):
+            payload.setdefault("file_path", str(json_path))
+            records.append(payload)
+    return records
+
+
+def _aggregate_overhead_records(records: list[dict]) -> dict:
+    grouped: dict[str, dict[str, list[dict]]] = defaultdict(lambda: defaultdict(list))
+    for record in records:
+        task_name = str(record.get("task_name") or record.get("task") or "").strip()
+        activation_name = str(record.get("activation_name") or record.get("activation") or "").strip()
+        if not task_name or not activation_name:
+            continue
+        grouped[activation_name][task_name].append(record)
+    return grouped
+
+
+def _metric_mean(records: list[dict], key: str, nested_key: str | None = None) -> float | None:
+    values = []
+    for record in records:
+        value: float | None
+        if nested_key is None:
+            raw_value = record.get(key)
+            value = float(raw_value) if isinstance(raw_value, (int, float)) else None
+        else:
+            nested = record.get(key, {})
+            if not isinstance(nested, dict):
+                value = None
+            else:
+                raw_value = nested.get(nested_key)
+                value = float(raw_value) if isinstance(raw_value, (int, float)) else None
+        if value is not None:
+            values.append(value)
+    return float(mean(values)) if values else None
+
+
+def _metric_mean_with_aliases(records: list[dict], *, primary_key: str, nested_key: str | None = None, aliases: list[str] | None = None) -> float | None:
+    for key in [primary_key, *(aliases or [])]:
+        value = _metric_mean(records, key, nested_key)
+        if value is not None:
+            return value
+    return None
+
+
+def _format_metric(value: float | None, digits: int = 2, suffix: str = "") -> str:
+    if value is None:
+        return "N/A"
+    return f"{value:.{digits}f}{suffix}"
+
+
+def handle_generate_overhead_table(args):
+    """Generates a publication-ready LaTeX overhead table from saved overhead JSON records."""
+    records = _load_overhead_records(args.overhead_root)
+    if not records:
+        print(f"[Error] No overhead JSON records found under {args.overhead_root}")
+        return
+
+    grouped = _aggregate_overhead_records(records)
+    if not grouped:
+        print(f"[Error] No usable overhead records found under {args.overhead_root}")
+        return
+
+    task_order = ["classification", "detection", "segmentation", "diffusion", "language_model", "robustness"]
+    task_labels = {
+        "classification": "Classification",
+        "detection": "Detection",
+        "segmentation": "Segmentation",
+        "diffusion": "Diffusion",
+        "language_model": "Language Modeling",
+        "robustness": "Robustness",
+    }
+
+    activations = [act for act in SUPPORTED_ACTIVATIONS if act in grouped]
+    for act in sorted(grouped.keys()):
+        if act not in activations:
+            activations.append(act)
+
+    lines = [
+        "% ===== Auto-Generated Publication LaTeX Overhead Table =====",
+        r"\begin{table*}[t]",
+        r"\centering",
+        r"\scriptsize",
+        r"\setlength{\tabcolsep}{3pt}",
+        r"\renewcommand{\arraystretch}{1.15}",
+        r"\begin{tabular}{l" + "c" * len(task_order) + r"}",
+        r"\toprule",
+        "Activation & " + " & ".join(f"\\textbf{{{task_labels[task]}}}" for task in task_order) + r" \\",
+        r"\midrule",
+    ]
+
+    for activation in activations:
+        row = [f"\\texttt{{{activation.replace('_', '-').upper()}}}"]
+        for task in task_order:
+            task_records = grouped.get(activation, {}).get(task, [])
+            if not task_records:
+                row.append("N/A")
+                continue
+
+            forward_ms = _metric_mean_with_aliases(
+                task_records,
+                primary_key="forward_latency_ms",
+                aliases=["forward_ms"],
+            )
+            backward_ms = _metric_mean_with_aliases(
+                task_records,
+                primary_key="backward_latency_ms",
+                aliases=["backward_ms"],
+            )
+            peak_mb = _metric_mean(task_records, "peak_cuda_memory_mb")
+            total_flops = _metric_mean(task_records, "estimated_total_flops")
+            cell = (
+                r"\shortstack{"
+                + f"Fwd {_format_metric(forward_ms)} ms" + r"\\"
+                + f"Bwd {_format_metric(backward_ms)} ms" + r"\\"
+                + f"Mem {_format_metric(peak_mb, digits=1)} MB" + r"\\"
+                + f"FLOPs {_format_metric(None if total_flops is None else total_flops / 1e6, digits=1, suffix='M')}"
+                + r"}"
+            )
+            row.append(cell)
+        lines.append(" & ".join(row) + " " + chr(92) + chr(92))
+
+    lines.extend([
+        r"\bottomrule",
+        r"\end{tabular}",
+        r"\caption{Mean overhead summary aggregated from saved benchmark runs. Each cell reports forward latency, backward latency, peak CUDA memory, and estimated total FLOPs for the corresponding activation-task pair.}",
+        r"\label{tab:overhead_results}",
+        r"\end{table*}",
+    ])
+
+    latex_table = "\n".join(lines) + "\n"
+    print(latex_table)
+
+    output_path = Path(args.output_path) if args.output_path else Path(args.overhead_root) / "overhead_table.tex"
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open("w", encoding="utf-8") as handle:
+        handle.write(latex_table)
+    print(f"[IO] Saved overhead LaTeX table to {output_path}")
+
+
 def _run_preflight_or_abort(data_root: str, output_root: str, min_free_gb: float = 20.0):
     project_root = Path(__file__).resolve().parents[0]
     report = run_preflight_checks(
@@ -113,6 +267,8 @@ def handle_run(args):
     task = args.task.lower()
     act = args.activation.lower()
     seeds = args.seeds
+    config = load_benchmark_config(args.config) if args.config else {}
+    task_alpha_lr = config.get("alpha_lr_by_task", {}).get(task)
     _run_preflight_or_abort(args.data_root, args.output_root, args.min_free_gb)
     resume_path = _resume_state_path(args.output_root, "single_task", {"task": task, "activation": act, "seeds": seeds})
     resume_state = _load_json_file(resume_path)
@@ -134,7 +290,7 @@ def handle_run(args):
             continue
 
         print(f"\n---> Running Seed: {seed}")
-        metric = TASK_MAP[task](act, seed=seed, data_root=args.data_root)
+        metric = TASK_MAP[task](act, seed=seed, data_root=args.data_root, alpha_lr=task_alpha_lr)
         results.append(metric)
         print(f"Seed {seed} Output Metric: {metric:.4f}")
         saved_scores[seed_key] = metric
@@ -182,6 +338,7 @@ def handle_run_all(args):
     seeds = args.seeds if args.seeds != DEFAULT_SEEDS else config.get("seeds", DEFAULT_SEEDS)
     activations = args.activations if args.activations != SUPPORTED_ACTIVATIONS else config.get("activations", SUPPORTED_ACTIVATIONS)
     task_names = config.get("tasks", list(TASK_MAP.keys()))
+    task_alpha_lrs = config.get("alpha_lr_by_task", {})
     output_root = config.get("output_root", "outputs/runs")
     summary_path = config.get("summary_path", "outputs/benchmark_results.json")
     data_root = config.get("data_root", args.data_root)
@@ -228,7 +385,8 @@ def handle_run_all(args):
                     print(f"Seed {seed} -> Score: {float(completed_scores[seed_key]):.4f} (already completed)")
                     continue
 
-                acc = runner_fn(act, seed=seed, data_root=data_root)
+                alpha_lr = task_alpha_lrs.get(task_name)
+                acc = runner_fn(act, seed=seed, data_root=data_root, alpha_lr=alpha_lr)
                 accs.append(acc)
                 print(f"Seed {seed} -> Score: {acc:.4f}")
 
@@ -438,6 +596,11 @@ def main():
     table_parser = subparsers.add_parser("generate_table", help="Generate LaTeX table from saved JSON results")
     table_parser.add_argument("--results_path", type=str, default="outputs/benchmark_results.json", help="Path to JSON results file")
 
+    # Command: generate_overhead_table
+    overhead_parser = subparsers.add_parser("generate_overhead_table", help="Generate LaTeX overhead table from saved overhead JSON records")
+    overhead_parser.add_argument("--overhead-root", type=str, default="outputs/overhead", help="Directory containing overhead JSON records")
+    overhead_parser.add_argument("--output-path", type=str, default=None, help="Optional path where the LaTeX table will be written")
+
     args = parser.parse_args()
 
     if args.command == "run":
@@ -446,6 +609,8 @@ def main():
         handle_run_all(args)
     elif args.command == "generate_table":
         handle_generate_table(args)
+    elif args.command == "generate_overhead_table":
+        handle_generate_overhead_table(args)
     elif args.command == "preflight":
         _run_preflight_or_abort(args.data_root, args.output_root, args.min_free_gb)
     elif args.command == "prepare_data":

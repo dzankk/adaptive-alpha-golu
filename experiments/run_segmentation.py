@@ -6,9 +6,11 @@ Demonstrates layer skip-connections combined with parameter-group optimization
 """
 
 import math
+import time
 import sys
 import random
 from pathlib import Path
+from typing import Callable
 import numpy as np
 import torch
 import torch.nn as nn
@@ -23,6 +25,10 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from models.alpha_golu import AlphaGoLU as AdaptiveAlphaGoLU, StaticGoLU
+from diagnostics.trajectory_logger import AlphaTrajectoryLogger
+from utils.overhead_tracker import OverheadTracker
+from utils.run_artifacts import build_run_manifest, create_run_directory, write_json
+from utils.train_tuning import build_adamw_with_activation_groups, clip_activation_gradients, default_loader_kwargs, resolve_task_alpha_hparams
 
 
 # ==========================================
@@ -76,27 +82,21 @@ def get_activation(act_type: str) -> nn.Module:
         raise ValueError(f"Unknown activation type: {act_type}")
 
 
-def get_optimizer(model: nn.Module, lr: float = 1e-3, weight_decay: float = 1e-4) -> optim.Optimizer:
-    act_params = []
-    base_params = []
-    
-    for module in model.modules():
-        if isinstance(module, (AdaptiveAlphaGoLU, PGELU, SwishAdaptive, nn.PReLU)):
-            for p in module.parameters():
-                if p.requires_grad:
-                    act_params.append(p)
-
-    act_param_ids = set(map(id, act_params))
-    for p in model.parameters():
-        if p.requires_grad and id(p) not in act_param_ids:
-            base_params.append(p)
-
-    param_groups = [{'params': base_params, 'weight_decay': weight_decay}]
-    if act_params:
-        # Zero weight-decay applied strictly to trainable activation parameters
-        param_groups.append({'params': act_params, 'lr': lr, 'weight_decay': 0.0})
-
-    return optim.AdamW(param_groups, lr=lr)
+def get_optimizer(
+    model: nn.Module,
+    lr: float = 1e-3,
+    alpha_lr: float | None = None,
+    weight_decay: float = 1e-4,
+    warmup_epochs: int = 1,
+) -> tuple[optim.Optimizer, Callable[[int], float], list[nn.Parameter]]:
+    return build_adamw_with_activation_groups(
+        model,
+        base_lr=lr,
+        base_weight_decay=weight_decay,
+        activation_lr=alpha_lr,
+        activation_weight_decay=0.0,
+        warmup_epochs=warmup_epochs,
+    )
 
 
 # ==========================================
@@ -204,7 +204,7 @@ def set_seed(seed: int):
     torch.backends.cudnn.benchmark = False
 
 
-def train_single_seed_segmentation(act_type: str, seed: int, epochs: int, device: torch.device, data_root: str = './data') -> float:
+def train_single_seed_segmentation(act_type: str, seed: int, epochs: int, device: torch.device, data_root: str = './data', alpha_lr: float | None = None, config_path: str | None = "configs/paper_benchmark.json") -> float:
     set_seed(seed)
     
     full_dataset = PascalVOCSegmentationDataset(root=data_root, year='2012', image_set='train', image_size=256, download=True)
@@ -218,22 +218,44 @@ def train_single_seed_segmentation(act_type: str, seed: int, epochs: int, device
     val_ds = val_dataset
 
     loader_g = torch.Generator().manual_seed(seed)
-    train_loader = DataLoader(train_ds, batch_size=8, shuffle=True, generator=loader_g)
-    val_loader = DataLoader(val_ds, batch_size=8, shuffle=False, generator=loader_g)
+    loader_kwargs = default_loader_kwargs()
+    train_loader = DataLoader(train_ds, batch_size=8, shuffle=True, generator=loader_g, **loader_kwargs)
+    val_loader = DataLoader(val_ds, batch_size=8, shuffle=False, generator=loader_g, **loader_kwargs)
 
     model = UNet(act_type=act_type, num_classes=VOC_SEG_CLASSES).to(device)
-    optimizer = get_optimizer(model, lr=1e-3, weight_decay=1e-4)
+    overhead_tracker = OverheadTracker(task_name="segmentation", activation_name=act_type, model=model, device=device)
+    alpha_logger = AlphaTrajectoryLogger(model)
+    alpha_lr, alpha_warmup_epochs, alpha_grad_clip_norm = resolve_task_alpha_hparams(
+        "segmentation",
+        alpha_lr,
+        config_path=config_path,
+    )
+    optimizer, set_alpha_lr, act_params = get_optimizer(model, lr=1e-3, alpha_lr=alpha_lr, weight_decay=1e-4, warmup_epochs=alpha_warmup_epochs)
     criterion = nn.CrossEntropyLoss(ignore_index=255)
+    epoch_seconds = []
+    train_start = time.perf_counter()
 
     for epoch in range(epochs):
+        epoch_start = time.perf_counter()
         model.train()
+        current_alpha_lr = set_alpha_lr(epoch)
         for x, y in train_loader:
             x, y = x.to(device), y.to(device)
             optimizer.zero_grad()
+            overhead_tracker.start_forward()
             out = model(x)
+            overhead_tracker.end_forward(batch_size=x.size(0))
             loss = criterion(out, y)
+            overhead_tracker.start_backward()
             loss.backward()
+            overhead_tracker.end_backward()
+            clip_activation_gradients(model, max_norm=alpha_grad_clip_norm)
             optimizer.step()
+        epoch_seconds.append(time.perf_counter() - epoch_start)
+        alpha_logger.step()
+
+    train_seconds = time.perf_counter() - train_start
+    overhead = overhead_tracker.save()
 
     model.eval()
     total_iou = 0.0
@@ -246,10 +268,47 @@ def train_single_seed_segmentation(act_type: str, seed: int, epochs: int, device
             total_iou += compute_mIoU(out, y, num_classes=VOC_SEG_CLASSES) * batch_size
             total_samples += batch_size
 
-    return total_iou / total_samples if total_samples > 0 else 0.0
+    miou = total_iou / total_samples if total_samples > 0 else 0.0
+
+    run_dir = create_run_directory(
+        str(PROJECT_ROOT / "outputs" / "runs" / "segmentation"),
+        "segmentation",
+        act_type,
+        [seed],
+    )
+    write_json(
+        run_dir / "results.json",
+        {
+            "task": "segmentation",
+            "activation": act_type,
+            "data_root": data_root,
+            "seed": seed,
+            "epochs": epochs,
+            "alpha_lr": alpha_lr,
+            "alpha_lr_final": current_alpha_lr if act_params else None,
+            "miou": float(miou),
+            "alpha_history": alpha_logger.alpha_history,
+            **overhead,
+        },
+    )
+    write_json(
+        run_dir / "run_manifest.json",
+        build_run_manifest(
+            command=f"python {Path(__file__).name} --activation {act_type} --seeds {seed} --epochs {epochs}",
+            task="segmentation",
+            seeds=[seed],
+            activations=[act_type],
+            extra_config={
+                "data_root": data_root,
+                "epochs": epochs,
+            },
+        ),
+    )
+
+    return miou
 
 
-def run_segmentation_benchmark(seeds=None, epochs=10, data_root: str = './data'):
+def run_segmentation_benchmark(seeds=None, epochs=10, data_root: str = './data', alpha_lr: float | None = None, config_path: str | None = "configs/paper_benchmark.json"):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     seeds = seeds or [42, 123, 999, 2024, 2025]
     print(f"Running Segmentation Benchmark on {device} (N={len(seeds)})")
@@ -258,16 +317,16 @@ def run_segmentation_benchmark(seeds=None, epochs=10, data_root: str = './data')
     for act_type in activations:
         scores = []
         for s in seeds:
-            miou = train_single_seed_segmentation(act_type=act_type, seed=s, epochs=epochs, device=device, data_root=data_root)
+            miou = train_single_seed_segmentation(act_type=act_type, seed=s, epochs=epochs, device=device, data_root=data_root, alpha_lr=alpha_lr, config_path=config_path)
             scores.append(miou)
             print(f"Activation: {act_type.ljust(15)} | Seed {s} | Validation mIoU: {miou:.4f}")
         print(f"--> {act_type.upper()} Mean mIoU: {np.mean(scores):.4f} ± {np.std(scores):.4f}\n")
 
 
-def train_and_eval(activation: str = 'alpha_golu', seed: int = 42, epochs: int = 10, data_root: str = './data') -> float:
+def train_and_eval(activation: str = 'alpha_golu', seed: int = 42, epochs: int = 10, data_root: str = './data', alpha_lr: float | None = None, config_path: str | None = "configs/paper_benchmark.json") -> float:
     """Returns Mean Intersection over Union (mIoU)."""
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    miou = train_single_seed_segmentation(act_type=activation, seed=seed, epochs=epochs, device=device, data_root=data_root)
+    miou = train_single_seed_segmentation(act_type=activation, seed=seed, epochs=epochs, device=device, data_root=data_root, alpha_lr=alpha_lr, config_path=config_path)
     return float(miou)
 
 
@@ -279,14 +338,16 @@ if __name__ == '__main__':
     parser.add_argument("--seeds", type=int, nargs="+", default=[42, 123, 999, 2024, 2025], help="Random seeds")
     parser.add_argument("--epochs", type=int, default=10, help="Training epochs")
     parser.add_argument("--data-root", type=str, default="./data", help="Dataset cache root")
+    parser.add_argument("--alpha-lr", type=float, default=None, help="Learning rate for activation parameters; defaults to configs/paper_benchmark.json")
+    parser.add_argument("--config", type=str, default="configs/paper_benchmark.json", help="Benchmark config file used for task alpha hyperparameters")
     parser.add_argument("--benchmark", action="store_true", help="Run the full activation sweep")
     args = parser.parse_args()
 
     if args.benchmark:
-        run_segmentation_benchmark(seeds=args.seeds, epochs=args.epochs, data_root=args.data_root)
+        run_segmentation_benchmark(seeds=args.seeds, epochs=args.epochs, data_root=args.data_root, alpha_lr=args.alpha_lr, config_path=args.config)
     else:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"Running Segmentation Benchmark on {device} (N={len(args.seeds)})")
         for seed in args.seeds:
-            miou = train_and_eval(activation=args.activation, seed=seed, epochs=args.epochs, data_root=args.data_root)
+            miou = train_and_eval(activation=args.activation, seed=seed, epochs=args.epochs, data_root=args.data_root, alpha_lr=args.alpha_lr, config_path=args.config)
             print(f"Activation: {args.activation.ljust(15)} | Seed {seed} | Validation mIoU: {miou:.4f}")

@@ -22,7 +22,7 @@ import torch.nn.functional as F
 import torchvision
 import torchvision.transforms as transforms
 from torch.optim.lr_scheduler import CosineAnnealingLR
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, random_split
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -30,6 +30,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from models.alpha_golu import AlphaGoLU as AdaptiveAlphaGoLU, StaticGoLU
 from diagnostics.trajectory_logger import AlphaTrajectoryLogger
+from utils.train_tuning import build_adamw_with_activation_groups, clip_activation_gradients, default_loader_kwargs, resolve_task_alpha_hparams
 
 
 # ==========================================
@@ -37,6 +38,7 @@ from diagnostics.trajectory_logger import AlphaTrajectoryLogger
 # ==========================================
 from utils.stats import compute_summary_statistics, calculate_p_value
 from utils.run_artifacts import build_run_manifest, create_run_directory, write_json
+from utils.overhead_tracker import OverheadTracker
 
 
 def seed_worker(worker_id):
@@ -93,9 +95,10 @@ class AdaptiveSwish(nn.Module):
         return x * torch.sigmoid(self.beta * x)
 
 
-def get_activation(act_type: str) -> nn.Module:
+def get_activation(act_type: str, channels: int | None = None, alpha_layout: str = "channel") -> nn.Module:
     """Factory function for instantiating activation modules."""
     act_type = str(act_type).lower().strip()
+    alpha_layout = str(alpha_layout).lower().strip()
     if act_type == 'relu':
         return nn.ReLU()
     elif act_type == 'gelu':
@@ -111,6 +114,8 @@ def get_activation(act_type: str) -> nn.Module:
     elif act_type == 'golu_static':
         return StaticGoLU()
     elif act_type == 'alpha_golu':
+        if alpha_layout == "channel" and channels is not None:
+            return AdaptiveAlphaGoLU(init_alpha=1.0, channels=channels)
         return AdaptiveAlphaGoLU(init_alpha=1.0)
     else:
         raise ValueError(f"Unknown activation type: {act_type}")
@@ -120,7 +125,7 @@ def get_activation(act_type: str) -> nn.Module:
 # 2. ResNet Architecture
 # ==========================================
 class ResNetBlock(nn.Module):
-    def __init__(self, in_planes: int, planes: int, stride: int = 1, act_type: str = 'alpha_golu'):
+    def __init__(self, in_planes: int, planes: int, stride: int = 1, act_type: str = 'alpha_golu', alpha_layout: str = "channel"):
         super().__init__()
         self.conv1 = nn.Conv2d(in_planes, planes, kernel_size=3, stride=stride, padding=1, bias=False)
         self.bn1 = nn.BatchNorm2d(planes)
@@ -134,8 +139,8 @@ class ResNetBlock(nn.Module):
                 nn.BatchNorm2d(planes)
             )
 
-        self.act1 = get_activation(act_type)
-        self.act2 = get_activation(act_type)
+        self.act1 = get_activation(act_type, channels=planes, alpha_layout=alpha_layout)
+        self.act2 = get_activation(act_type, channels=planes, alpha_layout=alpha_layout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         out = self.act1(self.bn1(self.conv1(x)))
@@ -146,14 +151,15 @@ class ResNetBlock(nn.Module):
 
 
 class ResNet18(nn.Module):
-    def __init__(self, num_classes: int = 10, act_type: str = 'alpha_golu'):
+    def __init__(self, num_classes: int = 10, act_type: str = 'alpha_golu', alpha_layout: str = "channel"):
         super().__init__()
         self.in_planes = 64
         self.act_type = act_type
+        self.alpha_layout = alpha_layout
         
         self.conv1 = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
         self.bn1 = nn.BatchNorm2d(64)
-        self.act1 = get_activation(act_type)
+        self.act1 = get_activation(act_type, channels=64, alpha_layout=alpha_layout)
 
         self.layer1 = self._make_layer(64, 2, stride=1, act_type=act_type)
         self.layer2 = self._make_layer(128, 2, stride=2, act_type=act_type)
@@ -165,7 +171,7 @@ class ResNet18(nn.Module):
         strides = [stride] + [1] * (num_blocks - 1)
         layers = []
         for s in strides:
-            layers.append(ResNetBlock(self.in_planes, planes, s, act_type))
+            layers.append(ResNetBlock(self.in_planes, planes, s, act_type, alpha_layout=self.alpha_layout))
             self.in_planes = planes
         return nn.Sequential(*layers)
 
@@ -194,9 +200,16 @@ class ResNet18(nn.Module):
 # ==========================================
 # 3. Data Pipeline & Optimization Helpers
 # ==========================================
-def get_dataloaders(dataset_name: str = "cifar10", batch_size: int = 128, seed: int = 42, root: str = "./data"):
+def get_dataloaders(
+    dataset_name: str = "cifar10",
+    batch_size: int = 128,
+    seed: int = 42,
+    root: str = "./data",
+    val_split: float = 0.1,
+    include_test: bool = True,
+):
     dataset_name_lower = str(dataset_name).lower().strip()
-    use_pin = torch.cuda.is_available()
+    loader_kwargs = default_loader_kwargs()
 
     g = torch.Generator()
     g.manual_seed(seed)
@@ -213,7 +226,7 @@ def get_dataloaders(dataset_name: str = "cifar10", batch_size: int = 128, seed: 
             transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010))
         ])
         trainset = torchvision.datasets.CIFAR10(root=root, train=True, download=True, transform=transform_train)
-        testset = torchvision.datasets.CIFAR10(root=root, train=False, download=True, transform=transform_test)
+        testset = torchvision.datasets.CIFAR10(root=root, train=False, download=True, transform=transform_test) if include_test else None
     elif dataset_name_lower == "fashion_mnist":
         transform = transforms.Compose([
             transforms.Grayscale(3),
@@ -221,29 +234,95 @@ def get_dataloaders(dataset_name: str = "cifar10", batch_size: int = 128, seed: 
             transforms.Normalize((0.5,), (0.5,))
         ])
         trainset = torchvision.datasets.FashionMNIST(root=root, train=True, download=True, transform=transform)
-        testset = torchvision.datasets.FashionMNIST(root=root, train=False, download=True, transform=transform)
+        testset = torchvision.datasets.FashionMNIST(root=root, train=False, download=True, transform=transform) if include_test else None
     else:
         raise ValueError(f"Unsupported dataset: {dataset_name}")
+
+    val_size = int(len(trainset) * val_split)
+    train_size = len(trainset) - val_size
+    if val_size > 0:
+        trainset, valset = random_split(trainset, [train_size, val_size], generator=g)
+    else:
+        valset = None
 
     trainloader = DataLoader(
         trainset, 
         batch_size=batch_size, 
         shuffle=True, 
-        num_workers=2, 
-        pin_memory=use_pin,
         worker_init_fn=seed_worker,
-        generator=g
+        generator=g,
+        **loader_kwargs,
     )
-    testloader = DataLoader(
-        testset, 
-        batch_size=256, 
-        shuffle=False, 
-        num_workers=2, 
-        pin_memory=use_pin,
-        worker_init_fn=seed_worker,
-        generator=g
+    valloader = None
+    if valset is not None:
+        valloader = DataLoader(
+            valset,
+            batch_size=256,
+            shuffle=False,
+            worker_init_fn=seed_worker,
+            generator=g,
+            **loader_kwargs,
+        )
+
+    testloader = None
+    if testset is not None:
+        testloader = DataLoader(
+            testset,
+            batch_size=256,
+            shuffle=False,
+            worker_init_fn=seed_worker,
+            generator=g,
+            **loader_kwargs,
+        )
+    return trainloader, valloader, testloader
+
+
+def evaluate_model(model: nn.Module, loader: DataLoader, device: torch.device) -> tuple[float, float]:
+    criterion = nn.CrossEntropyLoss()
+    total_loss = 0.0
+    correct, total = 0, 0
+    model.eval()
+    with torch.no_grad():
+        for inputs, labels in loader:
+            inputs, labels = inputs.to(device), labels.to(device)
+            outputs = model(inputs)
+            loss = criterion(outputs, labels)
+            batch_size = labels.size(0)
+            total_loss += float(loss.item()) * batch_size
+            _, predicted = torch.max(outputs.data, 1)
+            total += batch_size
+            correct += (predicted == labels).sum().item()
+
+    avg_loss = total_loss / max(total, 1)
+    accuracy = 100.0 * correct / max(total, 1)
+    return avg_loss, accuracy
+
+
+def summarize_model_overhead(model: nn.Module, train_samples: int, train_seconds: float) -> dict:
+    total_params = sum(parameter.numel() for parameter in model.parameters())
+    alpha_param_count = sum(
+        parameter.numel()
+        for module in model.modules()
+        if isinstance(module, AdaptiveAlphaGoLU)
+        for parameter in module.parameters(recurse=False)
     )
-    return trainloader, testloader
+
+    peak_cuda_memory_mb = None
+    if torch.cuda.is_available():
+        peak_cuda_memory_mb = torch.cuda.max_memory_allocated() / (1024 ** 2)
+
+    samples_per_second = train_samples / max(train_seconds, 1e-12)
+    seconds_per_sample = train_seconds / max(train_samples, 1)
+
+    return {
+        "total_params": int(total_params),
+        "alpha_param_count": int(alpha_param_count),
+        "peak_cuda_memory_mb": peak_cuda_memory_mb,
+        "train_samples": int(train_samples),
+        "train_seconds": float(train_seconds),
+        "seconds_per_sample": float(seconds_per_sample),
+        "samples_per_second": float(samples_per_second),
+    }
 
 
 # ==========================================
@@ -256,70 +335,91 @@ def train_single_seed(
     epochs: int = 10,
     device: torch.device = torch.device("cuda"),
     data_root: str = "./data",
+    alpha_lr: float | None = None,
+    val_split: float = 0.1,
+    eval_split: str = "test",
+    alpha_lr_scheduler: str = "none",
+    alpha_layout: str = "channel",
+    config_path: str | None = "configs/paper_benchmark.json",
     save_artifacts: bool = False,
+    return_metrics: bool = False,
 ):
     reset_all_seeds(seed)
-    trainloader, testloader = get_dataloaders(dataset_name, seed=seed, root=data_root)
+    trainloader, valloader, testloader = get_dataloaders(dataset_name, seed=seed, root=data_root, val_split=val_split, include_test=(eval_split == "test"))
     
-    model = ResNet18(num_classes=10, act_type=act_type).to(device)
+    model = ResNet18(num_classes=10, act_type=act_type, alpha_layout=alpha_layout).to(device)
+    overhead_tracker = OverheadTracker(task_name="classification", activation_name=act_type, model=model, device=device)
+    alpha_lr, alpha_warmup_epochs, alpha_grad_clip_norm = resolve_task_alpha_hparams(
+        "classification",
+        alpha_lr,
+        config_path=config_path,
+    )
     
-    act_params = []
-    weight_params = []
-
-    activation_module_types = (AdaptiveAlphaGoLU, AdaptiveSwish, PGELU, nn.PReLU)
-    activation_param_ids = set()
-    for module in model.modules():
-        if isinstance(module, activation_module_types):
-            for parameter in module.parameters(recurse=False):
-                if parameter.requires_grad:
-                    activation_param_ids.add(id(parameter))
-    
-    # Explicit parameter separation ensuring zero weight decay on activation parameters
-    for param in model.parameters():
-        if not param.requires_grad:
-            continue
-        if id(param) in activation_param_ids:
-            act_params.append(param)
-        else:
-            weight_params.append(param)
-
-    optimizer = torch.optim.AdamW([
-        # Intentional scale separation: adaptive activation parameters use a lower LR than the backbone.
-        {'params': weight_params, 'lr': 1e-3, 'weight_decay': 5e-4},
-        {'params': act_params, 'lr': 1e-4, 'weight_decay': 0.0}
-    ])
+    optimizer, set_alpha_lr, act_params = build_adamw_with_activation_groups(
+        model,
+        base_lr=1e-3,
+        base_weight_decay=5e-4,
+        activation_lr=alpha_lr,
+        activation_weight_decay=0.0,
+        warmup_epochs=alpha_warmup_epochs,
+    )
     scheduler = CosineAnnealingLR(optimizer, T_max=epochs)
-    criterion = nn.CrossEntropyLoss()
     alpha_logger = AlphaTrajectoryLogger(model)
     train_start = time.perf_counter()
     epoch_seconds = []
 
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats(device)
+
+    def update_alpha_lr(epoch_index: int) -> float:
+        if not act_params:
+            return 0.0
+        base_current = set_alpha_lr(epoch_index)
+        if alpha_lr_scheduler == "cosine":
+            denom = max(epochs - 1, 1)
+            scale = 0.5 * (1.0 + math.cos(math.pi * epoch_index / denom))
+            current_alpha_lr = base_current * scale
+            optimizer.param_groups[1]["lr"] = current_alpha_lr
+            return current_alpha_lr
+        return base_current
+
+    current_alpha_lr = update_alpha_lr(0)
+
     for epoch in range(epochs):
         epoch_start = time.perf_counter()
+        current_alpha_lr = update_alpha_lr(epoch)
         model.train()
         for inputs, labels in trainloader:
             inputs, labels = inputs.to(device), labels.to(device)
             optimizer.zero_grad()
+            overhead_tracker.start_forward()
             outputs = model(inputs)
-            loss = criterion(outputs, labels)
+            overhead_tracker.end_forward(batch_size=inputs.size(0))
+            loss = nn.CrossEntropyLoss()(outputs, labels)
+            overhead_tracker.start_backward()
             loss.backward()
+            overhead_tracker.end_backward()
+            clip_activation_gradients(model, max_norm=alpha_grad_clip_norm)
             optimizer.step()
+            for module in model.modules():
+                if isinstance(module, AdaptiveAlphaGoLU):
+                    module.clamp_alpha_(0.2, 3.0)
         scheduler.step()
         epoch_seconds.append(time.perf_counter() - epoch_start)
         alpha_logger.step()
 
-    model.eval()
-    correct, total = 0, 0
-    with torch.no_grad():
-        for inputs, labels in testloader:
-            inputs, labels = inputs.to(device), labels.to(device)
-            outputs = model(inputs)
-            _, predicted = torch.max(outputs.data, 1)
-            total += labels.size(0)
-            correct += (predicted == labels).sum().item()
+    if torch.cuda.is_available():
+        torch.cuda.synchronize(device)
 
-    acc = 100.0 * correct / total
+    train_seconds = time.perf_counter() - train_start
+
+    eval_loader = valloader if eval_split == "val" else testloader
+    if eval_loader is None:
+        raise ValueError("Evaluation loader is not available for the requested eval_split")
+
+    eval_loss, acc = evaluate_model(model, eval_loader, device)
     alphas = model.extract_alphas()
+    overhead = overhead_tracker.save()
 
     if save_artifacts:
         run_dir = create_run_directory(
@@ -335,13 +435,18 @@ def train_single_seed(
                 "dataset_name": dataset_name,
                 "data_root": data_root,
                 "activation": act_type,
+                "alpha_lr": alpha_lr,
                 "seed": seed,
                 "epochs": epochs,
+                "eval_split": eval_split,
+                "eval_loss": eval_loss,
                 "accuracy": acc,
                 "alpha_values": alphas,
                 "alpha_history": alpha_logger.alpha_history,
-                "train_seconds": time.perf_counter() - train_start,
+                "train_seconds": train_seconds,
                 "epoch_seconds": epoch_seconds,
+                "alpha_lr_final": current_alpha_lr,
+                **overhead,
             },
         )
         write_json(
@@ -355,6 +460,10 @@ def train_single_seed(
                     "dataset_name": dataset_name,
                     "data_root": data_root,
                     "epochs": epochs,
+                    "val_split": val_split,
+                    "eval_split": eval_split,
+                    "alpha_lr_scheduler": alpha_lr_scheduler,
+                    "alpha_lr": alpha_lr,
                     "seed": seed,
                 },
             ),
@@ -362,10 +471,20 @@ def train_single_seed(
         if alpha_logger.alpha_history:
             alpha_logger.plot_trajectories(str(run_dir / "alpha_trajectories.png"))
     
+    if return_metrics:
+        return {
+            "accuracy": acc,
+            "loss": eval_loss,
+            "alphas": alphas,
+            "eval_split": eval_split,
+            "alpha_lr_final": current_alpha_lr,
+                "alpha_layout": alpha_layout,
+        }
+
     return acc, alphas
 
 
-def run_benchmark(dataset_name: str = "cifar10", seeds: list = [42, 123, 999, 2024, 2025], epochs: int = 10, data_root: str = "./data"):
+def run_benchmark(dataset_name: str = "cifar10", seeds: list = [42, 123, 999, 2024, 2025], epochs: int = 10, data_root: str = "./data", alpha_lr: float | None = None, val_split: float = 0.1, alpha_lr_scheduler: str = "none", alpha_layout: str = "channel", config_path: str | None = "configs/paper_benchmark.json"):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     activations = ['relu', 'gelu', 'swish', 'adaptive_swish', 'prelu', 'pgelu', 'golu_static', 'alpha_golu']
     results = {act: [] for act in activations}
@@ -382,6 +501,12 @@ def run_benchmark(dataset_name: str = "cifar10", seeds: list = [42, 123, 999, 20
                 epochs=epochs,
                 device=device,
                 data_root=data_root,
+                alpha_lr=alpha_lr,
+                val_split=val_split,
+                eval_split="test",
+                alpha_lr_scheduler=alpha_lr_scheduler,
+                alpha_layout=alpha_layout,
+                config_path=config_path,
                 save_artifacts=True,
             )
             results[act].append(acc)
@@ -401,10 +526,85 @@ def run_benchmark(dataset_name: str = "cifar10", seeds: list = [42, 123, 999, 20
         print(f"\nStatistical Significance (Alpha-GoLU vs Static GoLU p-value): {p_val:.4f}")
 
 
-def train_and_eval(activation: str = 'alpha_golu', seed: int = 42, dataset_name: str = 'cifar10', epochs: int = 10, data_root: str = './data') -> float:
+def train_and_eval(activation: str = 'alpha_golu', seed: int = 42, dataset_name: str = 'cifar10', epochs: int = 10, data_root: str = './data', alpha_lr: float | None = None, val_split: float = 0.1, alpha_lr_scheduler: str = "none", alpha_layout: str = "channel", config_path: str | None = "configs/paper_benchmark.json") -> float:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    acc, _ = train_single_seed(act_type=activation, dataset_name=dataset_name, seed=seed, epochs=epochs, device=device, data_root=data_root, save_artifacts=False)
+    acc, _ = train_single_seed(act_type=activation, dataset_name=dataset_name, seed=seed, epochs=epochs, device=device, data_root=data_root, alpha_lr=alpha_lr, val_split=val_split, eval_split="test", alpha_lr_scheduler=alpha_lr_scheduler, alpha_layout=alpha_layout, config_path=config_path, save_artifacts=False)
     return float(acc)
+
+
+def run_alpha_layout_ablation(dataset_name: str = "cifar10", seeds: list[int] | None = None, epochs: int = 10, data_root: str = "./data", alpha_lr: float | None = None, val_split: float = 0.1, alpha_lr_scheduler: str = "none", config_path: str | None = "configs/paper_benchmark.json"):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    seeds = seeds or [42, 123, 999, 2024, 2025]
+    layouts = ["layer", "channel"]
+
+    print(f"\n================ Alpha Layout Ablation on {dataset_name.upper()} ================")
+    for layout in layouts:
+        scores = []
+        print(f"\n--- Alpha Layout: {layout.upper()} ---")
+        for seed in seeds:
+            acc, _ = train_single_seed(
+                act_type="alpha_golu",
+                dataset_name=dataset_name,
+                seed=seed,
+                epochs=epochs,
+                device=device,
+                data_root=data_root,
+                alpha_lr=alpha_lr,
+                val_split=val_split,
+                eval_split="test",
+                alpha_lr_scheduler=alpha_lr_scheduler,
+                alpha_layout=layout,
+                config_path=config_path,
+                save_artifacts=True,
+            )
+            scores.append(acc)
+            print(f"Seed {seed} -> Accuracy: {acc:.2f}%")
+        stats_res = compute_summary_statistics(scores)
+        print(f"--> {layout.upper()} Mean Accuracy: {stats_res['mean']:.2f}% ± {stats_res['std']:.2f}%")
+
+
+def run_alpha_lr_ablation(
+    dataset_name: str = "cifar10",
+    seeds: list[int] | None = None,
+    epochs: int = 10,
+    data_root: str = "./data",
+    val_split: float = 0.1,
+    alpha_lrs: list[float] | None = None,
+):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    seeds = seeds or [42]
+    alpha_lrs = alpha_lrs or [1e-4, 3e-4, 5e-4]
+
+    print(f"\n================ Alpha LR Ablation on {dataset_name.upper()} ================")
+    print(f"Seeds: {seeds}")
+    print(f"Alpha LRs: {alpha_lrs}")
+
+    summary = {}
+    for alpha_lr in alpha_lrs:
+        lr_key = f"alpha_lr_{alpha_lr:.0e}"
+        summary[lr_key] = []
+        print(f"\n--- Alpha LR: {alpha_lr:.1e} ---")
+        for seed in seeds:
+            metrics = train_single_seed(
+                act_type="alpha_golu",
+                dataset_name=dataset_name,
+                seed=seed,
+                epochs=epochs,
+                device=device,
+                data_root=data_root,
+                alpha_lr=alpha_lr,
+                val_split=val_split,
+                eval_split="val",
+                alpha_lr_scheduler="cosine",
+                config_path="configs/paper_benchmark.json",
+                save_artifacts=True,
+                return_metrics=True,
+            )
+            summary[lr_key].append({"seed": seed, "accuracy": metrics["accuracy"], "loss": metrics["loss"], "alphas": metrics["alphas"]})
+            mean_alpha = float(np.mean(metrics["alphas"])) if metrics["alphas"] else float("nan")
+            print(f"Seed {seed} -> Val Loss: {metrics['loss']:.4f} | Val Acc: {metrics['accuracy']:.2f}% | Final Mean Alpha: {mean_alpha:.4f}")
+
+    return summary
 
 
 if __name__ == '__main__':
@@ -416,13 +616,24 @@ if __name__ == '__main__':
     parser.add_argument("--epochs", type=int, default=10, help="Training epochs")
     parser.add_argument("--activation", type=str, default="alpha_golu", help="Single activation to evaluate")
     parser.add_argument("--data-root", type=str, default="./data", help="Dataset cache root")
+    parser.add_argument("--alpha-lr", type=float, default=None, help="Learning rate for activation parameters; defaults to configs/paper_benchmark.json")
+    parser.add_argument("--val-split", type=float, default=0.1, help="Fraction of training data reserved for validation")
+    parser.add_argument("--alpha-lr-scheduler", type=str, default="none", choices=["none", "cosine"], help="Scheduler for activation parameter LR")
+    parser.add_argument("--config", type=str, default="configs/paper_benchmark.json", help="Benchmark config file used for task alpha hyperparameters")
+    parser.add_argument("--alpha-layout", type=str, default="channel", choices=["layer", "channel"], help="Alpha-GoLU parameter layout")
     parser.add_argument("--benchmark", action="store_true", help="Run the full benchmark sweep")
+    parser.add_argument("--alpha-layout-ablation", action="store_true", help="Compare layer-wise vs channel-wise Alpha-GoLU")
+    parser.add_argument("--alpha-lr-ablation", action="store_true", help="Run a compact alpha LR sweep for Alpha-GoLU only")
     args = parser.parse_args()
 
-    if args.benchmark:
+    if args.alpha_layout_ablation:
+        run_alpha_layout_ablation(dataset_name=args.dataset_name or "cifar10", seeds=args.seeds, epochs=args.epochs, data_root=args.data_root, alpha_lr=args.alpha_lr, val_split=args.val_split, alpha_lr_scheduler=args.alpha_lr_scheduler, config_path=args.config)
+    elif args.alpha_lr_ablation:
+        run_alpha_lr_ablation(dataset_name=args.dataset_name or "cifar10", seeds=args.seeds, epochs=args.epochs, data_root=args.data_root, val_split=args.val_split, alpha_lrs=[1e-4, 3e-4, 5e-4])
+    elif args.benchmark:
         dataset_names = [args.dataset_name] if args.dataset_name else ["cifar10", "fashion_mnist"]
         for dataset_name in dataset_names:
-            run_benchmark(dataset_name=dataset_name, seeds=args.seeds, epochs=args.epochs, data_root=args.data_root)
+            run_benchmark(dataset_name=dataset_name, seeds=args.seeds, epochs=args.epochs, data_root=args.data_root, alpha_lr=args.alpha_lr, val_split=args.val_split, alpha_lr_scheduler=args.alpha_lr_scheduler, alpha_layout=args.alpha_layout, config_path=args.config)
     else:
         dataset_name = args.dataset_name or "cifar10"
         print(f"Running Classification Benchmark on {dataset_name.upper()}...")
@@ -434,6 +645,12 @@ if __name__ == '__main__':
                 epochs=args.epochs,
                 device=torch.device("cuda" if torch.cuda.is_available() else "cpu"),
                 data_root=args.data_root,
+                alpha_lr=args.alpha_lr,
+                val_split=args.val_split,
+                eval_split="test",
+                alpha_lr_scheduler=args.alpha_lr_scheduler,
+                alpha_layout=args.alpha_layout,
+                config_path=args.config,
                 save_artifacts=True,
             )
             print(f"Activation: {args.activation.ljust(15)} | Seed {seed} | Accuracy: {acc:.2f}%")

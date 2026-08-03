@@ -31,6 +31,8 @@ if str(PROJECT_ROOT) not in sys.path:
 from models.alpha_golu import AlphaGoLU as AdaptiveAlphaGoLU, StaticGoLU
 from diagnostics.trajectory_logger import AlphaTrajectoryLogger
 from utils.run_artifacts import build_run_manifest, create_run_directory, write_json
+from utils.overhead_tracker import OverheadTracker
+from utils.train_tuning import build_adamw_with_activation_groups, clip_activation_gradients, default_loader_kwargs, resolve_task_alpha_hparams
 
 
 WIKITEXT2_URLS = {
@@ -107,28 +109,21 @@ def get_activation(act_type: str) -> nn.Module:
     raise ValueError(f"Unknown activation type: {act_type}")
 
 
-def get_optimizer(model: nn.Module, lr: float = 1e-3, weight_decay: float = 1e-4) -> optim.Optimizer:
-    act_params = []
-    base_params = []
-
-    for module in model.modules():
-        if isinstance(module, (AdaptiveAlphaGoLU, PGELU, AdaptiveSwish, nn.PReLU)):
-            for parameter in module.parameters(recurse=False):
-                if parameter.requires_grad:
-                    act_params.append(parameter)
-
-    act_param_ids = set(map(id, act_params))
-    for parameter in model.parameters():
-        if parameter.requires_grad:
-            if id(parameter) in act_param_ids:
-                continue
-            base_params.append(parameter)
-
-    parameter_groups = [{"params": base_params, "lr": lr, "weight_decay": weight_decay}]
-    if act_params:
-        parameter_groups.append({"params": act_params, "lr": lr, "weight_decay": 0.0})
-
-    return optim.AdamW(parameter_groups)
+def get_optimizer(
+    model: nn.Module,
+    lr: float = 1e-3,
+    alpha_lr: float | None = None,
+    weight_decay: float = 1e-4,
+    warmup_epochs: int = 1,
+):
+    return build_adamw_with_activation_groups(
+        model,
+        base_lr=lr,
+        base_weight_decay=weight_decay,
+        activation_lr=alpha_lr,
+        activation_weight_decay=0.0,
+        warmup_epochs=warmup_epochs,
+    )
 
 
 def download_wikitext2(root: str = "./data") -> Dict[str, Path]:
@@ -278,6 +273,7 @@ def build_language_model_dataloaders(
     valid_dataset = BlockDataset(valid_ids, block_size=block_size)
 
     loader_g = torch.Generator().manual_seed(seed)
+    loader_kwargs = default_loader_kwargs()
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
@@ -285,6 +281,7 @@ def build_language_model_dataloaders(
         generator=loader_g,
         worker_init_fn=seed_worker,
         collate_fn=collate_blocks,
+        **loader_kwargs,
     )
     valid_loader = DataLoader(
         valid_dataset,
@@ -293,6 +290,7 @@ def build_language_model_dataloaders(
         generator=loader_g,
         worker_init_fn=seed_worker,
         collate_fn=collate_blocks,
+        **loader_kwargs,
     )
     return train_loader, valid_loader, vocab
 
@@ -305,6 +303,8 @@ def train_single_seed_lm(
     dataset_name: str = "wikitext2",
     block_size: int = 64,
     data_root: str = "./data",
+    alpha_lr: float | None = None,
+    config_path: str | None = "configs/paper_benchmark.json",
     save_artifacts: bool = False,
 ) -> float:
     reset_all_seeds(seed)
@@ -318,7 +318,13 @@ def train_single_seed_lm(
     )
 
     model = MiniGPT(vocab_size=len(vocab), act_type=act_type, max_seq_len=block_size).to(device)
-    optimizer = get_optimizer(model, lr=1e-3)
+    overhead_tracker = OverheadTracker(task_name="language_model", activation_name=act_type, model=model, device=device)
+    alpha_lr, alpha_warmup_epochs, alpha_grad_clip_norm = resolve_task_alpha_hparams(
+        "language_model",
+        alpha_lr,
+        config_path=config_path,
+    )
+    optimizer, set_alpha_lr, act_params = get_optimizer(model, lr=1e-3, alpha_lr=alpha_lr, warmup_epochs=alpha_warmup_epochs)
     criterion = nn.CrossEntropyLoss()
     alpha_logger = AlphaTrajectoryLogger(model)
     train_start = time.perf_counter()
@@ -327,15 +333,21 @@ def train_single_seed_lm(
     for epoch in range(epochs):
         epoch_start = time.perf_counter()
         model.train()
+        current_alpha_lr = set_alpha_lr(epoch)
         for batch in train_loader:
             batch = batch.to(device)
             inputs, targets = batch[:, :-1], batch[:, 1:]
+            overhead_tracker.start_forward()
             logits = model(inputs)
+            overhead_tracker.end_forward(batch_size=inputs.size(0))
             loss = criterion(logits.reshape(-1, len(vocab)), targets.reshape(-1))
 
             optimizer.zero_grad()
+            overhead_tracker.start_backward()
             loss.backward()
+            overhead_tracker.end_backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            clip_activation_gradients(model, max_norm=alpha_grad_clip_norm)
             optimizer.step()
         epoch_seconds.append(time.perf_counter() - epoch_start)
         alpha_logger.step()
@@ -354,6 +366,7 @@ def train_single_seed_lm(
 
     avg_loss = total_loss / max(total_tokens, 1)
     perplexity = math.exp(min(avg_loss, 20.0))
+    overhead = overhead_tracker.save()
 
     if save_artifacts:
         run_dir = create_run_directory(
@@ -369,14 +382,15 @@ def train_single_seed_lm(
                 "dataset_name": dataset_name,
                 "data_root": data_root,
                 "activation": act_type,
+                "alpha_lr": alpha_lr,
                 "seed": seed,
                 "epochs": epochs,
                 "block_size": block_size,
+                "alpha_lr_final": current_alpha_lr if act_params else None,
                 "perplexity": float(perplexity),
                 "avg_loss": float(avg_loss),
                 "alpha_history": alpha_logger.alpha_history,
-                "train_seconds": time.perf_counter() - train_start,
-                "epoch_seconds": epoch_seconds,
+                **overhead,
             },
         )
         write_json(
@@ -390,6 +404,7 @@ def train_single_seed_lm(
                     "dataset_name": dataset_name,
                     "data_root": data_root,
                     "epochs": epochs,
+                    "alpha_lr": alpha_lr if alpha_lr is not None else 1e-3,
                     "seed": seed,
                     "block_size": block_size,
                 },
@@ -401,7 +416,7 @@ def train_single_seed_lm(
     return float(perplexity)
 
 
-def run_lm_benchmark(seeds=None, epochs=5, data_root: str = "./data"):
+def run_lm_benchmark(seeds=None, epochs=5, data_root: str = "./data", alpha_lr: float | None = None, config_path: str | None = "configs/paper_benchmark.json"):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     seeds = seeds or [42, 123, 999, 2024, 2025]
     print(f"Running WikiText-2 Language Model Benchmark on {device}...")
@@ -411,17 +426,17 @@ def run_lm_benchmark(seeds=None, epochs=5, data_root: str = "./data"):
     for act_type in activations:
         ppls = []
         for s in seeds:
-            ppl = train_single_seed_lm(act_type=act_type, seed=s, epochs=epochs, device=device, data_root=data_root, save_artifacts=True)
+            ppl = train_single_seed_lm(act_type=act_type, seed=s, epochs=epochs, device=device, data_root=data_root, alpha_lr=alpha_lr, config_path=config_path, save_artifacts=True)
             ppls.append(ppl)
             print(f"[{act_type.upper():<14} | Seed {s}] Validation Perplexity: {ppl:.2f}")
 
         print(f"  --> {act_type.upper():<14} Mean PPL: {np.mean(ppls):.2f} ± {np.std(ppls):.2f}\n")
 
 
-def train_and_eval(activation: str = "alpha_golu", seed: int = 42, epochs: int = 5, data_root: str = "./data") -> float:
+def train_and_eval(activation: str = "alpha_golu", seed: int = 42, epochs: int = 5, data_root: str = "./data", alpha_lr: float | None = None, config_path: str | None = "configs/paper_benchmark.json") -> float:
     """Returns validation perplexity on WikiText-2."""
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    perplexity = train_single_seed_lm(act_type=activation, seed=seed, epochs=epochs, device=device, data_root=data_root, save_artifacts=False)
+    perplexity = train_single_seed_lm(act_type=activation, seed=seed, epochs=epochs, device=device, data_root=data_root, alpha_lr=alpha_lr, config_path=config_path, save_artifacts=False)
     return float(perplexity)
 
 
@@ -433,14 +448,16 @@ if __name__ == "__main__":
     parser.add_argument("--seeds", type=int, nargs="+", default=[42, 123, 999, 2024, 2025], help="Random seeds")
     parser.add_argument("--epochs", type=int, default=5, help="Training epochs")
     parser.add_argument("--data-root", type=str, default="./data", help="Dataset cache root")
+    parser.add_argument("--alpha-lr", type=float, default=None, help="Learning rate for language-model activation parameters; defaults to configs/paper_benchmark.json")
+    parser.add_argument("--config", type=str, default="configs/paper_benchmark.json", help="Benchmark config file used for task alpha hyperparameters")
     parser.add_argument("--benchmark", action="store_true", help="Run the full activation sweep")
     args = parser.parse_args()
 
     if args.benchmark:
-        run_lm_benchmark(seeds=args.seeds, epochs=args.epochs, data_root=args.data_root)
+        run_lm_benchmark(seeds=args.seeds, epochs=args.epochs, data_root=args.data_root, alpha_lr=args.alpha_lr, config_path=args.config)
     else:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"Running WikiText-2 Language Model Benchmark on {device}...")
         for seed in args.seeds:
-            ppl = train_and_eval(activation=args.activation, seed=seed, epochs=args.epochs, data_root=args.data_root)
+            ppl = train_and_eval(activation=args.activation, seed=seed, epochs=args.epochs, data_root=args.data_root, alpha_lr=args.alpha_lr, config_path=args.config)
             print(f"[{args.activation.upper():<14} | Seed {seed}] Validation Perplexity: {ppl:.2f}")
