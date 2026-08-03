@@ -47,6 +47,9 @@ class ParametricGELU(nn.Module):
     def alpha(self):
         return torch.nn.functional.softplus(self.raw_alpha)
 
+    def get_alpha_val(self) -> torch.Tensor:
+        return self.alpha.detach()
+
     def forward(self, x):
         return x * 0.5 * (1.0 + torch.erf((self.alpha * x) / 1.41421356))
 
@@ -57,6 +60,9 @@ class AdaptiveSwish(nn.Module):
     def __init__(self, init_beta=1.0):
         super().__init__()
         self.beta = nn.Parameter(torch.tensor(float(init_beta), dtype=torch.float32))
+
+    def get_alpha_val(self) -> torch.Tensor:
+        return self.beta.detach()
 
     def forward(self, x):
         return x * torch.sigmoid(self.beta * x)

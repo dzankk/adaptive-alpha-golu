@@ -34,7 +34,7 @@ from utils.run_artifacts import build_run_manifest, create_run_directory, write_
 from utils.preflight import run_preflight_checks, save_preflight_report
 from utils.data_prep import prepare_all_datasets
 from utils.stats import compute_summary_statistics, calculate_p_value
-from utils.visualization import plot_paper_alpha_trajectories, plot_paper_benchmark_summary, plot_paper_overhead_summary
+from utils.visualization import plot_paper_alpha_trajectories, plot_paper_benchmark_summary, plot_paper_overhead_summary, plot_parametric_comparison
 
 TASK_MAP = {
     "classification": run_classification,
@@ -45,8 +45,8 @@ TASK_MAP = {
     "robustness": run_robustness,
 }
 
-# Updated canonical set: includes standard static baselines and their parametric counterparts
-SUPPORTED_ACTIVATIONS = [
+# Updated canonical set: includes standard static baselines and their parametric counterparts.
+CANONICAL_ACTIVATIONS = [
     "relu",
     "gelu",
     "swish",
@@ -56,6 +56,10 @@ SUPPORTED_ACTIVATIONS = [
     "golu_static",
     "alpha_golu"
 ]
+
+SUPPORTED_ACTIVATIONS = CANONICAL_ACTIVATIONS + ["swish_adaptive"]
+
+PARAMETRIC_ACTIVATIONS = ["alpha_golu", "prelu", "pgelu", "adaptive_swish", "swish_adaptive"]
 
 DEFAULT_SEEDS = [42, 123, 999, 2024, 2025]
 
@@ -168,7 +172,7 @@ def handle_generate_overhead_table(args):
         "robustness": "Robustness",
     }
 
-    activations = [act for act in SUPPORTED_ACTIVATIONS if act in grouped]
+    activations = [act for act in CANONICAL_ACTIVATIONS if act in grouped]
     for act in sorted(grouped.keys()):
         if act not in activations:
             activations.append(act)
@@ -337,7 +341,7 @@ def handle_run_all(args):
     """Runs all benchmark tasks across selected activations and seeds."""
     config = load_benchmark_config(args.config) if args.config else {}
     seeds = args.seeds if args.seeds != DEFAULT_SEEDS else config.get("seeds", DEFAULT_SEEDS)
-    activations = args.activations if args.activations != SUPPORTED_ACTIVATIONS else config.get("activations", SUPPORTED_ACTIVATIONS)
+    activations = args.activations if args.activations != CANONICAL_ACTIVATIONS else config.get("activations", CANONICAL_ACTIVATIONS)
     task_names = config.get("tasks", list(TASK_MAP.keys()))
     task_alpha_lrs = config.get("alpha_lr_by_task", {})
     output_root = config.get("output_root", "outputs/runs")
@@ -646,6 +650,32 @@ def handle_generate_paper_assets(args):
     print(f"[IO] Paper assets written to {output_dir}")
 
 
+def handle_generate_parametric_comparison_plot(args):
+    """Plots layer-averaged trajectories for parametric activations from saved run JSON files."""
+    if args.run_jsons:
+        run_jsons = [str(Path(path)) for path in args.run_jsons]
+    else:
+        runs_root = Path(args.runs_root)
+        run_jsons = []
+        if runs_root.exists():
+            for result_path in runs_root.rglob("results.json"):
+                payload = _load_json_file(result_path)
+                if not payload:
+                    continue
+                activation_name = str(payload.get("activation", payload.get("activation_name", ""))).lower().strip()
+                task_name = str(payload.get("task", "")).lower().strip()
+                if args.task and task_name != args.task.lower().strip():
+                    continue
+                if activation_name in PARAMETRIC_ACTIVATIONS:
+                    run_jsons.append(str(result_path))
+
+    if not run_jsons:
+        print("[Error] No parametric run JSONs found to plot")
+        return
+
+    plot_parametric_comparison(run_jsons, save_path=args.output_path, task_name=args.task)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="CLI for Adaptive Alpha-GoLU Benchmark Suite & Paper Reproducibility",
@@ -668,7 +698,7 @@ def main():
         "--activations", 
         type=str, 
         nargs="+", 
-        default=SUPPORTED_ACTIVATIONS, 
+        default=CANONICAL_ACTIVATIONS, 
         choices=SUPPORTED_ACTIVATIONS, 
         help="Activations to evaluate"
     )
@@ -704,6 +734,13 @@ def main():
     paper_parser.add_argument("--output-dir", type=str, default="outputs/paper_assets", help="Directory where paper assets will be written")
     paper_parser.add_argument("--activation", type=str, default="alpha_golu", choices=SUPPORTED_ACTIVATIONS, help="Activation to use when scanning trajectory plots")
 
+    # Command: generate_parametric_comparison_plot
+    parametric_parser = subparsers.add_parser("generate_parametric_comparison_plot", help="Plot layer-averaged parameter adaptation curves for parametric activations")
+    parametric_parser.add_argument("--run-jsons", type=str, nargs="*", default=None, help="Explicit run JSON paths to compare")
+    parametric_parser.add_argument("--runs-root", type=str, default="outputs/runs", help="Directory to scan for run JSONs if no explicit paths are provided")
+    parametric_parser.add_argument("--task", type=str, default=None, choices=list(TASK_MAP.keys()), help="Optional task filter when scanning output runs")
+    parametric_parser.add_argument("--output-path", type=str, default="outputs/paper_assets/parametric_comparison.png", help="Where to save the comparison figure")
+
     args = parser.parse_args()
 
     if args.command == "run":
@@ -716,6 +753,8 @@ def main():
         handle_generate_overhead_table(args)
     elif args.command == "generate_paper_assets":
         handle_generate_paper_assets(args)
+    elif args.command == "generate_parametric_comparison_plot":
+        handle_generate_parametric_comparison_plot(args)
     elif args.command == "preflight":
         _run_preflight_or_abort(args.data_root, args.output_root, args.min_free_gb)
     elif args.command == "prepare_data":

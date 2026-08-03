@@ -25,6 +25,19 @@ TASK_LABELS = {
 
 LOWER_IS_BETTER = {"diffusion", "language_model"}
 
+TASK_ORDER = ["classification", "detection", "segmentation", "diffusion", "language_model", "robustness"]
+
+PARAMETRIC_ACTIVATION_ORDER = ["alpha_golu", "prelu", "pgelu", "adaptive_swish", "swish_adaptive"]
+
+PARAMETRIC_ACTIVATION_LABELS = {
+    "alpha_golu": r"Alpha-GoLU ($\alpha$)",
+    "adaptive_alpha_golu": r"Alpha-GoLU ($\alpha$)",
+    "prelu": r"PReLU ($a$)",
+    "pgelu": r"PGELU ($\alpha$)",
+    "adaptive_swish": r"Parametric Swish ($\beta$)",
+    "swish_adaptive": r"Parametric Swish ($\beta$)",
+}
+
 
 def _load_json(path: str | Path) -> dict:
     json_path = Path(path)
@@ -58,6 +71,122 @@ def _find_latest_task_result(runs_root: str | Path, task_name: str, activation_n
         return {}
     candidates.sort(key=lambda item: item[0], reverse=True)
     return candidates[0][1]
+
+
+def _layer_average_history(alpha_history: dict) -> np.ndarray | None:
+    if not isinstance(alpha_history, dict) or not alpha_history:
+        return None
+
+    arrays = []
+    for history in alpha_history.values():
+        if not history:
+            continue
+        arrays.append(np.asarray(history, dtype=np.float64))
+
+    if not arrays:
+        return None
+
+    min_len = min(array.shape[0] for array in arrays if array.ndim == 1 and array.size > 0)
+    if min_len <= 0:
+        return None
+
+    stacked = np.stack([array[:min_len] for array in arrays], axis=0)
+    return np.mean(stacked, axis=0)
+
+
+def _parametric_comparison_label(task_name: str, activation_name: str, include_task: bool) -> str:
+    activation_label = PARAMETRIC_ACTIVATION_LABELS.get(activation_name, activation_name.replace("_", " ").title())
+    if not include_task:
+        return activation_label
+    task_label = TASK_LABELS.get(task_name, task_name.replace("_", " ").title())
+    return f"{task_label} · {activation_label}"
+
+
+def _select_latest_parametric_runs(run_json_paths: list[str], task_name: str | None = None) -> list[tuple[str, dict]]:
+    latest: dict[tuple[str, str], tuple[float, str, dict]] = {}
+    task_filter = task_name.lower().strip() if task_name else None
+
+    for path in run_json_paths:
+        payload = _load_json(path)
+        if not payload:
+            continue
+
+        current_task = str(payload.get("task", "")).lower().strip()
+        activation_name = str(payload.get("activation", payload.get("activation_name", ""))).lower().strip()
+        if not current_task or not activation_name:
+            continue
+        if task_filter and current_task != task_filter:
+            continue
+
+        key = (current_task, activation_name)
+        stat_result = Path(path)
+        try:
+            mtime = stat_result.stat().st_mtime
+        except OSError:
+            mtime = 0.0
+
+        previous = latest.get(key)
+        if previous is None or mtime >= previous[0]:
+            latest[key] = (mtime, str(path), payload)
+
+    ordered_keys = sorted(
+        latest.keys(),
+        key=lambda item: (
+            TASK_ORDER.index(item[0]) if item[0] in TASK_ORDER else len(TASK_ORDER),
+            PARAMETRIC_ACTIVATION_ORDER.index(item[1]) if item[1] in PARAMETRIC_ACTIVATION_ORDER else len(PARAMETRIC_ACTIVATION_ORDER),
+        ),
+    )
+    return [(latest[key][1], latest[key][2]) for key in ordered_keys]
+
+
+def plot_parametric_comparison(
+    run_json_paths: list[str],
+    save_path: str = "outputs/paper_assets/parametric_comparison.png",
+    title: str = "Layer-Averaged Parametric Activation Trajectories",
+    task_name: str | None = None,
+):
+    """Plots layer-averaged parameter trajectories for multiple parametric activation runs."""
+    if not run_json_paths:
+        print("[Visualizer] No run JSONs provided for parametric comparison plot")
+        return None
+
+    series = []
+    selected_runs = _select_latest_parametric_runs(run_json_paths, task_name=task_name)
+    include_task_in_label = len({str(_load_json(path).get("task", "")).lower().strip() for path, _ in selected_runs if _load_json(path)}) > 1
+
+    for path, payload in selected_runs:
+        activation_name = str(payload.get("activation", payload.get("activation_name", "unknown"))).lower().strip()
+        current_task = str(payload.get("task", "")).lower().strip()
+        history = _layer_average_history(payload.get("alpha_history", {}))
+        if history is None or history.size == 0:
+            continue
+
+        display_label = _parametric_comparison_label(current_task, activation_name, include_task_in_label)
+        series.append((display_label, history))
+
+    if not series:
+        print("[Visualizer] No usable parametric trajectories found in the provided run JSONs")
+        return None
+
+    os.makedirs(Path(save_path).parent, exist_ok=True)
+    fig, ax = plt.subplots(figsize=(12, 6))
+    color_cycle = plt.rcParams["axes.prop_cycle"].by_key().get("color", [])
+
+    for index, (label, history) in enumerate(series):
+        steps = np.arange(1, len(history) + 1)
+        color = color_cycle[index % len(color_cycle)] if color_cycle else None
+        ax.plot(steps, history, label=label, linewidth=2.2, color=color)
+
+    ax.set_title(title)
+    ax.set_xlabel("Epoch / Step")
+    ax.set_ylabel(r"Layer-Averaged Parameter")
+    ax.grid(True, alpha=0.25)
+    ax.legend(frameon=False)
+    fig.tight_layout()
+    fig.savefig(save_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[Visualizer] Parametric comparison plot saved to: {save_path}")
+    return save_path
 
 
 def plot_paper_benchmark_summary(results_path: str = "outputs/benchmark_results.json", save_dir: str = "outputs/paper_assets"):
