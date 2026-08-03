@@ -388,7 +388,7 @@ def train_single_seed_detection(
     train_dataset, eval_dataset = random_split(full_dataset, [train_length, eval_length], generator=generator)
 
     loader_g = torch.Generator().manual_seed(seed)
-    loader_kwargs = default_loader_kwargs()
+    loader_kwargs = default_loader_kwargs(num_workers=2)
     train_loader = DataLoader(
         train_dataset,
         batch_size=8,
