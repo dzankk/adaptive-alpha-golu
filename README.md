@@ -14,7 +14,7 @@
 - **Dynamic Asymmetry ($\alpha$ parameter):** Learnable scaling factors per layer or channel that adapt to gradient flow during training.
 - **Zero Incomplete-Beta Bottleneck:** Optimized numerical formulation ensuring high throughput and negligible GPU overhead vs. standard GELU/ReLU.
 - **Cross-Domain Benchmark Suite:** Built-in evaluation covering Classification, Object Detection (Pascal VOC), Image Segmentation, Generative Diffusion (UNet), Language Modeling (WikiText-2), and Adversarial Robustness.
-- **Automated Paper Pipeline:** Reproducible CLI toolchain that generates LaTeX tables and publication-ready figures directly from experiment artifacts.
+- **Automated Paper Pipeline:** Reproducible CLI toolchain that generates LaTeX tables and figures directly from experiment artifacts.
 
 ---
 
