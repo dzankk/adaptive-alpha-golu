@@ -34,6 +34,7 @@ from utils.run_artifacts import build_run_manifest, create_run_directory, write_
 from utils.preflight import run_preflight_checks, save_preflight_report
 from utils.data_prep import prepare_all_datasets
 from utils.stats import compute_summary_statistics, calculate_p_value
+from utils.visualization import plot_paper_alpha_trajectories, plot_paper_benchmark_summary, plot_paper_overhead_summary
 
 TASK_MAP = {
     "classification": run_classification,
@@ -181,7 +182,7 @@ def handle_generate_overhead_table(args):
         r"\renewcommand{\arraystretch}{1.15}",
         r"\begin{tabular}{l" + "c" * len(task_order) + r"}",
         r"\toprule",
-        "Activation & " + " & ".join(f"\\textbf{{{task_labels[task]}}}" for task in task_order) + r" \\",
+            "Activation & " + " & ".join([f"\\textbf{{{task_labels[task]}}}" for task in task_order]) + r" \\",
         r"\midrule",
     ]
 
@@ -551,6 +552,100 @@ def handle_generate_table(args):
     print("\\end{table*}\n")
 
 
+def _build_benchmark_latex_table(data: dict) -> str:
+    tasks = list(data.keys())
+    if not tasks:
+        return "% ===== Auto-Generated Publication LaTeX Benchmark Table =====\n% Empty benchmark results.\n"
+
+    first_task = tasks[0]
+    acts = [k for k in data[first_task].keys() if not k.startswith("p_value_") and k != "completed_scores"]
+    lower_is_better_tasks = {"language_model", "diffusion"}
+
+    best_per_task = {}
+    second_best_per_task = {}
+    for task_name in tasks:
+        means = {activation: data[task_name][activation]["mean"] for activation in acts if activation in data[task_name]}
+        if not means:
+            continue
+        sorted_acts = sorted(means.keys(), key=lambda activation: means[activation], reverse=(task_name not in lower_is_better_tasks))
+        best_per_task[task_name] = sorted_acts[0]
+        second_best_per_task[task_name] = sorted_acts[1] if len(sorted_acts) > 1 else None
+
+    lines = [
+        r"% ===== Auto-Generated Publication LaTeX Benchmark Table =====",
+        r"\begin{table*}[t]",
+        r"\centering",
+        r"\small",
+        r"\begin{tabular}{l" + "c" * len(tasks) + r"}",
+        r"\toprule",
+        "Activation & " + " & ".join([f"\\textbf{{{task.replace('_', ' ').title()}}}" for task in tasks]) + r" \\",
+        r"\midrule",
+    ]
+
+    for activation in acts:
+        formatted_act_name = activation.replace("_", "-").upper()
+        row = [f"\\texttt{{{formatted_act_name}}}"]
+        for task_name in tasks:
+            if activation in data[task_name]:
+                mean_value = data[task_name][activation]["mean"]
+                std_value = data[task_name][activation]["std"]
+                cell_str = f"{mean_value:.2f} $\\pm$ {std_value:.2f}"
+                if activation == best_per_task.get(task_name):
+                    cell_str = f"\\textbf{{{cell_str}}}"
+                elif activation == second_best_per_task.get(task_name):
+                    cell_str = f"\\underline{{{cell_str}}}"
+                row.append(cell_str)
+            else:
+                row.append("N/A")
+        lines.append(" & ".join(row) + r" \\")
+
+    lines.append(r"\midrule")
+    p_row = [r"\textit{$p$-value (Welch; $\alpha$ vs Static)}"]
+    for task_name in tasks:
+        p_val = data[task_name].get("p_value_welch_alpha_vs_static", None)
+        if p_val is not None:
+            p_row.append(f"\\textit{{p = {p_val:.4f}}}")
+        else:
+            p_row.append("N/A")
+    lines.append(" & ".join(p_row) + r" \\")
+    lines.extend([
+        r"\bottomrule",
+        r"\end{tabular}",
+        r"\caption{Empirical benchmark comparison across tasks. Best performance is in \textbf{bold}; second best is \underline{underlined}. Statistical significance is computed via Welch's $t$-test between Alpha-GoLU and GoLU Static.}",
+        r"\label{tab:benchmark_results}",
+        r"\end{table*}",
+        "",
+    ])
+    return "\n".join(lines)
+
+
+def handle_generate_paper_assets(args):
+    """Generates paper-ready tables and figures from saved benchmark artifacts."""
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    if os.path.exists(args.results_path):
+        with open(args.results_path, "r", encoding="utf-8") as handle:
+            benchmark_data = json.load(handle)
+        if isinstance(benchmark_data, dict) and benchmark_data:
+            table_path = output_dir / "benchmark_table.tex"
+            table_path.write_text(_build_benchmark_latex_table(benchmark_data), encoding="utf-8")
+            print(f"[IO] Saved benchmark LaTeX table to {table_path}")
+            plot_paper_benchmark_summary(args.results_path, str(output_dir))
+    else:
+        print(f"[Warning] Benchmark results not found at {args.results_path}")
+
+    if os.path.exists(args.overhead_root):
+        overhead_args = argparse.Namespace(overhead_root=args.overhead_root, output_path=str(output_dir / "overhead_table.tex"))
+        handle_generate_overhead_table(overhead_args)
+        plot_paper_overhead_summary(args.overhead_root, str(output_dir))
+    else:
+        print(f"[Warning] Overhead root not found at {args.overhead_root}")
+
+    plot_paper_alpha_trajectories(args.runs_root, str(output_dir), activation_name=args.activation)
+    print(f"[IO] Paper assets written to {output_dir}")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="CLI for Adaptive Alpha-GoLU Benchmark Suite & Paper Reproducibility",
@@ -601,6 +696,14 @@ def main():
     overhead_parser.add_argument("--overhead-root", type=str, default="outputs/overhead", help="Directory containing overhead JSON records")
     overhead_parser.add_argument("--output-path", type=str, default=None, help="Optional path where the LaTeX table will be written")
 
+    # Command: generate_paper_assets
+    paper_parser = subparsers.add_parser("generate_paper_assets", help="Generate paper-ready tables and figures from saved artifacts")
+    paper_parser.add_argument("--results-path", type=str, default="outputs/benchmark_results.json", help="Path to benchmark summary JSON")
+    paper_parser.add_argument("--overhead-root", type=str, default="outputs/overhead", help="Directory containing overhead JSON records")
+    paper_parser.add_argument("--runs-root", type=str, default="outputs/runs", help="Directory containing benchmark run artifacts")
+    paper_parser.add_argument("--output-dir", type=str, default="outputs/paper_assets", help="Directory where paper assets will be written")
+    paper_parser.add_argument("--activation", type=str, default="alpha_golu", choices=SUPPORTED_ACTIVATIONS, help="Activation to use when scanning trajectory plots")
+
     args = parser.parse_args()
 
     if args.command == "run":
@@ -611,6 +714,8 @@ def main():
         handle_generate_table(args)
     elif args.command == "generate_overhead_table":
         handle_generate_overhead_table(args)
+    elif args.command == "generate_paper_assets":
+        handle_generate_paper_assets(args)
     elif args.command == "preflight":
         _run_preflight_or_abort(args.data_root, args.output_root, args.min_free_gb)
     elif args.command == "prepare_data":
