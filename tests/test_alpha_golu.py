@@ -19,6 +19,7 @@ class TestAlphaGoLU(unittest.TestCase):
         """Verify tensor shapes are preserved across 2D, 3D, and 4D inputs."""
         layer_scalar = AlphaGoLU(num_parameters=1)
         layer_channel = AlphaGoLU(num_parameters=64)
+        layer_channels_kw = AlphaGoLU(channels=64)
 
         x_2d = torch.randn(8, 64)
         x_3d = torch.randn(8, 16, 64)
@@ -27,6 +28,8 @@ class TestAlphaGoLU(unittest.TestCase):
         self.assertEqual(layer_scalar(x_2d).shape, x_2d.shape)
         self.assertEqual(layer_channel(x_4d).shape, x_4d.shape)
         self.assertEqual(layer_channel(x_3d).shape, x_3d.shape)
+        self.assertEqual(layer_channels_kw(x_4d).shape, x_4d.shape)
+        self.assertEqual(tuple(layer_channels_kw.raw_alpha.shape), (1, 64, 1, 1))
 
     def test_gradient_flow(self):
         """Verify backpropagation reaches raw_alpha parameter."""
@@ -37,6 +40,13 @@ class TestAlphaGoLU(unittest.TestCase):
 
         self.assertIsNotNone(layer.raw_alpha.grad)
         self.assertFalse(torch.isnan(layer.raw_alpha.grad).any())
+
+    def test_alpha_clamping(self):
+        """Verify alpha can be hard-clamped to a safe interval."""
+        layer = AlphaGoLU(channels=4, init_alpha=10.0)
+        layer.clamp_alpha_(0.2, 3.0)
+        self.assertGreaterEqual(layer.get_alpha_val().min().item(), 0.2)
+        self.assertLessEqual(layer.get_alpha_val().max().item(), 3.0)
 
     def test_init_alpha_round_trip(self):
         """Verify init_alpha maps back to alpha≈1.0 through inverse softplus."""

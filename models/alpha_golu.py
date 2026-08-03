@@ -58,16 +58,22 @@ class AlphaGoLU(nn.Module):
         AlphaGoLU(x) = x * exp(-exp(-alpha * x))
         where alpha = softplus(raw_alpha) > 0
     """
-    def __init__(self, num_parameters: int = 1, init_alpha: float = 1.0):
+    def __init__(self, num_parameters: int = 1, init_alpha: float = 1.0, channels: int | None = None):
         super().__init__()
-        self.num_parameters = num_parameters
+        self.channels = channels
+        self.num_parameters = channels if channels is not None else num_parameters
         
         init_val = float(init_alpha)
         init_raw = math.log(math.expm1(init_val)) if init_val < 20 else init_val
-        
-        self.raw_alpha = nn.Parameter(
-            torch.full((num_parameters,), init_raw, dtype=torch.float32)
-        )
+
+        if channels is not None:
+            alpha_shape = (1, channels, 1, 1)
+        elif num_parameters == 1:
+            alpha_shape = (1,)
+        else:
+            alpha_shape = (num_parameters,)
+
+        self.raw_alpha = nn.Parameter(torch.full(alpha_shape, init_raw, dtype=torch.float32))
 
     @property
     def alpha(self) -> torch.Tensor:
@@ -77,7 +83,16 @@ class AlphaGoLU(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         current_alpha = self.alpha
 
-        if self.num_parameters > 1:
+        if self.channels is not None:
+            if x.dim() == 4:
+                alpha_param = current_alpha
+            elif x.dim() == 3:
+                alpha_param = current_alpha.view(1, 1, -1)
+            elif x.dim() == 2:
+                alpha_param = current_alpha.view(1, -1)
+            else:
+                alpha_param = current_alpha.view(-1)
+        elif self.num_parameters > 1:
             if x.dim() == 4:     # CNN Feature Map (B, C, H, W)
                 shape = (1, -1, 1, 1)
             elif x.dim() == 3:   # Transformer Sequence (B, L, C)
@@ -96,8 +111,16 @@ class AlphaGoLU(nn.Module):
         """Returns the current alpha parameter tensor for tracking/logging."""
         return self.alpha.detach()
 
+    def clamp_alpha_(self, min_alpha: float = 0.2, max_alpha: float = 3.0) -> None:
+        """Hard-clamps the underlying alpha tensor while preserving the parameterization."""
+        min_raw = math.log(math.expm1(min_alpha)) if min_alpha < 20 else min_alpha
+        max_raw = math.log(math.expm1(max_alpha)) if max_alpha < 20 else max_alpha
+        self.raw_alpha.data.clamp_(min_raw, max_raw)
+
     def extra_repr(self) -> str:
         current_a = self.alpha.detach()
+        if self.channels is not None:
+            return f"channels={self.channels}, mean_alpha={current_a.mean().item():.4f}"
         if self.num_parameters == 1:
             return f"num_parameters=1, current_alpha={current_a.item():.4f}"
         return f"num_parameters={self.num_parameters}, mean_alpha={current_a.mean().item():.4f}"
