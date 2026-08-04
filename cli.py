@@ -391,7 +391,7 @@ def handle_run_all(args):
                     continue
 
                 alpha_lr = task_alpha_lrs.get(task_name)
-                acc = runner_fn(act, seed=seed, data_root=data_root, alpha_lr=alpha_lr)
+                acc = runner_fn(act, seed=seed, data_root=data_root, alpha_lr=alpha_lr, save_artifacts=args.save_artifacts)
                 accs.append(acc)
                 print(f"Seed {seed} -> Score: {acc:.4f}")
 
@@ -706,6 +706,7 @@ def main():
     run_all_parser.add_argument("--config", type=str, default=None, help="Path to a JSON benchmark config file")
     run_all_parser.add_argument("--data-root", type=str, default="./data", help="Dataset cache root used when config does not specify one")
     run_all_parser.add_argument("--min-free-gb", type=float, default=20.0, help="Minimum free disk space required before launching")
+    run_all_parser.add_argument("--save-artifacts", action="store_true", help="Save per-seed run JSONs, manifests, and trajectory plots")
 
     # Command: preflight
     preflight_parser = subparsers.add_parser("preflight", help="Run environment and storage checks before a long benchmark run")

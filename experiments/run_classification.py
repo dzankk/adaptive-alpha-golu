@@ -526,9 +526,9 @@ def run_benchmark(dataset_name: str = "cifar10", seeds: list = [42, 123, 999, 20
         print(f"\nStatistical Significance (Alpha-GoLU vs Static GoLU p-value): {p_val:.4f}")
 
 
-def train_and_eval(activation: str = 'alpha_golu', seed: int = 42, dataset_name: str = 'cifar10', epochs: int = 10, data_root: str = './data', alpha_lr: float | None = None, val_split: float = 0.1, alpha_lr_scheduler: str = "none", alpha_layout: str = "channel", config_path: str | None = "configs/paper_benchmark.json") -> float:
+def train_and_eval(activation: str = 'alpha_golu', seed: int = 42, dataset_name: str = 'cifar10', epochs: int = 10, data_root: str = './data', alpha_lr: float | None = None, val_split: float = 0.1, alpha_lr_scheduler: str = "none", alpha_layout: str = "channel", config_path: str | None = "configs/paper_benchmark.json", save_artifacts: bool = False) -> float:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    acc, _ = train_single_seed(act_type=activation, dataset_name=dataset_name, seed=seed, epochs=epochs, device=device, data_root=data_root, alpha_lr=alpha_lr, val_split=val_split, eval_split="test", alpha_lr_scheduler=alpha_lr_scheduler, alpha_layout=alpha_layout, config_path=config_path, save_artifacts=False)
+    acc, _ = train_single_seed(act_type=activation, dataset_name=dataset_name, seed=seed, epochs=epochs, device=device, data_root=data_root, alpha_lr=alpha_lr, val_split=val_split, eval_split="test", alpha_lr_scheduler=alpha_lr_scheduler, alpha_layout=alpha_layout, config_path=config_path, save_artifacts=save_artifacts)
     return float(acc)
 
 
