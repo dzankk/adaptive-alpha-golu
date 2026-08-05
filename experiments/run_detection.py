@@ -390,7 +390,8 @@ def train_single_seed_detection(
     train_dataset, eval_dataset = random_split(full_dataset, [train_length, eval_length], generator=generator)
 
     loader_g = torch.Generator().manual_seed(seed)
-    loader_kwargs = default_loader_kwargs()
+    train_loader_kwargs = default_loader_kwargs()
+    eval_loader_kwargs = default_loader_kwargs(num_workers=1)
     train_loader = DataLoader(
         train_dataset,
         batch_size=8,
@@ -398,7 +399,7 @@ def train_single_seed_detection(
         collate_fn=detection_collate_fn,
         worker_init_fn=seed_worker,
         generator=loader_g,
-        **loader_kwargs,
+        **train_loader_kwargs,
     )
     eval_loader = DataLoader(
         eval_dataset,
@@ -407,7 +408,7 @@ def train_single_seed_detection(
         collate_fn=detection_collate_fn,
         worker_init_fn=seed_worker,
         generator=loader_g,
-        **loader_kwargs,
+        **eval_loader_kwargs,
     )
 
     model = build_detection_model(act_type=act_type, num_classes=len(VOC_CLASSES) + 1).to(device)

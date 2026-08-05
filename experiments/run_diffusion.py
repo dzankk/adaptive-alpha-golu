@@ -157,14 +157,15 @@ def train_single_seed_diffusion(act_type: str, seed: int, epochs: int, device: t
     loader_g = torch.Generator().manual_seed(seed)
     eval_g = torch.Generator().manual_seed(seed + 999)
 
-    loader_kwargs = default_loader_kwargs()
+    train_loader_kwargs = default_loader_kwargs()
+    test_loader_kwargs = default_loader_kwargs(num_workers=1)
     trainloader = DataLoader(
         full_dataset,
         batch_size=128,
         shuffle=True,
         worker_init_fn=lambda worker_id: np.random.seed((seed + worker_id) % 2**32),
         generator=loader_g,
-        **loader_kwargs,
+        **train_loader_kwargs,
     )
     testloader = DataLoader(
         test_dataset,
@@ -172,7 +173,7 @@ def train_single_seed_diffusion(act_type: str, seed: int, epochs: int, device: t
         shuffle=False,
         worker_init_fn=lambda worker_id: np.random.seed((seed + 999 + worker_id) % 2**32),
         generator=eval_g,
-        **loader_kwargs,
+        **test_loader_kwargs,
     )
 
     timesteps = 1000

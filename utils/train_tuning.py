@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import os
 from contextlib import nullcontext
+from pathlib import Path
 from typing import Callable
 
 import torch
@@ -151,20 +152,36 @@ def configure_benchmark_runtime() -> None:
         torch.backends.cuda.matmul.allow_tf32 = True
 
 
+def _shared_memory_free_mb() -> float | None:
+    shm_path = Path("/dev/shm")
+    if not shm_path.exists():
+        return None
+    try:
+        usage = os.statvfs(str(shm_path))
+    except OSError:
+        return None
+    return (usage.f_bavail * usage.f_frsize) / (1024 ** 2)
+
+
 def default_loader_kwargs(num_workers: int | None = None) -> dict[str, object]:
     cpu_count = os.cpu_count() or 4
+    force_fast = os.environ.get("ADAPTIVE_ALPHA_GOLU_FORCE_FAST_LOADERS", "").strip().lower() in {"1", "true", "yes", "on"}
+    shared_memory_free_mb = _shared_memory_free_mb()
+    low_shm = not force_fast and shared_memory_free_mb is not None and shared_memory_free_mb < 1024.0
 
     if num_workers is None:
-        if torch.cuda.is_available():
+        if low_shm:
+            num_workers = 0
+        elif torch.cuda.is_available():
             num_workers = max(1, cpu_count - 1)
         else:
             num_workers = max(1, cpu_count // 2)
 
     kwargs: dict[str, object] = {
         "num_workers": int(num_workers),
-        "pin_memory": bool(torch.cuda.is_available()),
+        "pin_memory": bool(torch.cuda.is_available() and not low_shm),
     }
     if int(num_workers) > 0:
         kwargs["persistent_workers"] = True
-        kwargs["prefetch_factor"] = 4
+        kwargs["prefetch_factor"] = 4 if not low_shm else 2
     return kwargs

@@ -217,9 +217,10 @@ def train_single_seed_segmentation(act_type: str, seed: int, epochs: int, device
     val_ds = val_dataset
 
     loader_g = torch.Generator().manual_seed(seed)
-    loader_kwargs = default_loader_kwargs()
-    train_loader = DataLoader(train_ds, batch_size=8, shuffle=True, generator=loader_g, **loader_kwargs)
-    val_loader = DataLoader(val_ds, batch_size=8, shuffle=False, generator=loader_g, **loader_kwargs)
+    train_loader_kwargs = default_loader_kwargs()
+    val_loader_kwargs = default_loader_kwargs(num_workers=1)
+    train_loader = DataLoader(train_ds, batch_size=8, shuffle=True, generator=loader_g, **train_loader_kwargs)
+    val_loader = DataLoader(val_ds, batch_size=8, shuffle=False, generator=loader_g, **val_loader_kwargs)
 
     model = UNet(act_type=act_type, num_classes=VOC_SEG_CLASSES).to(device)
     overhead_tracker = OverheadTracker(task_name="segmentation", activation_name=act_type, model=model, device=device)

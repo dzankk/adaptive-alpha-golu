@@ -267,14 +267,15 @@ def train_single_seed_robustness(
     testset = torchvision.datasets.CIFAR10(root=data_root, train=False, download=True, transform=transform_test)
 
     loader_g = torch.Generator().manual_seed(seed)
-    loader_kwargs = default_loader_kwargs()
+    train_loader_kwargs = default_loader_kwargs()
+    test_loader_kwargs = default_loader_kwargs(num_workers=1)
     train_loader = DataLoader(
         trainset,
         batch_size=128,
         shuffle=True,
         worker_init_fn=seed_worker,
         generator=loader_g,
-        **loader_kwargs,
+        **train_loader_kwargs,
     )
     test_loader = DataLoader(
         testset,
@@ -282,7 +283,7 @@ def train_single_seed_robustness(
         shuffle=False,
         worker_init_fn=seed_worker,
         generator=loader_g,
-        **loader_kwargs,
+        **test_loader_kwargs,
     )
 
     model = ResNet18(act_type=act_type).to(device)

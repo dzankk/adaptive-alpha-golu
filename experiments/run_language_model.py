@@ -272,7 +272,8 @@ def build_language_model_dataloaders(
     valid_dataset = BlockDataset(valid_ids, block_size=block_size)
 
     loader_g = torch.Generator().manual_seed(seed)
-    loader_kwargs = default_loader_kwargs()
+    train_loader_kwargs = default_loader_kwargs()
+    valid_loader_kwargs = default_loader_kwargs(num_workers=1)
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
@@ -280,7 +281,7 @@ def build_language_model_dataloaders(
         generator=loader_g,
         worker_init_fn=seed_worker,
         collate_fn=collate_blocks,
-        **loader_kwargs,
+        **train_loader_kwargs,
     )
     valid_loader = DataLoader(
         valid_dataset,
@@ -289,7 +290,7 @@ def build_language_model_dataloaders(
         generator=loader_g,
         worker_init_fn=seed_worker,
         collate_fn=collate_blocks,
-        **loader_kwargs,
+        **valid_loader_kwargs,
     )
     return train_loader, valid_loader, vocab
 
