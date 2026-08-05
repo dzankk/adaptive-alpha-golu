@@ -165,17 +165,17 @@ def _shared_memory_free_mb() -> float | None:
 
 def default_loader_kwargs(num_workers: int | None = None) -> dict[str, object]:
     cpu_count = os.cpu_count() or 4
-    force_fast = os.environ.get("ADAPTIVE_ALPHA_GOLU_FORCE_FAST_LOADERS", "").strip().lower() in {"1", "true", "yes", "on"}
     shared_memory_free_mb = _shared_memory_free_mb()
-    low_shm = not force_fast and shared_memory_free_mb is not None and shared_memory_free_mb < 1024.0
+    low_shm = shared_memory_free_mb is not None and shared_memory_free_mb < 1024.0
 
     if num_workers is None:
         if low_shm:
             num_workers = 0
-        elif torch.cuda.is_available():
-            num_workers = max(1, cpu_count - 1)
+        elif not torch.cuda.is_available() and os.name == "nt":
+            num_workers = 0
         else:
-            num_workers = max(1, cpu_count // 2)
+            num_workers = min(8, max(2, cpu_count // 2)) if torch.cuda.is_available() else 2
+            num_workers = min(num_workers, max(1, cpu_count // 2))
 
     kwargs: dict[str, object] = {
         "num_workers": int(num_workers),
