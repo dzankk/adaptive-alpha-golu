@@ -208,7 +208,8 @@ def get_dataloaders(
     include_test: bool = True,
 ):
     dataset_name_lower = str(dataset_name).lower().strip()
-    loader_kwargs = default_loader_kwargs()
+    train_loader_kwargs = default_loader_kwargs()
+    eval_loader_kwargs = default_loader_kwargs(num_workers=1)
 
     g = torch.Generator()
     g.manual_seed(seed)
@@ -250,7 +251,7 @@ def get_dataloaders(
         shuffle=True, 
         worker_init_fn=seed_worker,
         generator=g,
-        **loader_kwargs,
+        **train_loader_kwargs,
     )
     valloader = None
     if valset is not None:
@@ -260,7 +261,7 @@ def get_dataloaders(
             shuffle=False,
             worker_init_fn=seed_worker,
             generator=g,
-            **loader_kwargs,
+            **eval_loader_kwargs,
         )
 
     testloader = None
@@ -271,7 +272,7 @@ def get_dataloaders(
             shuffle=False,
             worker_init_fn=seed_worker,
             generator=g,
-            **loader_kwargs,
+            **eval_loader_kwargs,
         )
     return trainloader, valloader, testloader
 
