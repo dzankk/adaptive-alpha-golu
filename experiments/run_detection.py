@@ -285,24 +285,24 @@ def evaluate_map50(
                 batch_images = [image.to(device) for image in images]
                 predictions = model(batch_images)
 
-            for batch_index, target in enumerate(targets):
-                image_id = int(target["image_id"].item())
-                gt_boxes = target["boxes"]
-                gt_labels = target["labels"]
+                for batch_index, target in enumerate(targets):
+                    image_id = int(target["image_id"].item())
+                    gt_boxes = target["boxes"]
+                    gt_labels = target["labels"]
 
-                for gt_box, gt_label in zip(gt_boxes, gt_labels):
-                    ground_truth_by_class[int(gt_label.item())][image_id].append(gt_box.clone())
+                    for gt_box, gt_label in zip(gt_boxes, gt_labels):
+                        ground_truth_by_class[int(gt_label.item())][image_id].append(gt_box.clone())
 
-                prediction = predictions[batch_index]
-                keep = prediction["scores"] >= score_thresh
-                prediction = {
-                    "boxes": prediction["boxes"][keep].detach().cpu(),
-                    "scores": prediction["scores"][keep].detach().cpu(),
-                    "labels": prediction["labels"][keep].detach().cpu(),
-                }
+                    prediction = predictions[batch_index]
+                    keep = prediction["scores"] >= score_thresh
+                    prediction = {
+                        "boxes": prediction["boxes"][keep].detach().cpu(),
+                        "scores": prediction["scores"][keep].detach().cpu(),
+                        "labels": prediction["labels"][keep].detach().cpu(),
+                    }
 
-                for box, score, label in zip(prediction["boxes"], prediction["scores"], prediction["labels"]):
-                    detections_by_class[int(label.item())].append((float(score.item()), image_id, box.detach().cpu()))
+                    for box, score, label in zip(prediction["boxes"], prediction["scores"], prediction["labels"]):
+                        detections_by_class[int(label.item())].append((float(score.item()), image_id, box.detach().cpu()))
 
     ap_values = []
     for class_index in range(1, len(VOC_CLASSES) + 1):
