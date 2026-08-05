@@ -28,7 +28,7 @@ from models.alpha_golu import AlphaGoLU as AdaptiveAlphaGoLU, StaticGoLU
 from diagnostics.trajectory_logger import AlphaTrajectoryLogger
 from utils.overhead_tracker import OverheadTracker
 from utils.run_artifacts import build_run_manifest, create_run_directory, write_json
-from utils.train_tuning import bf16_autocast, build_adamw_with_activation_groups, clip_activation_gradients, default_loader_kwargs, resolve_task_alpha_hparams
+from utils.train_tuning import bf16_autocast, build_adamw_with_activation_groups, clip_activation_gradients, configure_benchmark_runtime, default_loader_kwargs, resolve_task_alpha_hparams
 
 
 # ==========================================
@@ -200,8 +200,7 @@ def set_seed(seed: int):
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
+    configure_benchmark_runtime()
 
 
 def train_single_seed_segmentation(act_type: str, seed: int, epochs: int, device: torch.device, data_root: str = './data', alpha_lr: float | None = None, config_path: str | None = "configs/paper_benchmark.json", amp: bool = False) -> float:

@@ -38,7 +38,7 @@ from models.alpha_golu import AlphaGoLU as AdaptiveAlphaGoLU, StaticGoLU
 from diagnostics.trajectory_logger import AlphaTrajectoryLogger
 from utils.run_artifacts import build_run_manifest, create_run_directory, write_json
 from utils.overhead_tracker import OverheadTracker
-from utils.train_tuning import bf16_autocast, build_adamw_with_activation_groups, clip_activation_gradients, default_loader_kwargs, resolve_task_alpha_hparams
+from utils.train_tuning import bf16_autocast, build_adamw_with_activation_groups, clip_activation_gradients, configure_benchmark_runtime, default_loader_kwargs, resolve_task_alpha_hparams
 
 
 VOC_CLASSES = [
@@ -55,8 +55,7 @@ def set_seed(seed: int):
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
+    configure_benchmark_runtime()
 
 
 def seed_worker(worker_id: int):
@@ -391,7 +390,7 @@ def train_single_seed_detection(
     train_dataset, eval_dataset = random_split(full_dataset, [train_length, eval_length], generator=generator)
 
     loader_g = torch.Generator().manual_seed(seed)
-    loader_kwargs = default_loader_kwargs(num_workers=2)
+    loader_kwargs = default_loader_kwargs()
     train_loader = DataLoader(
         train_dataset,
         batch_size=8,

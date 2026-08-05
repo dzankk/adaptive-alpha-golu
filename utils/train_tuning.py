@@ -137,13 +137,21 @@ def bf16_autocast(enabled: bool):
     return nullcontext()
 
 
+def configure_benchmark_runtime() -> None:
+    if not torch.cuda.is_available():
+        return
+
+    torch.backends.cudnn.deterministic = False
+    torch.backends.cudnn.benchmark = True
+
+
 def default_loader_kwargs(num_workers: int | None = None) -> dict[str, object]:
     cpu_count = os.cpu_count() or 4
     if num_workers is None:
         if not torch.cuda.is_available() and os.name == "nt":
             num_workers = 0
         else:
-            num_workers = 4 if torch.cuda.is_available() else 2
+            num_workers = min(8, max(2, cpu_count // 2)) if torch.cuda.is_available() else 2
             num_workers = min(num_workers, max(1, cpu_count // 2))
 
     kwargs: dict[str, object] = {
