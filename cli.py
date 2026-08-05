@@ -373,8 +373,8 @@ def handle_run(args):
     print(f"[IO] Saved run artifacts to {run_dir}")
 
 
-def handle_run_all(args):
-    """Runs all benchmark tasks across selected activations and seeds."""
+def handle_run_all(args, summary_only: bool = False):
+    """Runs benchmark tasks across selected activations and seeds."""
     config = load_benchmark_config(args.config) if args.config else {}
     seeds = args.seeds if args.seeds != DEFAULT_SEEDS else config.get("seeds", DEFAULT_SEEDS)
     activations = args.activations if args.activations != CANONICAL_ACTIVATIONS else config.get("activations", CANONICAL_ACTIVATIONS)
@@ -399,18 +399,22 @@ def handle_run_all(args):
     if args.config:
         print(f"[Config] Loaded benchmark config from {args.config}")
 
-    resume_path = _resume_state_path(
-        output_root,
-        "full_suite",
-        {"tasks": selected_tasks, "activations": activations, "seeds": seeds, "config": args.config, "amp": bool(args.amp)},
-    )
-    if args.fresh and resume_path.exists():
-        try:
-            resume_path.unlink()
-        except OSError:
-            pass
-    resume_state = {} if args.fresh else _load_json_file(resume_path)
-    all_task_results = resume_state.get("all_task_results", {}) if isinstance(resume_state.get("all_task_results", {}), dict) else {}
+    resume_path = None
+    if not summary_only:
+        resume_path = _resume_state_path(
+            output_root,
+            "full_suite",
+            {"tasks": selected_tasks, "activations": activations, "seeds": seeds, "config": args.config, "amp": bool(args.amp)},
+        )
+        if args.fresh and resume_path.exists():
+            try:
+                resume_path.unlink()
+            except OSError:
+                pass
+        resume_state = {} if args.fresh else _load_json_file(resume_path)
+        all_task_results = resume_state.get("all_task_results", {}) if isinstance(resume_state.get("all_task_results", {}), dict) else {}
+    else:
+        all_task_results = {}
 
     os.makedirs(os.path.dirname(summary_path) or ".", exist_ok=True)
 
@@ -446,16 +450,17 @@ def handle_run_all(args):
                     "sem": stats["sem"],
                 }
                 all_task_results[task_name] = task_results
-                _save_json_file(
-                    resume_path,
-                    {
-                        "tasks": selected_tasks,
-                        "activations": activations,
-                        "seeds": seeds,
-                        "all_task_results": all_task_results,
-                        "updated_utc": datetime.now(timezone.utc).isoformat(),
-                    },
-                )
+                if resume_path is not None:
+                    _save_json_file(
+                        resume_path,
+                        {
+                            "tasks": selected_tasks,
+                            "activations": activations,
+                            "seeds": seeds,
+                            "all_task_results": all_task_results,
+                            "updated_utc": datetime.now(timezone.utc).isoformat(),
+                        },
+                    )
             
             stats = compute_summary_statistics(accs)
             task_results[act] = {
@@ -478,35 +483,48 @@ def handle_run_all(args):
     json_path = summary_path
     with open(json_path, "w") as f:
         json.dump(all_task_results, f, indent=4)
-    run_dir = create_run_directory(output_root, task="full_suite", activation="all", seeds=seeds)
-    write_json(run_dir / "benchmark_results.json", all_task_results)
-    if args.config:
-        write_json(run_dir / "config.json", config)
-    write_json(
-        run_dir / "run_manifest.json",
-        build_run_manifest(
-            command="run_all",
-            task="full_suite",
-            seeds=seeds,
-            activations=activations,
-            extra_config={
-                "activations": activations,
-                "tasks": selected_tasks,
-                "summary_path": summary_path,
-                "output_root": output_root,
+    run_dir = None
+    if not summary_only:
+        run_dir = create_run_directory(output_root, task="full_suite", activation="all", seeds=seeds)
+        write_json(run_dir / "benchmark_results.json", all_task_results)
+        if args.config:
+            write_json(run_dir / "config.json", config)
+        write_json(
+            run_dir / "run_manifest.json",
+            build_run_manifest(
+                command="run_all",
+                task="full_suite",
+                seeds=seeds,
+                activations=activations,
+                extra_config={
+                    "activations": activations,
+                    "tasks": selected_tasks,
+                    "summary_path": summary_path,
+                    "output_root": output_root,
                     "amp": bool(args.amp),
-                **({"config_path": args.config} if args.config else {}),
-            },
-        ),
-    )
-    if resume_path.exists():
-        try:
-            resume_path.unlink()
-        except OSError:
-            pass
+                    **({"config_path": args.config} if args.config else {}),
+                },
+            ),
+        )
+        if resume_path is not None and resume_path.exists():
+            try:
+                resume_path.unlink()
+            except OSError:
+                pass
     print(f"\n[IO] Saved benchmark JSON summary to {json_path}")
-    print(f"[IO] Saved full-suite run artifacts to {run_dir}")
+    if run_dir is not None:
+        print(f"[IO] Saved full-suite run artifacts to {run_dir}")
     print("\n================ All Experiments Completed Successfully! ================")
+
+
+def handle_smoke_run(args):
+    """Runs a lightweight publication smoke test with static vs Alpha-GoLU only."""
+    args.tasks = list(TASK_MAP.keys())
+    args.activations = ["golu_static", "alpha_golu"]
+    args.seeds = [42, 123]
+    args.save_artifacts = False
+    args.amp = bool(args.amp)
+    handle_run_all(args, summary_only=True)
 
 
 def handle_generate_table(args):
@@ -838,6 +856,13 @@ def main():
     run_all_parser.add_argument("--amp", action="store_true", help="Enable BF16 automatic mixed precision on CUDA")
     run_all_parser.add_argument("--fresh", action="store_true", help="Ignore any saved resume state and start this run from scratch")
 
+    # Command: smoke_run
+    smoke_parser = subparsers.add_parser("smoke_run", help="Run a fast static-vs-Alpha-GoLU smoke benchmark across all tasks")
+    smoke_parser.add_argument("--config", type=str, default="configs/paper_benchmark_alpha_lr_2e3.json", help="Benchmark config file used for task alpha hyperparameters")
+    smoke_parser.add_argument("--data-root", type=str, default="./data", help="Dataset cache root used when config does not specify one")
+    smoke_parser.add_argument("--min-free-gb", type=float, default=20.0, help="Minimum free disk space required before launching")
+    smoke_parser.add_argument("--amp", action="store_true", help="Enable BF16 automatic mixed precision on CUDA")
+
     # Command: preflight
     preflight_parser = subparsers.add_parser("preflight", help="Run environment and storage checks before a long benchmark run")
     preflight_parser.add_argument("--data-root", type=str, default="./data", help="Dataset cache root to check")
@@ -885,6 +910,8 @@ def main():
         handle_run(args)
     elif args.command == "run_all":
         handle_run_all(args)
+    elif args.command == "smoke_run":
+        handle_smoke_run(args)
     elif args.command == "generate_table":
         handle_generate_table(args)
     elif args.command == "generate_overhead_table":
