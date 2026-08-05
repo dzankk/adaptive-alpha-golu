@@ -133,7 +133,7 @@ def clip_activation_gradients(model: nn.Module, max_norm: float = 1.0) -> float:
 
 def bf16_autocast(enabled: bool):
     if enabled and torch.cuda.is_available():
-        return torch.cuda.amp.autocast(dtype=torch.bfloat16)
+        return torch.amp.autocast("cuda", dtype=torch.bfloat16)
     return nullcontext()
 
 
