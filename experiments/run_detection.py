@@ -38,7 +38,7 @@ from models.alpha_golu import AlphaGoLU as AdaptiveAlphaGoLU, StaticGoLU
 from diagnostics.trajectory_logger import AlphaTrajectoryLogger
 from utils.run_artifacts import build_run_manifest, create_run_directory, write_json
 from utils.overhead_tracker import OverheadTracker
-from utils.train_tuning import build_adamw_with_activation_groups, clip_activation_gradients, default_loader_kwargs, resolve_task_alpha_hparams
+from utils.train_tuning import bf16_autocast, build_adamw_with_activation_groups, clip_activation_gradients, default_loader_kwargs, resolve_task_alpha_hparams
 
 
 VOC_CLASSES = [
@@ -272,6 +272,7 @@ def evaluate_map50(
     dataloader: DataLoader,
     device: torch.device,
     score_thresh: float = 0.05,
+    amp_enabled: bool = False,
 ) -> float:
     model.eval()
 
@@ -279,9 +280,10 @@ def evaluate_map50(
     ground_truth_by_class: Dict[int, Dict[int, List[torch.Tensor]]] = defaultdict(lambda: defaultdict(list))
 
     with torch.no_grad():
-        for images, targets in dataloader:
-            batch_images = [image.to(device) for image in images]
-            predictions = model(batch_images)
+        with bf16_autocast(amp_enabled):
+            for images, targets in dataloader:
+                batch_images = [image.to(device) for image in images]
+                predictions = model(batch_images)
 
             for batch_index, target in enumerate(targets):
                 image_id = int(target["image_id"].item())
@@ -363,6 +365,7 @@ def train_single_seed_detection(
     max_train_samples: int | None = None,
     max_eval_samples: int | None = None,
     save_artifacts: bool = False,
+    amp: bool = False,
 ) -> float:
     set_seed(seed)
 
@@ -427,6 +430,7 @@ def train_single_seed_detection(
     alpha_logger = AlphaTrajectoryLogger(model)
     train_start = time.perf_counter()
     epoch_seconds = []
+    amp_enabled = bool(amp) and torch.cuda.is_available() and device.type == "cuda"
 
     for epoch in range(epochs):
         epoch_start = time.perf_counter()
@@ -444,9 +448,10 @@ def train_single_seed_detection(
             ]
 
             overhead_tracker.start_forward()
-            loss_dict = model(images, targets)
+            with bf16_autocast(amp_enabled):
+                loss_dict = model(images, targets)
             overhead_tracker.end_forward(batch_size=len(images))
-            loss = sum(loss_value for loss_value in loss_dict.values())
+            loss = sum(loss_value.float() for loss_value in loss_dict.values())
             optimizer.zero_grad()
             overhead_tracker.start_backward()
             loss.backward()
@@ -459,7 +464,7 @@ def train_single_seed_detection(
 
     train_seconds = time.perf_counter() - train_start
 
-    map50 = evaluate_map50(model, eval_loader, device=device)
+    map50 = evaluate_map50(model, eval_loader, device=device, amp_enabled=amp_enabled)
     overhead = overhead_tracker.save()
 
     if save_artifacts:
@@ -520,7 +525,7 @@ def train_single_seed_detection(
     return float(map50)
 
 
-def run_detection_benchmark(seeds: list[int] | None = None, epochs: int = 8, lr: float = 2e-4, alpha_lr: float | None = None, data_root: str = "./data", config_path: str | None = "configs/paper_benchmark.json"):
+def run_detection_benchmark(seeds: list[int] | None = None, epochs: int = 8, lr: float = 2e-4, alpha_lr: float | None = None, data_root: str = "./data", config_path: str | None = "configs/paper_benchmark.json", amp: bool = False):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Running Pascal VOC 2012 Detection Benchmark on {device}")
     activations = ["relu", "gelu", "swish", "prelu", "pgelu", "golu_static", "alpha_golu", "swish_adaptive"]
@@ -539,6 +544,7 @@ def run_detection_benchmark(seeds: list[int] | None = None, epochs: int = 8, lr:
                 alpha_lr=alpha_lr,
                 config_path=config_path,
                 save_artifacts=True,
+                amp=amp,
             )
             print(f"Seed {seed} -> VOC mAP@0.5: {map50:.4f}")
 
@@ -554,6 +560,7 @@ def train_and_eval(
     max_eval_samples: int | None = None,
     config_path: str | None = "configs/paper_benchmark.json",
     save_artifacts: bool = False,
+    amp: bool = False,
 ) -> float:
     """Returns VOC mAP@0.5 on a held-out Pascal VOC validation split."""
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -569,6 +576,7 @@ def train_and_eval(
         max_train_samples=max_train_samples,
         max_eval_samples=max_eval_samples,
         save_artifacts=save_artifacts,
+        amp=amp,
     )
     return float(map50)
 
@@ -585,10 +593,11 @@ if __name__ == "__main__":
     parser.add_argument("--max-eval-samples", type=int, default=None, help="Optional cap on evaluation samples for quick smoke runs")
     parser.add_argument("--config", type=str, default="configs/paper_benchmark.json", help="Benchmark config file used for task alpha hyperparameters")
     parser.add_argument("--benchmark", action="store_true", help="Run the full activation sweep benchmark")
+    parser.add_argument("--amp", action="store_true", help="Enable BF16 automatic mixed precision on CUDA")
     args = parser.parse_args()
 
     if args.benchmark:
-        run_detection_benchmark(seeds=args.seeds, epochs=args.epochs, lr=args.lr, alpha_lr=args.alpha_lr, data_root=args.data_root, config_path=args.config)
+        run_detection_benchmark(seeds=args.seeds, epochs=args.epochs, lr=args.lr, alpha_lr=args.alpha_lr, data_root=args.data_root, config_path=args.config, amp=args.amp)
     else:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"Running Pascal VOC 2012 Detection Benchmark on {device}")
@@ -604,5 +613,6 @@ if __name__ == "__main__":
                 max_eval_samples=args.max_eval_samples,
                 config_path=args.config,
                 save_artifacts=True,
+                amp=args.amp,
             )
             print(f"Activation: {args.activation.ljust(15)} | Seed {seed} | VOC mAP@0.5: {map50:.4f}")

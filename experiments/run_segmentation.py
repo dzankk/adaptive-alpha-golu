@@ -28,7 +28,7 @@ from models.alpha_golu import AlphaGoLU as AdaptiveAlphaGoLU, StaticGoLU
 from diagnostics.trajectory_logger import AlphaTrajectoryLogger
 from utils.overhead_tracker import OverheadTracker
 from utils.run_artifacts import build_run_manifest, create_run_directory, write_json
-from utils.train_tuning import build_adamw_with_activation_groups, clip_activation_gradients, default_loader_kwargs, resolve_task_alpha_hparams
+from utils.train_tuning import bf16_autocast, build_adamw_with_activation_groups, clip_activation_gradients, default_loader_kwargs, resolve_task_alpha_hparams
 
 
 # ==========================================
@@ -204,7 +204,7 @@ def set_seed(seed: int):
     torch.backends.cudnn.benchmark = False
 
 
-def train_single_seed_segmentation(act_type: str, seed: int, epochs: int, device: torch.device, data_root: str = './data', alpha_lr: float | None = None, config_path: str | None = "configs/paper_benchmark.json") -> float:
+def train_single_seed_segmentation(act_type: str, seed: int, epochs: int, device: torch.device, data_root: str = './data', alpha_lr: float | None = None, config_path: str | None = "configs/paper_benchmark.json", amp: bool = False) -> float:
     set_seed(seed)
     
     full_dataset = PascalVOCSegmentationDataset(root=data_root, year='2012', image_set='train', image_size=256, download=True)
@@ -234,6 +234,7 @@ def train_single_seed_segmentation(act_type: str, seed: int, epochs: int, device
     criterion = nn.CrossEntropyLoss(ignore_index=255)
     epoch_seconds = []
     train_start = time.perf_counter()
+    amp_enabled = bool(amp) and torch.cuda.is_available() and device.type == "cuda"
 
     for epoch in range(epochs):
         epoch_start = time.perf_counter()
@@ -243,9 +244,10 @@ def train_single_seed_segmentation(act_type: str, seed: int, epochs: int, device
             x, y = x.to(device), y.to(device)
             optimizer.zero_grad()
             overhead_tracker.start_forward()
-            out = model(x)
+            with bf16_autocast(amp_enabled):
+                out = model(x)
             overhead_tracker.end_forward(batch_size=x.size(0))
-            loss = criterion(out, y)
+            loss = criterion(out.float(), y)
             overhead_tracker.start_backward()
             loss.backward()
             overhead_tracker.end_backward()
@@ -261,12 +263,13 @@ def train_single_seed_segmentation(act_type: str, seed: int, epochs: int, device
     total_iou = 0.0
     total_samples = 0
     with torch.no_grad():
-        for x, y in val_loader:
-            x, y = x.to(device), y.to(device)
-            out = model(x)
-            batch_size = x.size(0)
-            total_iou += compute_mIoU(out, y, num_classes=VOC_SEG_CLASSES) * batch_size
-            total_samples += batch_size
+        with bf16_autocast(amp_enabled):
+            for x, y in val_loader:
+                x, y = x.to(device), y.to(device)
+                out = model(x)
+                batch_size = x.size(0)
+                total_iou += compute_mIoU(out.float(), y, num_classes=VOC_SEG_CLASSES) * batch_size
+                total_samples += batch_size
 
     miou = total_iou / total_samples if total_samples > 0 else 0.0
 
@@ -308,7 +311,7 @@ def train_single_seed_segmentation(act_type: str, seed: int, epochs: int, device
     return miou
 
 
-def run_segmentation_benchmark(seeds=None, epochs=10, data_root: str = './data', alpha_lr: float | None = None, config_path: str | None = "configs/paper_benchmark.json"):
+def run_segmentation_benchmark(seeds=None, epochs=10, data_root: str = './data', alpha_lr: float | None = None, config_path: str | None = "configs/paper_benchmark.json", amp: bool = False):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     seeds = seeds or [42, 123, 999, 2024, 2025]
     print(f"Running Segmentation Benchmark on {device} (N={len(seeds)})")
@@ -317,16 +320,16 @@ def run_segmentation_benchmark(seeds=None, epochs=10, data_root: str = './data',
     for act_type in activations:
         scores = []
         for s in seeds:
-            miou = train_single_seed_segmentation(act_type=act_type, seed=s, epochs=epochs, device=device, data_root=data_root, alpha_lr=alpha_lr, config_path=config_path)
+            miou = train_single_seed_segmentation(act_type=act_type, seed=s, epochs=epochs, device=device, data_root=data_root, alpha_lr=alpha_lr, config_path=config_path, amp=amp)
             scores.append(miou)
             print(f"Activation: {act_type.ljust(15)} | Seed {s} | Validation mIoU: {miou:.4f}")
         print(f"--> {act_type.upper()} Mean mIoU: {np.mean(scores):.4f} ± {np.std(scores):.4f}\n")
 
 
-def train_and_eval(activation: str = 'alpha_golu', seed: int = 42, epochs: int = 10, data_root: str = './data', alpha_lr: float | None = None, config_path: str | None = "configs/paper_benchmark.json", save_artifacts: bool = False) -> float:
+def train_and_eval(activation: str = 'alpha_golu', seed: int = 42, epochs: int = 10, data_root: str = './data', alpha_lr: float | None = None, config_path: str | None = "configs/paper_benchmark.json", save_artifacts: bool = False, amp: bool = False) -> float:
     """Returns Mean Intersection over Union (mIoU)."""
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    miou = train_single_seed_segmentation(act_type=activation, seed=seed, epochs=epochs, device=device, data_root=data_root, alpha_lr=alpha_lr, config_path=config_path, save_artifacts=save_artifacts)
+    miou = train_single_seed_segmentation(act_type=activation, seed=seed, epochs=epochs, device=device, data_root=data_root, alpha_lr=alpha_lr, config_path=config_path, save_artifacts=save_artifacts, amp=amp)
     return float(miou)
 
 
@@ -341,13 +344,14 @@ if __name__ == '__main__':
     parser.add_argument("--alpha-lr", type=float, default=None, help="Learning rate for activation parameters; defaults to configs/paper_benchmark.json")
     parser.add_argument("--config", type=str, default="configs/paper_benchmark.json", help="Benchmark config file used for task alpha hyperparameters")
     parser.add_argument("--benchmark", action="store_true", help="Run the full activation sweep")
+    parser.add_argument("--amp", action="store_true", help="Enable BF16 automatic mixed precision on CUDA")
     args = parser.parse_args()
 
     if args.benchmark:
-        run_segmentation_benchmark(seeds=args.seeds, epochs=args.epochs, data_root=args.data_root, alpha_lr=args.alpha_lr, config_path=args.config)
+        run_segmentation_benchmark(seeds=args.seeds, epochs=args.epochs, data_root=args.data_root, alpha_lr=args.alpha_lr, config_path=args.config, amp=args.amp)
     else:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"Running Segmentation Benchmark on {device} (N={len(args.seeds)})")
         for seed in args.seeds:
-            miou = train_and_eval(activation=args.activation, seed=seed, epochs=args.epochs, data_root=args.data_root, alpha_lr=args.alpha_lr, config_path=args.config)
+            miou = train_and_eval(activation=args.activation, seed=seed, epochs=args.epochs, data_root=args.data_root, alpha_lr=args.alpha_lr, config_path=args.config, amp=args.amp)
             print(f"Activation: {args.activation.ljust(15)} | Seed {seed} | Validation mIoU: {miou:.4f}")

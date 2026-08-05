@@ -28,7 +28,7 @@ from diagnostics.trajectory_logger import AlphaTrajectoryLogger
 from models.alpha_golu import AlphaGoLU as AdaptiveAlphaGoLU, StaticGoLU
 from utils.run_artifacts import build_run_manifest, create_run_directory, write_json
 from utils.overhead_tracker import OverheadTracker
-from utils.train_tuning import build_adamw_with_activation_groups, clip_activation_gradients, default_loader_kwargs, resolve_task_alpha_hparams
+from utils.train_tuning import bf16_autocast, build_adamw_with_activation_groups, clip_activation_gradients, default_loader_kwargs, resolve_task_alpha_hparams
 
 
 def reset_all_seeds(seed=42):
@@ -249,6 +249,7 @@ def train_single_seed_robustness(
     alpha_lr: float | None = None,
     config_path: str | None = "configs/paper_benchmark.json",
     save_artifacts: bool = False,
+    amp: bool = False,
 ) -> tuple[float, float]:
     reset_all_seeds(seed)
     
@@ -297,6 +298,7 @@ def train_single_seed_robustness(
     alpha_logger = AlphaTrajectoryLogger(model)
     epoch_seconds = []
     train_start = time.perf_counter()
+    amp_enabled = bool(amp) and torch.cuda.is_available() and device.type == "cuda"
 
     for epoch in range(epochs):
         epoch_start = time.perf_counter()
@@ -306,9 +308,10 @@ def train_single_seed_robustness(
             inputs, targets = inputs.to(device), targets.to(device)
             optimizer.zero_grad()
             overhead_tracker.start_forward()
-            outputs = model(inputs)
+            with bf16_autocast(amp_enabled):
+                outputs = model(inputs)
             overhead_tracker.end_forward(batch_size=inputs.size(0))
-            loss = criterion(outputs, targets)
+            loss = criterion(outputs.float(), targets)
             overhead_tracker.start_backward()
             loss.backward()
             overhead_tracker.end_backward()
@@ -326,13 +329,15 @@ def train_single_seed_robustness(
         images, labels = images.to(device), labels.to(device)
 
         with torch.no_grad():
-            clean_correct += (model(images).argmax(1) == labels).sum().item()
+            with bf16_autocast(amp_enabled):
+                clean_correct += (model(images).argmax(1) == labels).sum().item()
 
         with torch.enable_grad():
             adv_pgd = pgd_attack(model, images, labels)
 
         with torch.no_grad():
-            pgd_correct += (model(adv_pgd).argmax(1) == labels).sum().item()
+            with bf16_autocast(amp_enabled):
+                pgd_correct += (model(adv_pgd).argmax(1) == labels).sum().item()
 
         total += labels.size(0)
 
@@ -386,7 +391,7 @@ def train_single_seed_robustness(
             alpha_logger.plot_trajectories(str(run_dir / "alpha_trajectories.png"))
 
     return clean_acc, pgd_acc
-def run_benchmark(seeds=None, epochs: int = 10, data_root: str = './data'):
+def run_benchmark(seeds=None, epochs: int = 10, data_root: str = './data', amp: bool = False):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Running Full Adversarial Robustness Benchmark on {device}")
     activations = ['relu', 'gelu', 'swish', 'prelu', 'pgelu', 'golu_static', 'alpha_golu', 'swish_adaptive']
@@ -402,11 +407,12 @@ def run_benchmark(seeds=None, epochs: int = 10, data_root: str = './data'):
                 device=device,
                 data_root=data_root,
                 save_artifacts=True,
+                amp=amp,
             )
             print(f"Seed {seed} -> Clean Acc: {clean_acc:.2f}% | PGD-10 Robust Acc: {pgd_acc:.2f}%")
 
 
-def train_and_eval(activation: str = 'alpha_golu', seed: int = 42, epochs: int = 10, data_root: str = './data', alpha_lr: float | None = None, save_artifacts: bool = False) -> float:
+def train_and_eval(activation: str = 'alpha_golu', seed: int = 42, epochs: int = 10, data_root: str = './data', alpha_lr: float | None = None, save_artifacts: bool = False, amp: bool = False) -> float:
     """Returns Robust Accuracy under PGD attack."""
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     _, robust_acc = train_single_seed_robustness(
@@ -418,6 +424,7 @@ def train_and_eval(activation: str = 'alpha_golu', seed: int = 42, epochs: int =
         alpha_lr=alpha_lr,
         config_path="configs/paper_benchmark.json",
         save_artifacts=save_artifacts,
+        amp=amp,
     )
     return float(robust_acc)
 
@@ -433,10 +440,11 @@ if __name__ == '__main__':
     parser.add_argument("--alpha-lr", type=float, default=None, help="Learning rate for activation parameters; defaults to configs/paper_benchmark.json")
     parser.add_argument("--config", type=str, default="configs/paper_benchmark.json", help="Benchmark config file used for task alpha hyperparameters")
     parser.add_argument("--benchmark", action="store_true", help="Run the full activation sweep")
+    parser.add_argument("--amp", action="store_true", help="Enable BF16 automatic mixed precision on CUDA")
     args = parser.parse_args()
 
     if args.benchmark:
-        run_benchmark(seeds=args.seeds, epochs=args.epochs, data_root=args.data_root)
+        run_benchmark(seeds=args.seeds, epochs=args.epochs, data_root=args.data_root, amp=args.amp)
     else:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"Running Adversarial Robustness Benchmark on {device}")
@@ -449,5 +457,6 @@ if __name__ == '__main__':
                 alpha_lr=args.alpha_lr,
                 config_path=args.config,
                 save_artifacts=True,
+                amp=args.amp,
             )
             print(f"Activation: {args.activation.ljust(15)} | Seed {seed} | PGD-10 Robust Acc: {robust_acc:.2f}%")

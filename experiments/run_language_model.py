@@ -32,7 +32,7 @@ from models.alpha_golu import AlphaGoLU as AdaptiveAlphaGoLU, StaticGoLU
 from diagnostics.trajectory_logger import AlphaTrajectoryLogger
 from utils.run_artifacts import build_run_manifest, create_run_directory, write_json
 from utils.overhead_tracker import OverheadTracker
-from utils.train_tuning import build_adamw_with_activation_groups, clip_activation_gradients, default_loader_kwargs, resolve_task_alpha_hparams
+from utils.train_tuning import bf16_autocast, build_adamw_with_activation_groups, clip_activation_gradients, default_loader_kwargs, resolve_task_alpha_hparams
 
 
 WIKITEXT2_URLS = {
@@ -306,6 +306,7 @@ def train_single_seed_lm(
     alpha_lr: float | None = None,
     config_path: str | None = "configs/paper_benchmark.json",
     save_artifacts: bool = False,
+    amp: bool = False,
 ) -> float:
     reset_all_seeds(seed)
 
@@ -329,6 +330,7 @@ def train_single_seed_lm(
     alpha_logger = AlphaTrajectoryLogger(model)
     train_start = time.perf_counter()
     epoch_seconds = []
+    amp_enabled = bool(amp) and torch.cuda.is_available() and "cuda" in str(device)
 
     for epoch in range(epochs):
         epoch_start = time.perf_counter()
@@ -338,9 +340,10 @@ def train_single_seed_lm(
             batch = batch.to(device)
             inputs, targets = batch[:, :-1], batch[:, 1:]
             overhead_tracker.start_forward()
-            logits = model(inputs)
+            with bf16_autocast(amp_enabled):
+                logits = model(inputs)
             overhead_tracker.end_forward(batch_size=inputs.size(0))
-            loss = criterion(logits.reshape(-1, len(vocab)), targets.reshape(-1))
+            loss = criterion(logits.float().reshape(-1, len(vocab)), targets.reshape(-1))
 
             optimizer.zero_grad()
             overhead_tracker.start_backward()
@@ -356,13 +359,14 @@ def train_single_seed_lm(
     total_loss = 0.0
     total_tokens = 0
     with torch.no_grad():
-        for batch in valid_loader:
-            batch = batch.to(device)
-            inputs, targets = batch[:, :-1], batch[:, 1:]
-            logits = model(inputs)
-            loss = criterion(logits.reshape(-1, len(vocab)), targets.reshape(-1))
-            total_loss += float(loss.item()) * targets.numel()
-            total_tokens += targets.numel()
+        with bf16_autocast(amp_enabled):
+            for batch in valid_loader:
+                batch = batch.to(device)
+                inputs, targets = batch[:, :-1], batch[:, 1:]
+                logits = model(inputs)
+                loss = criterion(logits.float().reshape(-1, len(vocab)), targets.reshape(-1))
+                total_loss += float(loss.item()) * targets.numel()
+                total_tokens += targets.numel()
 
     avg_loss = total_loss / max(total_tokens, 1)
     perplexity = math.exp(min(avg_loss, 20.0))
@@ -416,7 +420,7 @@ def train_single_seed_lm(
     return float(perplexity)
 
 
-def run_lm_benchmark(seeds=None, epochs=5, data_root: str = "./data", alpha_lr: float | None = None, config_path: str | None = "configs/paper_benchmark.json"):
+def run_lm_benchmark(seeds=None, epochs=5, data_root: str = "./data", alpha_lr: float | None = None, config_path: str | None = "configs/paper_benchmark.json", amp: bool = False):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     seeds = seeds or [42, 123, 999, 2024, 2025]
     print(f"Running WikiText-2 Language Model Benchmark on {device}...")
@@ -426,17 +430,17 @@ def run_lm_benchmark(seeds=None, epochs=5, data_root: str = "./data", alpha_lr: 
     for act_type in activations:
         ppls = []
         for s in seeds:
-            ppl = train_single_seed_lm(act_type=act_type, seed=s, epochs=epochs, device=device, data_root=data_root, alpha_lr=alpha_lr, config_path=config_path, save_artifacts=True)
+            ppl = train_single_seed_lm(act_type=act_type, seed=s, epochs=epochs, device=device, data_root=data_root, alpha_lr=alpha_lr, config_path=config_path, save_artifacts=True, amp=amp)
             ppls.append(ppl)
             print(f"[{act_type.upper():<14} | Seed {s}] Validation Perplexity: {ppl:.2f}")
 
         print(f"  --> {act_type.upper():<14} Mean PPL: {np.mean(ppls):.2f} ± {np.std(ppls):.2f}\n")
 
 
-def train_and_eval(activation: str = "alpha_golu", seed: int = 42, epochs: int = 5, data_root: str = "./data", alpha_lr: float | None = None, config_path: str | None = "configs/paper_benchmark.json", save_artifacts: bool = False) -> float:
+def train_and_eval(activation: str = "alpha_golu", seed: int = 42, epochs: int = 5, data_root: str = "./data", alpha_lr: float | None = None, config_path: str | None = "configs/paper_benchmark.json", save_artifacts: bool = False, amp: bool = False) -> float:
     """Returns validation perplexity on WikiText-2."""
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    perplexity = train_single_seed_lm(act_type=activation, seed=seed, epochs=epochs, device=device, data_root=data_root, alpha_lr=alpha_lr, config_path=config_path, save_artifacts=save_artifacts)
+    perplexity = train_single_seed_lm(act_type=activation, seed=seed, epochs=epochs, device=device, data_root=data_root, alpha_lr=alpha_lr, config_path=config_path, save_artifacts=save_artifacts, amp=amp)
     return float(perplexity)
 
 
@@ -451,13 +455,14 @@ if __name__ == "__main__":
     parser.add_argument("--alpha-lr", type=float, default=None, help="Learning rate for language-model activation parameters; defaults to configs/paper_benchmark.json")
     parser.add_argument("--config", type=str, default="configs/paper_benchmark.json", help="Benchmark config file used for task alpha hyperparameters")
     parser.add_argument("--benchmark", action="store_true", help="Run the full activation sweep")
+    parser.add_argument("--amp", action="store_true", help="Enable BF16 automatic mixed precision on CUDA")
     args = parser.parse_args()
 
     if args.benchmark:
-        run_lm_benchmark(seeds=args.seeds, epochs=args.epochs, data_root=args.data_root, alpha_lr=args.alpha_lr, config_path=args.config)
+        run_lm_benchmark(seeds=args.seeds, epochs=args.epochs, data_root=args.data_root, alpha_lr=args.alpha_lr, config_path=args.config, amp=args.amp)
     else:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"Running WikiText-2 Language Model Benchmark on {device}...")
         for seed in args.seeds:
-            ppl = train_and_eval(activation=args.activation, seed=seed, epochs=args.epochs, data_root=args.data_root, alpha_lr=args.alpha_lr, config_path=args.config)
+            ppl = train_and_eval(activation=args.activation, seed=seed, epochs=args.epochs, data_root=args.data_root, alpha_lr=args.alpha_lr, config_path=args.config, amp=args.amp)
             print(f"[{args.activation.upper():<14} | Seed {seed}] Validation Perplexity: {ppl:.2f}")

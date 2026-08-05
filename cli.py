@@ -295,7 +295,7 @@ def handle_run(args):
             continue
 
         print(f"\n---> Running Seed: {seed}")
-        metric = TASK_MAP[task](act, seed=seed, data_root=args.data_root, alpha_lr=task_alpha_lr, save_artifacts=args.save_artifacts)
+        metric = TASK_MAP[task](act, seed=seed, data_root=args.data_root, alpha_lr=task_alpha_lr, save_artifacts=args.save_artifacts, amp=args.amp)
         results.append(metric)
         print(f"Seed {seed} Output Metric: {metric:.4f}")
         saved_scores[seed_key] = metric
@@ -305,6 +305,7 @@ def handle_run(args):
                 "task": task,
                 "activation": act,
                 "seeds": seeds,
+                "amp": bool(args.amp),
                 "scores": saved_scores,
                 "updated_utc": datetime.now(timezone.utc).isoformat(),
             },
@@ -319,7 +320,7 @@ def handle_run(args):
             task=task,
             seeds=seeds,
             activations=[act],
-            extra_config={"activation": act},
+            extra_config={"activation": act, "amp": bool(args.amp)},
         ),
     )
     write_json(
@@ -366,7 +367,7 @@ def handle_run_all(args):
     resume_path = _resume_state_path(
         output_root,
         "full_suite",
-        {"tasks": selected_tasks, "activations": activations, "seeds": seeds, "config": args.config},
+        {"tasks": selected_tasks, "activations": activations, "seeds": seeds, "config": args.config, "amp": bool(args.amp)},
     )
     resume_state = _load_json_file(resume_path)
     all_task_results = resume_state.get("all_task_results", {}) if isinstance(resume_state.get("all_task_results", {}), dict) else {}
@@ -391,7 +392,7 @@ def handle_run_all(args):
                     continue
 
                 alpha_lr = task_alpha_lrs.get(task_name)
-                acc = runner_fn(act, seed=seed, data_root=data_root, alpha_lr=alpha_lr, save_artifacts=args.save_artifacts)
+                acc = runner_fn(act, seed=seed, data_root=data_root, alpha_lr=alpha_lr, save_artifacts=args.save_artifacts, amp=args.amp)
                 accs.append(acc)
                 print(f"Seed {seed} -> Score: {acc:.4f}")
 
@@ -453,6 +454,7 @@ def handle_run_all(args):
                 "tasks": selected_tasks,
                 "summary_path": summary_path,
                 "output_root": output_root,
+                    "amp": bool(args.amp),
                 **({"config_path": args.config} if args.config else {}),
             },
         ),
@@ -692,6 +694,7 @@ def main():
     run_parser.add_argument("--output-root", type=str, default="outputs/runs", help="Output root used for preflight checks")
     run_parser.add_argument("--min-free-gb", type=float, default=20.0, help="Minimum free disk space required before launching")
     run_parser.add_argument("--save-artifacts", action="store_true", help="Save per-seed run JSONs, manifests, and trajectory plots")
+    run_parser.add_argument("--amp", action="store_true", help="Enable BF16 automatic mixed precision on CUDA")
 
     # Command: run_all
     run_all_parser = subparsers.add_parser("run_all", help="Reproduce all paper tables across all tasks")
@@ -708,6 +711,7 @@ def main():
     run_all_parser.add_argument("--data-root", type=str, default="./data", help="Dataset cache root used when config does not specify one")
     run_all_parser.add_argument("--min-free-gb", type=float, default=20.0, help="Minimum free disk space required before launching")
     run_all_parser.add_argument("--save-artifacts", action="store_true", help="Save per-seed run JSONs, manifests, and trajectory plots")
+    run_all_parser.add_argument("--amp", action="store_true", help="Enable BF16 automatic mixed precision on CUDA")
 
     # Command: preflight
     preflight_parser = subparsers.add_parser("preflight", help="Run environment and storage checks before a long benchmark run")

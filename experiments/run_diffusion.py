@@ -27,7 +27,7 @@ from models.alpha_golu import AlphaGoLU as AdaptiveAlphaGoLU, StaticGoLU
 from diagnostics.trajectory_logger import AlphaTrajectoryLogger
 from utils.overhead_tracker import OverheadTracker
 from utils.run_artifacts import build_run_manifest, create_run_directory, write_json
-from utils.train_tuning import build_adamw_with_activation_groups, clip_activation_gradients, default_loader_kwargs, resolve_task_alpha_hparams
+from utils.train_tuning import bf16_autocast, build_adamw_with_activation_groups, clip_activation_gradients, default_loader_kwargs, resolve_task_alpha_hparams
 
 
 def reset_seeds(seed=42):
@@ -142,7 +142,7 @@ def get_optimizer(model: nn.Module, lr: float = 2e-4, alpha_lr: float | None = N
     )
 
 
-def train_single_seed_diffusion(act_type: str, seed: int, epochs: int, device: torch.device, data_root: str = './data', alpha_lr: float | None = None, config_path: str | None = "configs/paper_benchmark.json") -> float:
+def train_single_seed_diffusion(act_type: str, seed: int, epochs: int, device: torch.device, data_root: str = './data', alpha_lr: float | None = None, config_path: str | None = "configs/paper_benchmark.json", amp: bool = False) -> float:
     reset_seeds(seed)
 
     transform = transforms.Compose([
@@ -193,6 +193,7 @@ def train_single_seed_diffusion(act_type: str, seed: int, epochs: int, device: t
     criterion = nn.MSELoss()
     epoch_seconds = []
     train_start = time.perf_counter()
+    amp_enabled = bool(amp) and torch.cuda.is_available() and device.type == "cuda"
 
     # Complete Epoch Training Run
     for epoch in range(epochs):
@@ -208,9 +209,10 @@ def train_single_seed_diffusion(act_type: str, seed: int, epochs: int, device: t
             xt = torch.sqrt(a_hat_t) * x0 + torch.sqrt(1 - a_hat_t) * noise
 
             overhead_tracker.start_forward()
-            predicted_noise = model(xt, t)
+            with bf16_autocast(amp_enabled):
+                predicted_noise = model(xt, t)
             overhead_tracker.end_forward(batch_size=x0.size(0))
-            loss = criterion(predicted_noise, noise)
+            loss = criterion(predicted_noise.float(), noise)
 
             optimizer.zero_grad()
             overhead_tracker.start_backward()
@@ -228,20 +230,21 @@ def train_single_seed_diffusion(act_type: str, seed: int, epochs: int, device: t
     total_examples = 0
 
     with torch.no_grad():
-        for x0, _ in testloader:
-            x0 = x0.to(device)
-            t = torch.randint(0, timesteps, (x0.size(0),), device=device, generator=eval_g).long()
-            noise = torch.randn(x0.shape, device=device, generator=eval_g)
+        with bf16_autocast(amp_enabled):
+            for x0, _ in testloader:
+                x0 = x0.to(device)
+                t = torch.randint(0, timesteps, (x0.size(0),), device=device, generator=eval_g).long()
+                noise = torch.randn(x0.shape, device=device, generator=eval_g)
 
-            a_hat_t = alpha_hat[t][:, None, None, None]
-            xt = torch.sqrt(a_hat_t) * x0 + torch.sqrt(1 - a_hat_t) * noise
+                a_hat_t = alpha_hat[t][:, None, None, None]
+                xt = torch.sqrt(a_hat_t) * x0 + torch.sqrt(1 - a_hat_t) * noise
 
-            pred_noise = model(xt, t)
-            batch_loss = criterion(pred_noise, noise).item()
-            batch_size = x0.size(0)
-            val_losses.append(batch_loss)
-            total_loss += batch_loss * batch_size
-            total_examples += batch_size
+                pred_noise = model(xt, t)
+                batch_loss = criterion(pred_noise.float(), noise).item()
+                batch_size = x0.size(0)
+                val_losses.append(batch_loss)
+                total_loss += batch_loss * batch_size
+                total_examples += batch_size
 
     overhead = overhead_tracker.save()
     loss = float(total_loss / total_examples) if total_examples > 0 else float(np.mean(val_losses)) if val_losses else 0.0
@@ -283,7 +286,7 @@ def train_single_seed_diffusion(act_type: str, seed: int, epochs: int, device: t
     return loss
 
 
-def run_diffusion_benchmark(seeds=None, epochs: int = 10, data_root: str = './data', alpha_lr: float | None = None, config_path: str | None = "configs/paper_benchmark.json"):
+def run_diffusion_benchmark(seeds=None, epochs: int = 10, data_root: str = './data', alpha_lr: float | None = None, config_path: str | None = "configs/paper_benchmark.json", amp: bool = False):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Running CelebA DDPM Diffusion Benchmark on {device}...")
 
@@ -295,7 +298,7 @@ def run_diffusion_benchmark(seeds=None, epochs: int = 10, data_root: str = './da
     for act in activations:
         seed_losses = []
         for s in seeds:
-            mean_val = train_single_seed_diffusion(act_type=act, seed=s, epochs=epochs, device=device, data_root=data_root, alpha_lr=alpha_lr, config_path=config_path)
+            mean_val = train_single_seed_diffusion(act_type=act, seed=s, epochs=epochs, device=device, data_root=data_root, alpha_lr=alpha_lr, config_path=config_path, amp=amp)
             seed_losses.append(mean_val)
             print(f"[{act.upper():<14} | Seed {s}] Denoising MSE: {mean_val:.6f}")
 
@@ -306,10 +309,10 @@ def run_diffusion_benchmark(seeds=None, epochs: int = 10, data_root: str = './da
         print(f"  {act.upper():<14}: Loss = {m_loss:.6f} ± {s_loss:.6f}")
 
 
-def train_and_eval(activation: str = 'alpha_golu', seed: int = 42, epochs: int = 10, data_root: str = './data', alpha_lr: float | None = None, config_path: str | None = "configs/paper_benchmark.json", save_artifacts: bool = False) -> float:
+def train_and_eval(activation: str = 'alpha_golu', seed: int = 42, epochs: int = 10, data_root: str = './data', alpha_lr: float | None = None, config_path: str | None = "configs/paper_benchmark.json", save_artifacts: bool = False, amp: bool = False) -> float:
     """Returns Denoising Test MSE Loss."""
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    loss = train_single_seed_diffusion(act_type=activation, seed=seed, epochs=epochs, device=device, data_root=data_root, alpha_lr=alpha_lr, config_path=config_path, save_artifacts=save_artifacts)
+    loss = train_single_seed_diffusion(act_type=activation, seed=seed, epochs=epochs, device=device, data_root=data_root, alpha_lr=alpha_lr, config_path=config_path, save_artifacts=save_artifacts, amp=amp)
     return float(loss)
 
 
@@ -324,13 +327,14 @@ if __name__ == '__main__':
     parser.add_argument("--alpha-lr", type=float, default=None, help="Learning rate for activation parameters; defaults to configs/paper_benchmark.json")
     parser.add_argument("--config", type=str, default="configs/paper_benchmark.json", help="Benchmark config file used for task alpha hyperparameters")
     parser.add_argument("--benchmark", action="store_true", help="Run the full activation sweep")
+    parser.add_argument("--amp", action="store_true", help="Enable BF16 automatic mixed precision on CUDA")
     args = parser.parse_args()
 
     if args.benchmark:
-        run_diffusion_benchmark(seeds=args.seeds, epochs=args.epochs, data_root=args.data_root, alpha_lr=args.alpha_lr, config_path=args.config)
+        run_diffusion_benchmark(seeds=args.seeds, epochs=args.epochs, data_root=args.data_root, alpha_lr=args.alpha_lr, config_path=args.config, amp=args.amp)
     else:
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         print(f"Running CelebA DDPM Diffusion Benchmark on {device}...")
         for seed in args.seeds:
-            loss = train_and_eval(activation=args.activation, seed=seed, epochs=args.epochs, data_root=args.data_root, alpha_lr=args.alpha_lr, config_path=args.config)
+            loss = train_and_eval(activation=args.activation, seed=seed, epochs=args.epochs, data_root=args.data_root, alpha_lr=args.alpha_lr, config_path=args.config, amp=args.amp)
             print(f"Activation: {args.activation.ljust(15)} | Seed {seed} | Denoising MSE: {loss:.6f}")

@@ -10,6 +10,7 @@ Provides:
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 import os
 from typing import Callable
 
@@ -128,6 +129,12 @@ def clip_activation_gradients(model: nn.Module, max_norm: float = 1.0) -> float:
     if not activation_params:
         return 0.0
     return float(torch.nn.utils.clip_grad_norm_(activation_params, max_norm=max_norm))
+
+
+def bf16_autocast(enabled: bool):
+    if enabled and torch.cuda.is_available():
+        return torch.cuda.amp.autocast(dtype=torch.bfloat16)
+    return nullcontext()
 
 
 def default_loader_kwargs(num_workers: int | None = None) -> dict[str, object]:

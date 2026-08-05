@@ -30,7 +30,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from models.alpha_golu import AlphaGoLU as AdaptiveAlphaGoLU, StaticGoLU
 from diagnostics.trajectory_logger import AlphaTrajectoryLogger
-from utils.train_tuning import build_adamw_with_activation_groups, clip_activation_gradients, default_loader_kwargs, resolve_task_alpha_hparams
+from utils.train_tuning import bf16_autocast, build_adamw_with_activation_groups, clip_activation_gradients, default_loader_kwargs, resolve_task_alpha_hparams
 
 
 # ==========================================
@@ -277,21 +277,22 @@ def get_dataloaders(
     return trainloader, valloader, testloader
 
 
-def evaluate_model(model: nn.Module, loader: DataLoader, device: torch.device) -> tuple[float, float]:
+def evaluate_model(model: nn.Module, loader: DataLoader, device: torch.device, amp_enabled: bool = False) -> tuple[float, float]:
     criterion = nn.CrossEntropyLoss()
     total_loss = 0.0
     correct, total = 0, 0
     model.eval()
     with torch.no_grad():
-        for inputs, labels in loader:
-            inputs, labels = inputs.to(device), labels.to(device)
-            outputs = model(inputs)
-            loss = criterion(outputs, labels)
-            batch_size = labels.size(0)
-            total_loss += float(loss.item()) * batch_size
-            _, predicted = torch.max(outputs.data, 1)
-            total += batch_size
-            correct += (predicted == labels).sum().item()
+        with bf16_autocast(amp_enabled):
+            for inputs, labels in loader:
+                inputs, labels = inputs.to(device), labels.to(device)
+                outputs = model(inputs)
+                loss = criterion(outputs.float(), labels)
+                batch_size = labels.size(0)
+                total_loss += float(loss.item()) * batch_size
+                _, predicted = torch.max(outputs.data, 1)
+                total += batch_size
+                correct += (predicted == labels).sum().item()
 
     avg_loss = total_loss / max(total, 1)
     accuracy = 100.0 * correct / max(total, 1)
@@ -342,6 +343,7 @@ def train_single_seed(
     alpha_layout: str = "channel",
     config_path: str | None = "configs/paper_benchmark.json",
     save_artifacts: bool = False,
+    amp: bool = False,
     return_metrics: bool = False,
 ):
     reset_all_seeds(seed)
@@ -370,6 +372,7 @@ def train_single_seed(
 
     if torch.cuda.is_available():
         torch.cuda.reset_peak_memory_stats(device)
+    amp_enabled = bool(amp) and torch.cuda.is_available() and device.type == "cuda"
 
     def update_alpha_lr(epoch_index: int) -> float:
         if not act_params:
@@ -393,9 +396,10 @@ def train_single_seed(
             inputs, labels = inputs.to(device), labels.to(device)
             optimizer.zero_grad()
             overhead_tracker.start_forward()
-            outputs = model(inputs)
+            with bf16_autocast(amp_enabled):
+                outputs = model(inputs)
             overhead_tracker.end_forward(batch_size=inputs.size(0))
-            loss = nn.CrossEntropyLoss()(outputs, labels)
+            loss = nn.CrossEntropyLoss()(outputs.float(), labels)
             overhead_tracker.start_backward()
             loss.backward()
             overhead_tracker.end_backward()
@@ -417,7 +421,7 @@ def train_single_seed(
     if eval_loader is None:
         raise ValueError("Evaluation loader is not available for the requested eval_split")
 
-    eval_loss, acc = evaluate_model(model, eval_loader, device)
+    eval_loss, acc = evaluate_model(model, eval_loader, device, amp_enabled=amp_enabled)
     alphas = model.extract_alphas()
     overhead = overhead_tracker.save()
 
@@ -484,7 +488,7 @@ def train_single_seed(
     return acc, alphas
 
 
-def run_benchmark(dataset_name: str = "cifar10", seeds: list = [42, 123, 999, 2024, 2025], epochs: int = 10, data_root: str = "./data", alpha_lr: float | None = None, val_split: float = 0.1, alpha_lr_scheduler: str = "none", alpha_layout: str = "channel", config_path: str | None = "configs/paper_benchmark.json"):
+def run_benchmark(dataset_name: str = "cifar10", seeds: list = [42, 123, 999, 2024, 2025], epochs: int = 10, data_root: str = "./data", alpha_lr: float | None = None, val_split: float = 0.1, alpha_lr_scheduler: str = "none", alpha_layout: str = "channel", config_path: str | None = "configs/paper_benchmark.json", amp: bool = False):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     activations = ['relu', 'gelu', 'swish', 'adaptive_swish', 'prelu', 'pgelu', 'golu_static', 'alpha_golu']
     results = {act: [] for act in activations}
@@ -508,6 +512,7 @@ def run_benchmark(dataset_name: str = "cifar10", seeds: list = [42, 123, 999, 20
                 alpha_layout=alpha_layout,
                 config_path=config_path,
                 save_artifacts=True,
+                amp=amp,
             )
             results[act].append(acc)
             if 'golu' in act and alphas:
@@ -526,9 +531,9 @@ def run_benchmark(dataset_name: str = "cifar10", seeds: list = [42, 123, 999, 20
         print(f"\nStatistical Significance (Alpha-GoLU vs Static GoLU p-value): {p_val:.4f}")
 
 
-def train_and_eval(activation: str = 'alpha_golu', seed: int = 42, dataset_name: str = 'cifar10', epochs: int = 10, data_root: str = './data', alpha_lr: float | None = None, val_split: float = 0.1, alpha_lr_scheduler: str = "none", alpha_layout: str = "channel", config_path: str | None = "configs/paper_benchmark.json", save_artifacts: bool = False) -> float:
+def train_and_eval(activation: str = 'alpha_golu', seed: int = 42, dataset_name: str = 'cifar10', epochs: int = 10, data_root: str = './data', alpha_lr: float | None = None, val_split: float = 0.1, alpha_lr_scheduler: str = "none", alpha_layout: str = "channel", config_path: str | None = "configs/paper_benchmark.json", save_artifacts: bool = False, amp: bool = False) -> float:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    acc, _ = train_single_seed(act_type=activation, dataset_name=dataset_name, seed=seed, epochs=epochs, device=device, data_root=data_root, alpha_lr=alpha_lr, val_split=val_split, eval_split="test", alpha_lr_scheduler=alpha_lr_scheduler, alpha_layout=alpha_layout, config_path=config_path, save_artifacts=save_artifacts)
+    acc, _ = train_single_seed(act_type=activation, dataset_name=dataset_name, seed=seed, epochs=epochs, device=device, data_root=data_root, alpha_lr=alpha_lr, val_split=val_split, eval_split="test", alpha_lr_scheduler=alpha_lr_scheduler, alpha_layout=alpha_layout, config_path=config_path, save_artifacts=save_artifacts, amp=amp)
     return float(acc)
 
 
@@ -622,6 +627,7 @@ if __name__ == '__main__':
     parser.add_argument("--config", type=str, default="configs/paper_benchmark.json", help="Benchmark config file used for task alpha hyperparameters")
     parser.add_argument("--alpha-layout", type=str, default="channel", choices=["layer", "channel"], help="Alpha-GoLU parameter layout")
     parser.add_argument("--benchmark", action="store_true", help="Run the full benchmark sweep")
+    parser.add_argument("--amp", action="store_true", help="Enable BF16 automatic mixed precision on CUDA")
     parser.add_argument("--alpha-layout-ablation", action="store_true", help="Compare layer-wise vs channel-wise Alpha-GoLU")
     parser.add_argument("--alpha-lr-ablation", action="store_true", help="Run a compact alpha LR sweep for Alpha-GoLU only")
     args = parser.parse_args()
@@ -633,7 +639,7 @@ if __name__ == '__main__':
     elif args.benchmark:
         dataset_names = [args.dataset_name] if args.dataset_name else ["cifar10", "fashion_mnist"]
         for dataset_name in dataset_names:
-            run_benchmark(dataset_name=dataset_name, seeds=args.seeds, epochs=args.epochs, data_root=args.data_root, alpha_lr=args.alpha_lr, val_split=args.val_split, alpha_lr_scheduler=args.alpha_lr_scheduler, alpha_layout=args.alpha_layout, config_path=args.config)
+            run_benchmark(dataset_name=dataset_name, seeds=args.seeds, epochs=args.epochs, data_root=args.data_root, alpha_lr=args.alpha_lr, val_split=args.val_split, alpha_lr_scheduler=args.alpha_lr_scheduler, alpha_layout=args.alpha_layout, config_path=args.config, amp=args.amp)
     else:
         dataset_name = args.dataset_name or "cifar10"
         print(f"Running Classification Benchmark on {dataset_name.upper()}...")
@@ -652,5 +658,6 @@ if __name__ == '__main__':
                 alpha_layout=args.alpha_layout,
                 config_path=args.config,
                 save_artifacts=True,
+                amp=args.amp,
             )
             print(f"Activation: {args.activation.ljust(15)} | Seed {seed} | Accuracy: {acc:.2f}%")
