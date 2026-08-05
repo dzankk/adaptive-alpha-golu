@@ -147,6 +147,9 @@ def clamp_alpha_golu_modules(model: nn.Module, min_alpha: float = 0.2, max_alpha
             clamp_events += 1
     return clamp_events, clamp_checks
 
+def overhead_tracking_enabled() -> bool:
+    return os.getenv("ADAPTIVE_ALPHA_GOLU_TRACK_OVERHEAD", "0") == "1"
+
 
 def bf16_autocast(enabled: bool):
     if enabled and torch.cuda.is_available():

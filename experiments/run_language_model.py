@@ -33,6 +33,7 @@ from diagnostics.trajectory_logger import AlphaTrajectoryLogger
 from utils.run_artifacts import build_run_manifest, create_run_directory, write_json
 from utils.overhead_tracker import OverheadTracker
 from utils.train_tuning import bf16_autocast, build_adamw_with_activation_groups, clip_activation_gradients, clamp_alpha_golu_modules, configure_benchmark_runtime, default_loader_kwargs, resolve_task_alpha_hparams
+from utils.train_tuning import bf16_autocast, build_adamw_with_activation_groups, clip_activation_gradients, clamp_alpha_golu_modules, configure_benchmark_runtime, default_loader_kwargs, overhead_tracking_enabled, resolve_task_alpha_hparams
 
 
 WIKITEXT2_URLS = {
@@ -319,7 +320,7 @@ def train_single_seed_lm(
     )
 
     model = MiniGPT(vocab_size=len(vocab), act_type=act_type, max_seq_len=block_size).to(device)
-    overhead_tracker = OverheadTracker(task_name="language_model", activation_name=act_type, model=model, device=device)
+    overhead_tracker = OverheadTracker(task_name="language_model", activation_name=act_type, model=model, device=device) if overhead_tracking_enabled() else None
     alpha_lr, alpha_warmup_epochs, alpha_grad_clip_norm = resolve_task_alpha_hparams(
         "language_model",
         alpha_lr,
@@ -341,16 +342,20 @@ def train_single_seed_lm(
         for batch in train_loader:
             batch = batch.to(device, non_blocking=True)
             inputs, targets = batch[:, :-1], batch[:, 1:]
-            overhead_tracker.start_forward()
+            if overhead_tracker is not None:
+                overhead_tracker.start_forward()
             with bf16_autocast(amp_enabled):
                 logits = model(inputs)
-            overhead_tracker.end_forward(batch_size=inputs.size(0))
+            if overhead_tracker is not None:
+                overhead_tracker.end_forward(batch_size=inputs.size(0))
             loss = criterion(logits.float().reshape(-1, len(vocab)), targets.reshape(-1))
 
             optimizer.zero_grad()
-            overhead_tracker.start_backward()
+            if overhead_tracker is not None:
+                overhead_tracker.start_backward()
             loss.backward()
-            overhead_tracker.end_backward()
+            if overhead_tracker is not None:
+                overhead_tracker.end_backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             clip_activation_gradients(model, max_norm=alpha_grad_clip_norm)
             optimizer.step()
@@ -375,7 +380,7 @@ def train_single_seed_lm(
 
     avg_loss = total_loss / max(total_tokens, 1)
     perplexity = math.exp(min(avg_loss, 20.0))
-    overhead = overhead_tracker.save()
+    overhead = overhead_tracker.save() if overhead_tracker is not None else {}
 
     if save_artifacts:
         run_dir = create_run_directory(

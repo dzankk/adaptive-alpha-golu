@@ -1,3 +1,4 @@
+from utils.train_tuning import bf16_autocast, build_adamw_with_activation_groups, clamp_alpha_golu_modules, clip_activation_gradients, configure_benchmark_runtime, default_loader_kwargs, overhead_tracking_enabled, resolve_task_alpha_hparams
 """
 Benchmark: Consolidated Image Classification & Trajectory Analysis
 ===================================================================
@@ -350,7 +351,7 @@ def train_single_seed(
     trainloader, valloader, testloader = get_dataloaders(dataset_name, seed=seed, root=data_root, val_split=val_split, include_test=(eval_split == "test"))
     
     model = ResNet18(num_classes=10, act_type=act_type, alpha_layout=alpha_layout).to(device)
-    overhead_tracker = OverheadTracker(task_name="classification", activation_name=act_type, model=model, device=device)
+    overhead_tracker = OverheadTracker(task_name="classification", activation_name=act_type, model=model, device=device) if overhead_tracking_enabled() else None
     alpha_lr, alpha_warmup_epochs, alpha_grad_clip_norm = resolve_task_alpha_hparams(
         "classification",
         alpha_lr,
@@ -397,14 +398,18 @@ def train_single_seed(
         for inputs, labels in trainloader:
             inputs, labels = inputs.to(device, non_blocking=True), labels.to(device, non_blocking=True)
             optimizer.zero_grad()
-            overhead_tracker.start_forward()
+            if overhead_tracker is not None:
+                overhead_tracker.start_forward()
             with bf16_autocast(amp_enabled):
                 outputs = model(inputs)
-            overhead_tracker.end_forward(batch_size=inputs.size(0))
+            if overhead_tracker is not None:
+                overhead_tracker.end_forward(batch_size=inputs.size(0))
             loss = nn.CrossEntropyLoss()(outputs.float(), labels)
-            overhead_tracker.start_backward()
+            if overhead_tracker is not None:
+                overhead_tracker.start_backward()
             loss.backward()
-            overhead_tracker.end_backward()
+            if overhead_tracker is not None:
+                overhead_tracker.end_backward()
             clip_activation_gradients(model, max_norm=alpha_grad_clip_norm)
             optimizer.step()
             clamp_events, clamp_checks = clamp_alpha_golu_modules(model, min_alpha=0.2, max_alpha=3.0)
@@ -425,7 +430,7 @@ def train_single_seed(
 
     eval_loss, acc = evaluate_model(model, eval_loader, device, amp_enabled=amp_enabled)
     alphas = model.extract_alphas()
-    overhead = overhead_tracker.save()
+    overhead = overhead_tracker.save() if overhead_tracker is not None else {}
 
     if save_artifacts:
         run_dir = create_run_directory(

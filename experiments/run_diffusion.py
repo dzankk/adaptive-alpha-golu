@@ -28,6 +28,7 @@ from diagnostics.trajectory_logger import AlphaTrajectoryLogger
 from utils.overhead_tracker import OverheadTracker
 from utils.run_artifacts import build_run_manifest, create_run_directory, write_json
 from utils.train_tuning import bf16_autocast, build_adamw_with_activation_groups, clip_activation_gradients, clamp_alpha_golu_modules, configure_benchmark_runtime, default_loader_kwargs, resolve_task_alpha_hparams
+from utils.train_tuning import bf16_autocast, build_adamw_with_activation_groups, clip_activation_gradients, clamp_alpha_golu_modules, configure_benchmark_runtime, default_loader_kwargs, overhead_tracking_enabled, resolve_task_alpha_hparams
 
 
 def reset_seeds(seed=42):
@@ -182,7 +183,7 @@ def train_single_seed_diffusion(act_type: str, seed: int, epochs: int, device: t
     alpha_hat = torch.cumprod(alpha, dim=0)
 
     model = DiffusionUNet(in_channels=3, act_type=act_type).to(device)
-    overhead_tracker = OverheadTracker(task_name="diffusion", activation_name=act_type, model=model, device=device)
+    overhead_tracker = OverheadTracker(task_name="diffusion", activation_name=act_type, model=model, device=device) if overhead_tracking_enabled() else None
     alpha_logger = AlphaTrajectoryLogger(model)
     alpha_lr, alpha_warmup_epochs, alpha_grad_clip_norm = resolve_task_alpha_hparams(
         "diffusion",
@@ -210,16 +211,20 @@ def train_single_seed_diffusion(act_type: str, seed: int, epochs: int, device: t
             a_hat_t = alpha_hat[t][:, None, None, None]
             xt = torch.sqrt(a_hat_t) * x0 + torch.sqrt(1 - a_hat_t) * noise
 
-            overhead_tracker.start_forward()
+            if overhead_tracker is not None:
+                overhead_tracker.start_forward()
             with bf16_autocast(amp_enabled):
                 predicted_noise = model(xt, t)
-            overhead_tracker.end_forward(batch_size=x0.size(0))
+            if overhead_tracker is not None:
+                overhead_tracker.end_forward(batch_size=x0.size(0))
             loss = criterion(predicted_noise.float(), noise)
 
             optimizer.zero_grad()
-            overhead_tracker.start_backward()
+            if overhead_tracker is not None:
+                overhead_tracker.start_backward()
             loss.backward()
-            overhead_tracker.end_backward()
+            if overhead_tracker is not None:
+                overhead_tracker.end_backward()
             clip_activation_gradients(model, max_norm=alpha_grad_clip_norm)
             optimizer.step()
             clamp_events, clamp_checks = clamp_alpha_golu_modules(model, min_alpha=0.2, max_alpha=3.0)
@@ -251,7 +256,7 @@ def train_single_seed_diffusion(act_type: str, seed: int, epochs: int, device: t
                 total_loss += batch_loss * batch_size
                 total_examples += batch_size
 
-    overhead = overhead_tracker.save()
+    overhead = overhead_tracker.save() if overhead_tracker is not None else {}
     loss = float(total_loss / total_examples) if total_examples > 0 else float(np.mean(val_losses)) if val_losses else 0.0
 
     run_dir = create_run_directory(

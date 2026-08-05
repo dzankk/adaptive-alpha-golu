@@ -39,6 +39,7 @@ from diagnostics.trajectory_logger import AlphaTrajectoryLogger
 from utils.run_artifacts import build_run_manifest, create_run_directory, write_json
 from utils.overhead_tracker import OverheadTracker
 from utils.train_tuning import bf16_autocast, build_adamw_with_activation_groups, clip_activation_gradients, clamp_alpha_golu_modules, configure_benchmark_runtime, default_loader_kwargs, resolve_task_alpha_hparams
+from utils.train_tuning import bf16_autocast, build_adamw_with_activation_groups, clip_activation_gradients, clamp_alpha_golu_modules, configure_benchmark_runtime, default_loader_kwargs, overhead_tracking_enabled, resolve_task_alpha_hparams
 
 
 VOC_CLASSES = [
@@ -412,7 +413,7 @@ def train_single_seed_detection(
     )
 
     model = build_detection_model(act_type=act_type, num_classes=len(VOC_CLASSES) + 1).to(device)
-    overhead_tracker = OverheadTracker(task_name="detection", activation_name=act_type, model=model, device=device)
+    overhead_tracker = OverheadTracker(task_name="detection", activation_name=act_type, model=model, device=device) if overhead_tracking_enabled() else None
     alpha_lr, alpha_warmup_epochs, alpha_grad_clip_norm = resolve_task_alpha_hparams(
         "detection",
         alpha_lr,
@@ -449,15 +450,19 @@ def train_single_seed_detection(
                 for target in targets
             ]
 
-            overhead_tracker.start_forward()
+            if overhead_tracker is not None:
+                overhead_tracker.start_forward()
             with bf16_autocast(amp_enabled):
                 loss_dict = model(images, targets)
-            overhead_tracker.end_forward(batch_size=len(images))
+            if overhead_tracker is not None:
+                overhead_tracker.end_forward(batch_size=len(images))
             loss = sum(loss_value.float() for loss_value in loss_dict.values())
             optimizer.zero_grad()
-            overhead_tracker.start_backward()
+            if overhead_tracker is not None:
+                overhead_tracker.start_backward()
             loss.backward()
-            overhead_tracker.end_backward()
+            if overhead_tracker is not None:
+                overhead_tracker.end_backward()
             clip_activation_gradients(model, max_norm=alpha_grad_clip_norm)
             optimizer.step()
             clamp_events, clamp_checks = clamp_alpha_golu_modules(model, min_alpha=0.2, max_alpha=3.0)
@@ -470,7 +475,7 @@ def train_single_seed_detection(
     train_seconds = time.perf_counter() - train_start
 
     map50 = evaluate_map50(model, eval_loader, device=device, amp_enabled=amp_enabled)
-    overhead = overhead_tracker.save()
+    overhead = overhead_tracker.save() if overhead_tracker is not None else {}
 
     if save_artifacts:
         run_dir = create_run_directory(
