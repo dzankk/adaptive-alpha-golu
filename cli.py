@@ -276,7 +276,12 @@ def handle_run(args):
     task_alpha_lr = config.get("alpha_lr_by_task", {}).get(task)
     _run_preflight_or_abort(args.data_root, args.output_root, args.min_free_gb)
     resume_path = _resume_state_path(args.output_root, "single_task", {"task": task, "activation": act, "seeds": seeds})
-    resume_state = _load_json_file(resume_path)
+    if args.fresh and resume_path.exists():
+        try:
+            resume_path.unlink()
+        except OSError:
+            pass
+    resume_state = {} if args.fresh else _load_json_file(resume_path)
     saved_scores = resume_state.get("scores", {}) if isinstance(resume_state.get("scores", {}), dict) else {}
 
     if task not in TASK_MAP:
@@ -369,7 +374,12 @@ def handle_run_all(args):
         "full_suite",
         {"tasks": selected_tasks, "activations": activations, "seeds": seeds, "config": args.config, "amp": bool(args.amp)},
     )
-    resume_state = _load_json_file(resume_path)
+    if args.fresh and resume_path.exists():
+        try:
+            resume_path.unlink()
+        except OSError:
+            pass
+    resume_state = {} if args.fresh else _load_json_file(resume_path)
     all_task_results = resume_state.get("all_task_results", {}) if isinstance(resume_state.get("all_task_results", {}), dict) else {}
 
     os.makedirs(os.path.dirname(summary_path) or ".", exist_ok=True)
@@ -695,6 +705,7 @@ def main():
     run_parser.add_argument("--min-free-gb", type=float, default=20.0, help="Minimum free disk space required before launching")
     run_parser.add_argument("--save-artifacts", action="store_true", help="Save per-seed run JSONs, manifests, and trajectory plots")
     run_parser.add_argument("--amp", action="store_true", help="Enable BF16 automatic mixed precision on CUDA")
+    run_parser.add_argument("--fresh", action="store_true", help="Ignore any saved resume state and start this run from scratch")
 
     # Command: run_all
     run_all_parser = subparsers.add_parser("run_all", help="Reproduce all paper tables across all tasks")
@@ -713,6 +724,7 @@ def main():
     run_all_parser.add_argument("--min-free-gb", type=float, default=20.0, help="Minimum free disk space required before launching")
     run_all_parser.add_argument("--save-artifacts", action="store_true", help="Save per-seed run JSONs, manifests, and trajectory plots")
     run_all_parser.add_argument("--amp", action="store_true", help="Enable BF16 automatic mixed precision on CUDA")
+    run_all_parser.add_argument("--fresh", action="store_true", help="Ignore any saved resume state and start this run from scratch")
 
     # Command: preflight
     preflight_parser = subparsers.add_parser("preflight", help="Run environment and storage checks before a long benchmark run")
