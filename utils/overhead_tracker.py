@@ -8,6 +8,7 @@ and a lightweight FLOPs estimate derived from registered module hooks.
 from __future__ import annotations
 
 import json
+import os
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -69,6 +70,7 @@ class OverheadTracker:
     task_name: str
     activation_name: str
     warmup_steps: int = 10
+    enabled: bool | None = None
     model: Optional[nn.Module] = None
     device: Optional[torch.device | str] = None
     output_root: str | Path = "outputs/overhead"
@@ -88,11 +90,13 @@ class OverheadTracker:
     _hook_handles: list[Any] = field(default_factory=list)
 
     def __post_init__(self) -> None:
+        if self.enabled is None:
+            self.enabled = os.getenv("ADAPTIVE_ALPHA_GOLU_TRACK_OVERHEAD", "0") == "1"
         self.warmup_steps = max(int(self.warmup_steps), 0)
         self.device = _as_device(self.device)
-        if torch.cuda.is_available() and self.device.type == "cuda":
+        if self.enabled and torch.cuda.is_available() and self.device.type == "cuda":
             torch.cuda.reset_peak_memory_stats(self.device)
-        if self.model is not None:
+        if self.enabled and self.model is not None:
             self.attach_model(self.model)
 
     @property
@@ -104,6 +108,10 @@ class OverheadTracker:
         return self.backward_times
 
     def attach_model(self, model: nn.Module) -> "OverheadTracker":
+        if not self.enabled:
+            self.model = model
+            return self
+
         self.model = model
         for handle in self._hook_handles:
             handle.remove()
@@ -166,6 +174,8 @@ class OverheadTracker:
             self._current_forward_flops += output_elements * _activation_flop_cost(module)
 
     def start_forward(self) -> "OverheadTracker":
+        if not self.enabled:
+            return self
         _safe_sync(self.device)
         self._current_batch_is_warmup = self._completed_batches < self.warmup_steps
         self._current_forward_flops = 0
@@ -174,6 +184,8 @@ class OverheadTracker:
         return self
 
     def end_forward(self, batch_size: Optional[int] = None) -> float:
+        if not self.enabled:
+            return 0.0
         _safe_sync(self.device)
         if self._forward_start is None:
             return 0.0
@@ -188,11 +200,16 @@ class OverheadTracker:
         return float(elapsed_ms)
 
     def start_backward(self) -> "OverheadTracker":
+        if not self.enabled:
+            return self
         _safe_sync(self.device)
         self._backward_start = time.perf_counter()
         return self
 
     def end_backward(self) -> float:
+        if not self.enabled:
+            self._completed_batches += 1
+            return 0.0
         _safe_sync(self.device)
         if self._backward_start is None:
             return 0.0
@@ -238,6 +255,26 @@ class OverheadTracker:
         }
 
     def summary(self) -> Dict[str, Any]:
+        if not self.enabled:
+            return {
+                "task_name": self.task_name,
+                "activation_name": self.activation_name,
+                "warmup_steps": int(self.warmup_steps),
+                "run_id": self.run_id,
+                "created_utc": datetime.now(timezone.utc).isoformat(),
+                "device": str(self.device),
+                "batch_count": 0,
+                "forward_ms": {"mean": 0.0, "std": 0.0, "count": 0},
+                "backward_ms": {"mean": 0.0, "std": 0.0, "count": 0},
+                "peak_cuda_memory_mb": None,
+                "batch_sizes": [],
+                "parameter_stats": self._parameter_stats(),
+                "estimated_forward_flops": 0,
+                "estimated_backward_flops": 0,
+                "estimated_total_flops": 0,
+                "metadata": self.metadata,
+            }
+
         parameter_stats = self._parameter_stats()
         forward_mean = mean(self.forward_times) if self.forward_times else 0.0
         backward_mean = mean(self.backward_times) if self.backward_times else 0.0
@@ -284,6 +321,9 @@ class OverheadTracker:
         }
 
     def save(self, output_root: str | Path | None = None) -> Dict[str, Any]:
+        if not self.enabled:
+            return {}
+
         payload = self.summary()
         target_root = Path(output_root or self.output_root)
         target_root.mkdir(parents=True, exist_ok=True)
