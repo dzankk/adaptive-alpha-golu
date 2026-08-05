@@ -305,7 +305,7 @@ def train_single_seed_robustness(
         model.train()
         current_alpha_lr = set_alpha_lr(epoch)
         for inputs, targets in train_loader:
-            inputs, targets = inputs.to(device), targets.to(device)
+            inputs, targets = inputs.to(device, non_blocking=True), targets.to(device, non_blocking=True)
             optimizer.zero_grad()
             overhead_tracker.start_forward()
             with bf16_autocast(amp_enabled):
@@ -326,7 +326,7 @@ def train_single_seed_robustness(
     clean_correct, pgd_correct, total = 0, 0, 0
 
     for images, labels in test_loader:
-        images, labels = images.to(device), labels.to(device)
+        images, labels = images.to(device, non_blocking=True), labels.to(device, non_blocking=True)
 
         with torch.no_grad():
             with bf16_autocast(amp_enabled):

@@ -241,7 +241,7 @@ def train_single_seed_segmentation(act_type: str, seed: int, epochs: int, device
         model.train()
         current_alpha_lr = set_alpha_lr(epoch)
         for x, y in train_loader:
-            x, y = x.to(device), y.to(device)
+            x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
             optimizer.zero_grad()
             overhead_tracker.start_forward()
             with bf16_autocast(amp_enabled):
@@ -265,7 +265,7 @@ def train_single_seed_segmentation(act_type: str, seed: int, epochs: int, device
     with torch.no_grad():
         with bf16_autocast(amp_enabled):
             for x, y in val_loader:
-                x, y = x.to(device), y.to(device)
+                x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
                 out = model(x)
                 batch_size = x.size(0)
                 total_iou += compute_mIoU(out.float(), y, num_classes=VOC_SEG_CLASSES) * batch_size

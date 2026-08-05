@@ -201,7 +201,7 @@ def train_single_seed_diffusion(act_type: str, seed: int, epochs: int, device: t
         model.train()
         current_alpha_lr = set_alpha_lr(epoch)
         for x0, _ in trainloader:
-            x0 = x0.to(device)
+            x0 = x0.to(device, non_blocking=True)
             t = torch.randint(0, timesteps, (x0.size(0),), device=device).long()
             noise = torch.randn_like(x0)
 
@@ -232,7 +232,7 @@ def train_single_seed_diffusion(act_type: str, seed: int, epochs: int, device: t
     with torch.no_grad():
         with bf16_autocast(amp_enabled):
             for x0, _ in testloader:
-                x0 = x0.to(device)
+                x0 = x0.to(device, non_blocking=True)
                 t = torch.randint(0, timesteps, (x0.size(0),), device=device, generator=eval_g).long()
                 noise = torch.randn(x0.shape, device=device, generator=eval_g)
 

@@ -337,7 +337,7 @@ def train_single_seed_lm(
         model.train()
         current_alpha_lr = set_alpha_lr(epoch)
         for batch in train_loader:
-            batch = batch.to(device)
+            batch = batch.to(device, non_blocking=True)
             inputs, targets = batch[:, :-1], batch[:, 1:]
             overhead_tracker.start_forward()
             with bf16_autocast(amp_enabled):
@@ -361,7 +361,7 @@ def train_single_seed_lm(
     with torch.no_grad():
         with bf16_autocast(amp_enabled):
             for batch in valid_loader:
-                batch = batch.to(device)
+                batch = batch.to(device, non_blocking=True)
                 inputs, targets = batch[:, :-1], batch[:, 1:]
                 logits = model(inputs)
                 loss = criterion(logits.float().reshape(-1, len(vocab)), targets.reshape(-1))

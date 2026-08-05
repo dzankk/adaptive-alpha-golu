@@ -285,7 +285,7 @@ def evaluate_model(model: nn.Module, loader: DataLoader, device: torch.device, a
     with torch.no_grad():
         with bf16_autocast(amp_enabled):
             for inputs, labels in loader:
-                inputs, labels = inputs.to(device), labels.to(device)
+                inputs, labels = inputs.to(device, non_blocking=True), labels.to(device, non_blocking=True)
                 outputs = model(inputs)
                 loss = criterion(outputs.float(), labels)
                 batch_size = labels.size(0)
@@ -393,7 +393,7 @@ def train_single_seed(
         current_alpha_lr = update_alpha_lr(epoch)
         model.train()
         for inputs, labels in trainloader:
-            inputs, labels = inputs.to(device), labels.to(device)
+            inputs, labels = inputs.to(device, non_blocking=True), labels.to(device, non_blocking=True)
             optimizer.zero_grad()
             overhead_tracker.start_forward()
             with bf16_autocast(amp_enabled):

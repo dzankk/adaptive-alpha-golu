@@ -281,7 +281,7 @@ def evaluate_map50(
     with torch.no_grad():
         with bf16_autocast(amp_enabled):
             for images, targets in dataloader:
-                batch_images = [image.to(device) for image in images]
+                batch_images = [image.to(device, non_blocking=True) for image in images]
                 predictions = model(batch_images)
 
                 for batch_index, target in enumerate(targets):
@@ -437,12 +437,12 @@ def train_single_seed_detection(
         current_alpha_lr = set_alpha_lr(epoch)
         model.train()
         for images, targets in train_loader:
-            images = [image.to(device) for image in images]
+            images = [image.to(device, non_blocking=True) for image in images]
             targets = [
                 {
-                    "boxes": target["boxes"].to(device),
-                    "labels": target["labels"].to(device),
-                    "image_id": target["image_id"].to(device),
+                    "boxes": target["boxes"].to(device, non_blocking=True),
+                    "labels": target["labels"].to(device, non_blocking=True),
+                    "image_id": target["image_id"].to(device, non_blocking=True),
                 }
                 for target in targets
             ]
