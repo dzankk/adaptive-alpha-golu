@@ -28,7 +28,7 @@ from diagnostics.trajectory_logger import AlphaTrajectoryLogger
 from models.alpha_golu import AlphaGoLU as AdaptiveAlphaGoLU, StaticGoLU
 from utils.run_artifacts import build_run_manifest, create_run_directory, write_json
 from utils.overhead_tracker import OverheadTracker
-from utils.train_tuning import bf16_autocast, build_adamw_with_activation_groups, clip_activation_gradients, configure_benchmark_runtime, default_loader_kwargs, resolve_task_alpha_hparams
+from utils.train_tuning import bf16_autocast, build_adamw_with_activation_groups, clip_activation_gradients, clamp_alpha_golu_modules, configure_benchmark_runtime, default_loader_kwargs, resolve_task_alpha_hparams
 
 
 def reset_all_seeds(seed=42):
@@ -299,6 +299,8 @@ def train_single_seed_robustness(
     epoch_seconds = []
     train_start = time.perf_counter()
     amp_enabled = bool(amp) and torch.cuda.is_available() and device.type == "cuda"
+    alpha_clamp_events = 0
+    alpha_clamp_checks = 0
 
     for epoch in range(epochs):
         epoch_start = time.perf_counter()
@@ -317,6 +319,9 @@ def train_single_seed_robustness(
             overhead_tracker.end_backward()
             clip_activation_gradients(model, max_norm=alpha_grad_clip_norm)
             optimizer.step()
+            clamp_events, clamp_checks = clamp_alpha_golu_modules(model, min_alpha=0.2, max_alpha=3.0)
+            alpha_clamp_events += clamp_events
+            alpha_clamp_checks += clamp_checks
         epoch_seconds.append(time.perf_counter() - epoch_start)
         alpha_logger.step()
 
@@ -363,6 +368,8 @@ def train_single_seed_robustness(
                 "alpha_lr_final": current_alpha_lr if act_params else None,
                 "clean_acc": clean_acc,
                 "pgd_acc": pgd_acc,
+                "alpha_clamp_events": alpha_clamp_events,
+                "alpha_clamp_checks": alpha_clamp_checks,
                 "alpha_history": alpha_logger.alpha_history,
                 **overhead,
             },

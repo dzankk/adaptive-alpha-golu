@@ -132,6 +132,22 @@ def clip_activation_gradients(model: nn.Module, max_norm: float = 1.0) -> float:
     return float(torch.nn.utils.clip_grad_norm_(activation_params, max_norm=max_norm))
 
 
+def clamp_alpha_golu_modules(model: nn.Module, min_alpha: float = 0.2, max_alpha: float = 3.0) -> tuple[int, int]:
+    clamp_events = 0
+    clamp_checks = 0
+    for module in model.modules():
+        clamp_fn = getattr(module, "clamp_alpha_", None)
+        raw_alpha = getattr(module, "raw_alpha", None)
+        if not callable(clamp_fn) or not isinstance(raw_alpha, torch.nn.Parameter):
+            continue
+        before_raw = raw_alpha.detach().clone()
+        clamp_fn(min_alpha, max_alpha)
+        clamp_checks += 1
+        if not torch.equal(before_raw, raw_alpha.detach()):
+            clamp_events += 1
+    return clamp_events, clamp_checks
+
+
 def bf16_autocast(enabled: bool):
     if enabled and torch.cuda.is_available():
         return torch.amp.autocast("cuda", dtype=torch.bfloat16)

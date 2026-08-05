@@ -38,7 +38,7 @@ from models.alpha_golu import AlphaGoLU as AdaptiveAlphaGoLU, StaticGoLU
 from diagnostics.trajectory_logger import AlphaTrajectoryLogger
 from utils.run_artifacts import build_run_manifest, create_run_directory, write_json
 from utils.overhead_tracker import OverheadTracker
-from utils.train_tuning import bf16_autocast, build_adamw_with_activation_groups, clip_activation_gradients, configure_benchmark_runtime, default_loader_kwargs, resolve_task_alpha_hparams
+from utils.train_tuning import bf16_autocast, build_adamw_with_activation_groups, clip_activation_gradients, clamp_alpha_golu_modules, configure_benchmark_runtime, default_loader_kwargs, resolve_task_alpha_hparams
 
 
 VOC_CLASSES = [
@@ -431,6 +431,8 @@ def train_single_seed_detection(
     train_start = time.perf_counter()
     epoch_seconds = []
     amp_enabled = bool(amp) and torch.cuda.is_available() and device.type == "cuda"
+    alpha_clamp_events = 0
+    alpha_clamp_checks = 0
 
     for epoch in range(epochs):
         epoch_start = time.perf_counter()
@@ -458,6 +460,9 @@ def train_single_seed_detection(
             overhead_tracker.end_backward()
             clip_activation_gradients(model, max_norm=alpha_grad_clip_norm)
             optimizer.step()
+            clamp_events, clamp_checks = clamp_alpha_golu_modules(model, min_alpha=0.2, max_alpha=3.0)
+            alpha_clamp_events += clamp_events
+            alpha_clamp_checks += clamp_checks
         scheduler.step()
         epoch_seconds.append(time.perf_counter() - epoch_start)
         alpha_logger.step()
@@ -491,6 +496,8 @@ def train_single_seed_detection(
                 "max_train_samples": max_train_samples,
                 "max_eval_samples": max_eval_samples,
                 "map50": float(map50),
+                "alpha_clamp_events": alpha_clamp_events,
+                "alpha_clamp_checks": alpha_clamp_checks,
                 "alpha_history": alpha_logger.alpha_history,
                 **overhead,
             },
