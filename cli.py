@@ -11,6 +11,7 @@ usage examples:
 """
 
 import argparse
+import math
 import json
 import os
 import hashlib
@@ -19,7 +20,6 @@ from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 from statistics import mean
-from typing import List
 
 # Import benchmark modules
 from experiments.run_classification import train_and_eval as run_classification
@@ -62,6 +62,17 @@ SUPPORTED_ACTIVATIONS = CANONICAL_ACTIVATIONS + ["swish_adaptive"]
 PARAMETRIC_ACTIVATIONS = ["alpha_golu", "prelu", "pgelu", "adaptive_swish", "swish_adaptive"]
 
 DEFAULT_SEEDS = [42, 123, 999, 2024, 2025]
+
+TASK_METRIC_KEYS = {
+    "classification": "accuracy",
+    "detection": "map50",
+    "segmentation": "miou",
+    "diffusion": "mse",
+    "language_model": "perplexity",
+    "robustness": "pgd_acc",
+}
+
+LOWER_IS_BETTER_TASKS = {"diffusion", "language_model"}
 
 
 def _stable_signature(payload: dict) -> str:
@@ -148,6 +159,25 @@ def _format_metric(value: float | None, digits: int = 2, suffix: str = "") -> st
     if value is None:
         return "N/A"
     return f"{value:.{digits}f}{suffix}"
+
+
+def _metric_is_better(task_name: str, first_value: float, second_value: float) -> bool:
+    return first_value < second_value if task_name in LOWER_IS_BETTER_TASKS else first_value > second_value
+
+
+def _extract_task_summary(results: dict, task_name: str) -> dict:
+    task_data = results.get(task_name, {}) if isinstance(results.get(task_name, {}), dict) else {}
+    alpha_entry = task_data.get("alpha_golu", {}) if isinstance(task_data.get("alpha_golu", {}), dict) else {}
+    static_entry = task_data.get("golu_static", {}) if isinstance(task_data.get("golu_static", {}), dict) else {}
+
+    return {
+        "alpha_mean": float(alpha_entry.get("mean", float("nan"))) if alpha_entry else float("nan"),
+        "alpha_std": float(alpha_entry.get("std", float("nan"))) if alpha_entry else float("nan"),
+        "alpha_scores": alpha_entry.get("scores", []),
+        "static_mean": float(static_entry.get("mean", float("nan"))) if static_entry else float("nan"),
+        "static_scores": static_entry.get("scores", []),
+        "p_value": task_data.get("p_value_welch_alpha_vs_static", None),
+    }
 
 
 def handle_generate_overhead_table(args):
@@ -688,6 +718,88 @@ def handle_generate_parametric_comparison_plot(args):
     plot_parametric_comparison(run_jsons, save_path=args.output_path, task_name=args.task)
 
 
+def handle_generate_alpha_lr_leaderboard(args):
+    """Compares multiple benchmark summary JSON files and reports which alpha-lr config wins per task."""
+    result_paths = [Path(path) for path in args.results_paths]
+    labels = args.labels if args.labels else [path.stem for path in result_paths]
+    if len(labels) != len(result_paths):
+        raise ValueError("--labels must match --results-paths in length")
+
+    summaries = []
+    for label, path in zip(labels, result_paths):
+        if not path.exists():
+            print(f"[Warning] Missing results file: {path}")
+            continue
+        with path.open("r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+        if not isinstance(payload, dict) or not payload:
+            print(f"[Warning] Empty or invalid results file: {path}")
+            continue
+        summaries.append((label, path, payload))
+
+    if not summaries:
+        print("[Error] No valid results files provided")
+        return
+
+    tasks = [task for task in TASK_MAP.keys() if args.tasks is None or task in args.tasks]
+    report: dict[str, dict[str, dict[str, float | str | None]]] = {}
+
+    print("\n================ AlphaGoLU Alpha-LR Leaderboard ================")
+    print("Configs compared:")
+    for label, path, _ in summaries:
+        print(f"  - {label}: {path}")
+
+    for task_name in tasks:
+        task_rows = []
+        for label, path, payload in summaries:
+            summary = _extract_task_summary(payload, task_name)
+            alpha_mean = summary["alpha_mean"]
+            static_mean = summary["static_mean"]
+            if math.isnan(alpha_mean) or math.isnan(static_mean):
+                continue
+
+            p_value = summary["p_value"]
+            if p_value is None:
+                p_value = calculate_p_value(summary["static_scores"], summary["alpha_scores"])
+
+            task_rows.append(
+                {
+                    "label": label,
+                    "alpha_mean": alpha_mean,
+                    "static_mean": static_mean,
+                    "p_value": float(p_value),
+                }
+            )
+
+        if not task_rows:
+            continue
+
+        winner = task_rows[0]
+        for row in task_rows[1:]:
+            if _metric_is_better(task_name, row["alpha_mean"], winner["alpha_mean"]):
+                winner = row
+
+        report[task_name] = {
+            "metric": TASK_METRIC_KEYS[task_name],
+            "winner": winner["label"],
+            "winner_mean": winner["alpha_mean"],
+            "winner_p_value": winner["p_value"],
+        }
+
+        print(f"\n--- Task: {task_name.upper()} ---")
+        for row in sorted(task_rows, key=lambda item: item["alpha_mean"], reverse=(task_name not in LOWER_IS_BETTER_TASKS)):
+            marker = "*" if row is winner else " "
+            print(f"{marker} {row['label']:<22} alpha_mean={row['alpha_mean']:.4f} | static_mean={row['static_mean']:.4f} | p={row['p_value']:.4f}")
+
+        print(f"  -> Winner: {winner['label']} (p={winner['p_value']:.4f})")
+
+    output_path = Path(args.output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open("w", encoding="utf-8") as handle:
+        json.dump({"configs": labels, "tasks": tasks, "report": report}, handle, indent=4, sort_keys=True)
+    print(f"\n[IO] Saved alpha-lr leaderboard to {output_path}")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="CLI for Adaptive Alpha-GoLU Benchmark Suite & Paper Reproducibility",
@@ -760,6 +872,13 @@ def main():
     parametric_parser.add_argument("--task", type=str, default=None, choices=list(TASK_MAP.keys()), help="Optional task filter when scanning output runs")
     parametric_parser.add_argument("--output-path", type=str, default="outputs/paper_assets/parametric_comparison.png", help="Where to save the comparison figure")
 
+    # Command: generate_alpha_lr_leaderboard
+    leaderboard_parser = subparsers.add_parser("generate_alpha_lr_leaderboard", help="Compare multiple benchmark summaries and rank alpha-lr configs per task")
+    leaderboard_parser.add_argument("--results-paths", type=str, nargs="+", default=["outputs/benchmark_results_alpha_lr_1e3.json", "outputs/benchmark_results_alpha_lr_2e3.json", "outputs/benchmark_results.json"], help="Benchmark summary JSON files to compare")
+    leaderboard_parser.add_argument("--labels", type=str, nargs="*", default=None, help="Optional labels for the provided results files")
+    leaderboard_parser.add_argument("--tasks", type=str, nargs="*", default=None, choices=list(TASK_MAP.keys()), help="Optional subset of tasks to include")
+    leaderboard_parser.add_argument("--output-path", type=str, default="outputs/paper_assets/alpha_lr_leaderboard.json", help="Where to save the leaderboard JSON")
+
     args = parser.parse_args()
 
     if args.command == "run":
@@ -774,6 +893,8 @@ def main():
         handle_generate_paper_assets(args)
     elif args.command == "generate_parametric_comparison_plot":
         handle_generate_parametric_comparison_plot(args)
+    elif args.command == "generate_alpha_lr_leaderboard":
+        handle_generate_alpha_lr_leaderboard(args)
     elif args.command == "preflight":
         _run_preflight_or_abort(args.data_root, args.output_root, args.min_free_gb)
     elif args.command == "prepare_data":

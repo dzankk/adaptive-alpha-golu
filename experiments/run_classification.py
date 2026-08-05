@@ -30,7 +30,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from models.alpha_golu import AlphaGoLU as AdaptiveAlphaGoLU, StaticGoLU
 from diagnostics.trajectory_logger import AlphaTrajectoryLogger
-from utils.train_tuning import bf16_autocast, build_adamw_with_activation_groups, clip_activation_gradients, configure_benchmark_runtime, default_loader_kwargs, resolve_task_alpha_hparams
+from utils.train_tuning import bf16_autocast, build_adamw_with_activation_groups, clip_activation_gradients, clamp_alpha_golu_modules, configure_benchmark_runtime, default_loader_kwargs, resolve_task_alpha_hparams
 
 
 # ==========================================
@@ -387,6 +387,8 @@ def train_single_seed(
         return base_current
 
     current_alpha_lr = update_alpha_lr(0)
+    alpha_clamp_events = 0
+    alpha_clamp_checks = 0
 
     for epoch in range(epochs):
         epoch_start = time.perf_counter()
@@ -405,9 +407,9 @@ def train_single_seed(
             overhead_tracker.end_backward()
             clip_activation_gradients(model, max_norm=alpha_grad_clip_norm)
             optimizer.step()
-            for module in model.modules():
-                if isinstance(module, AdaptiveAlphaGoLU):
-                    module.clamp_alpha_(0.2, 3.0)
+            clamp_events, clamp_checks = clamp_alpha_golu_modules(model, min_alpha=0.2, max_alpha=3.0)
+            alpha_clamp_events += clamp_events
+            alpha_clamp_checks += clamp_checks
         scheduler.step()
         epoch_seconds.append(time.perf_counter() - epoch_start)
         alpha_logger.step()
@@ -450,6 +452,8 @@ def train_single_seed(
                 "train_seconds": train_seconds,
                 "epoch_seconds": epoch_seconds,
                 "alpha_lr_final": current_alpha_lr,
+                "alpha_clamp_events": alpha_clamp_events,
+                "alpha_clamp_checks": alpha_clamp_checks,
                 **overhead,
             },
         )
@@ -578,7 +582,7 @@ def run_alpha_lr_ablation(
 ):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     seeds = seeds or [42]
-    alpha_lrs = alpha_lrs or [1e-4, 3e-4, 5e-4]
+    alpha_lrs = alpha_lrs or [5e-4, 1e-3, 2e-3]
 
     print(f"\n================ Alpha LR Ablation on {dataset_name.upper()} ================")
     print(f"Seeds: {seeds}")
@@ -630,12 +634,13 @@ if __name__ == '__main__':
     parser.add_argument("--amp", action="store_true", help="Enable BF16 automatic mixed precision on CUDA")
     parser.add_argument("--alpha-layout-ablation", action="store_true", help="Compare layer-wise vs channel-wise Alpha-GoLU")
     parser.add_argument("--alpha-lr-ablation", action="store_true", help="Run a compact alpha LR sweep for Alpha-GoLU only")
+    parser.add_argument("--alpha-lrs", type=float, nargs="+", default=None, help="Custom alpha LR sweep values for --alpha-lr-ablation")
     args = parser.parse_args()
 
     if args.alpha_layout_ablation:
         run_alpha_layout_ablation(dataset_name=args.dataset_name or "cifar10", seeds=args.seeds, epochs=args.epochs, data_root=args.data_root, alpha_lr=args.alpha_lr, val_split=args.val_split, alpha_lr_scheduler=args.alpha_lr_scheduler, config_path=args.config)
     elif args.alpha_lr_ablation:
-        run_alpha_lr_ablation(dataset_name=args.dataset_name or "cifar10", seeds=args.seeds, epochs=args.epochs, data_root=args.data_root, val_split=args.val_split, alpha_lrs=[1e-4, 3e-4, 5e-4])
+        run_alpha_lr_ablation(dataset_name=args.dataset_name or "cifar10", seeds=args.seeds, epochs=args.epochs, data_root=args.data_root, val_split=args.val_split, alpha_lrs=args.alpha_lrs)
     elif args.benchmark:
         dataset_names = [args.dataset_name] if args.dataset_name else ["cifar10", "fashion_mnist"]
         for dataset_name in dataset_names:
