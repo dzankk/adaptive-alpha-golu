@@ -343,7 +343,7 @@ def handle_run_all(args):
     config = load_benchmark_config(args.config) if args.config else {}
     seeds = args.seeds if args.seeds != DEFAULT_SEEDS else config.get("seeds", DEFAULT_SEEDS)
     activations = args.activations if args.activations != CANONICAL_ACTIVATIONS else config.get("activations", CANONICAL_ACTIVATIONS)
-    task_names = config.get("tasks", list(TASK_MAP.keys()))
+    task_names = args.tasks if args.tasks else config.get("tasks", list(TASK_MAP.keys()))
     task_alpha_lrs = config.get("alpha_lr_by_task", {})
     output_root = config.get("output_root", "outputs/runs")
     summary_path = config.get("summary_path", "outputs/benchmark_results.json")
@@ -706,6 +706,7 @@ def main():
         choices=SUPPORTED_ACTIVATIONS, 
         help="Activations to evaluate"
     )
+    run_all_parser.add_argument("--tasks", type=str, nargs="+", default=None, choices=list(TASK_MAP.keys()), help="Subset of tasks to run instead of the config task list")
     run_all_parser.add_argument("--seeds", type=int, nargs="+", default=DEFAULT_SEEDS, help="Random seeds for statistical testing")
     run_all_parser.add_argument("--config", type=str, default=None, help="Path to a JSON benchmark config file")
     run_all_parser.add_argument("--data-root", type=str, default="./data", help="Dataset cache root used when config does not specify one")
