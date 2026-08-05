@@ -295,7 +295,7 @@ def handle_run(args):
             continue
 
         print(f"\n---> Running Seed: {seed}")
-        metric = TASK_MAP[task](act, seed=seed, data_root=args.data_root, alpha_lr=task_alpha_lr)
+        metric = TASK_MAP[task](act, seed=seed, data_root=args.data_root, alpha_lr=task_alpha_lr, save_artifacts=args.save_artifacts)
         results.append(metric)
         print(f"Seed {seed} Output Metric: {metric:.4f}")
         saved_scores[seed_key] = metric
@@ -691,6 +691,7 @@ def main():
     run_parser.add_argument("--data-root", type=str, default="./data", help="Dataset cache root used for preflight checks")
     run_parser.add_argument("--output-root", type=str, default="outputs/runs", help="Output root used for preflight checks")
     run_parser.add_argument("--min-free-gb", type=float, default=20.0, help="Minimum free disk space required before launching")
+    run_parser.add_argument("--save-artifacts", action="store_true", help="Save per-seed run JSONs, manifests, and trajectory plots")
 
     # Command: run_all
     run_all_parser = subparsers.add_parser("run_all", help="Reproduce all paper tables across all tasks")
