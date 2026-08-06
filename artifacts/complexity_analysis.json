@@ -1,0 +1,79 @@
+{
+    "device": "cpu",
+    "flop_counter_backend": "torch.utils.flop_counter.FlopCounterMode",
+    "generated_utc": "2026-08-06T16:29:45.996235+00:00",
+    "language_model_vocab": {
+        "size": 1000,
+        "source": "not_requested"
+    },
+    "table": [
+        {
+            "activation": "relu",
+            "batch_spec": {
+                "images": [
+                    1,
+                    3,
+                    32,
+                    32
+                ],
+                "labels": [
+                    1
+                ],
+                "num_classes": 10
+            },
+            "delta_forward_flops_vs_relu": 0,
+            "delta_params_vs_relu": 0,
+            "delta_peak_cuda_memory_mb_vs_relu": null,
+            "flops_backend": "torch.utils.flop_counter.FlopCounterMode",
+            "forward_flops": 1110845440,
+            "peak_cuda_memory_mb": null,
+            "task": "classification",
+            "total_params": 11173962,
+            "trainable_params": 11173962
+        }
+    ],
+    "tasks": {
+        "classification": {
+            "baseline_activation": "relu",
+            "batch_spec": {
+                "images": [
+                    1,
+                    3,
+                    32,
+                    32
+                ],
+                "labels": [
+                    1
+                ],
+                "num_classes": 10
+            },
+            "rows": [
+                {
+                    "activation": "relu",
+                    "batch_spec": {
+                        "images": [
+                            1,
+                            3,
+                            32,
+                            32
+                        ],
+                        "labels": [
+                            1
+                        ],
+                        "num_classes": 10
+                    },
+                    "delta_forward_flops_vs_relu": 0,
+                    "delta_params_vs_relu": 0,
+                    "delta_peak_cuda_memory_mb_vs_relu": null,
+                    "flops_backend": "torch.utils.flop_counter.FlopCounterMode",
+                    "forward_flops": 1110845440,
+                    "peak_cuda_memory_mb": null,
+                    "task": "classification",
+                    "total_params": 11173962,
+                    "trainable_params": 11173962
+                }
+            ]
+        }
+    },
+    "torch_version": "2.12.1+cpu"
+}
