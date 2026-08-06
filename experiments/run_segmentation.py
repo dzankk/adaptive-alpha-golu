@@ -238,6 +238,29 @@ def train_single_seed_segmentation(act_type: str, seed: int, epochs: int, device
     amp_enabled = bool(amp) and torch.cuda.is_available() and device.type == "cuda"
     alpha_clamp_events = 0
     alpha_clamp_checks = 0
+    run_dir = None
+    progress_path = None
+    if save_artifacts:
+        run_dir = create_run_directory(
+            str(PROJECT_ROOT / "outputs" / "runs" / "segmentation"),
+            "segmentation",
+            act_type,
+            [seed],
+        )
+        progress_path = run_dir / "progress.json"
+        write_json(
+            run_dir / "run_manifest.json",
+            build_run_manifest(
+                command=f"python {Path(__file__).name} --activation {act_type} --seeds {seed} --epochs {epochs}",
+                task="segmentation",
+                seeds=[seed],
+                activations=[act_type],
+                extra_config={
+                    "data_root": data_root,
+                    "epochs": epochs,
+                },
+            ),
+        )
 
     for epoch in range(epochs):
         epoch_start = time.perf_counter()
@@ -270,6 +293,27 @@ def train_single_seed_segmentation(act_type: str, seed: int, epochs: int, device
         epoch_seconds.append(time.perf_counter() - epoch_start)
         alpha_logger.step()
         mean_epoch_loss = epoch_loss_total / max(epoch_batches, 1)
+        if save_artifacts and progress_path is not None:
+            write_json(
+                progress_path,
+                {
+                    "status": "running",
+                    "task": "segmentation",
+                    "data_root": data_root,
+                    "activation": act_type,
+                    "alpha_lr": alpha_lr,
+                    "seed": seed,
+                    "epochs": epochs,
+                    "epoch": epoch + 1,
+                    "progress_pct": float(((epoch + 1) / max(epochs, 1)) * 100.0),
+                    "epoch_loss": mean_epoch_loss,
+                    "epoch_seconds": epoch_seconds,
+                    "alpha_lr_final": current_alpha_lr,
+                    "alpha_clamp_events": alpha_clamp_events,
+                    "alpha_clamp_checks": alpha_clamp_checks,
+                    "alpha_history": alpha_logger.alpha_history,
+                },
+            )
         if not save_artifacts:
             print(f"[SEGMENTATION] Epoch {epoch + 1}/{epochs} - Loss: {mean_epoch_loss:.4f} | alpha_lr={current_alpha_lr:.6f}", flush=True)
 
@@ -290,12 +334,6 @@ def train_single_seed_segmentation(act_type: str, seed: int, epochs: int, device
 
     miou = total_iou / total_samples if total_samples > 0 else 0.0
 
-    run_dir = create_run_directory(
-        str(PROJECT_ROOT / "outputs" / "runs" / "segmentation"),
-        "segmentation",
-        act_type,
-        [seed],
-    )
     write_json(
         run_dir / "results.json",
         {
@@ -313,6 +351,26 @@ def train_single_seed_segmentation(act_type: str, seed: int, epochs: int, device
             **overhead,
         },
     )
+    if progress_path is not None:
+        write_json(
+            progress_path,
+            {
+                "status": "completed",
+                "task": "segmentation",
+                "data_root": data_root,
+                "activation": act_type,
+                "alpha_lr": alpha_lr,
+                "seed": seed,
+                "epochs": epochs,
+                "progress_pct": 100.0,
+                "alpha_lr_final": current_alpha_lr if act_params else None,
+                "miou": float(miou),
+                "alpha_clamp_events": alpha_clamp_events,
+                "alpha_clamp_checks": alpha_clamp_checks,
+                "alpha_history": alpha_logger.alpha_history,
+                **overhead,
+            },
+        )
     write_json(
         run_dir / "run_manifest.json",
         build_run_manifest(

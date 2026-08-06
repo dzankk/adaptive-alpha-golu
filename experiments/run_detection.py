@@ -434,6 +434,40 @@ def train_single_seed_detection(
     amp_enabled = bool(amp) and torch.cuda.is_available() and device.type == "cuda"
     alpha_clamp_events = 0
     alpha_clamp_checks = 0
+    run_dir = None
+    progress_path = None
+    if save_artifacts:
+        run_dir = create_run_directory(
+            str(PROJECT_ROOT / "outputs" / "runs" / "detection"),
+            "detection",
+            act_type,
+            [seed],
+        )
+        progress_path = run_dir / "progress.json"
+        write_json(
+            run_dir / "run_manifest.json",
+            build_run_manifest(
+                command=(
+                    f"python {Path(__file__).name} --activation {act_type} --seeds {seed} "
+                    f"--epochs {epochs} --lr {lr}"
+                ),
+                task="detection",
+                seeds=[seed],
+                activations=[act_type],
+                extra_config={
+                    "dataset_name": "pascal_voc_2012",
+                    "data_root": data_root,
+                    "epochs": epochs,
+                    "seed": seed,
+                    "lr": lr,
+                    "alpha_lr": alpha_lr if alpha_lr is not None else lr,
+                    "image_size": image_size,
+                    "train_split_ratio": train_split_ratio,
+                    "max_train_samples": max_train_samples,
+                    "max_eval_samples": max_eval_samples,
+                },
+            ),
+        )
 
     for epoch in range(epochs):
         epoch_start = time.perf_counter()
@@ -476,6 +510,28 @@ def train_single_seed_detection(
         epoch_seconds.append(time.perf_counter() - epoch_start)
         alpha_logger.step()
         mean_epoch_loss = epoch_loss_total / max(epoch_batches, 1)
+        if save_artifacts and progress_path is not None:
+            write_json(
+                progress_path,
+                {
+                    "status": "running",
+                    "task": "detection",
+                    "dataset_name": "pascal_voc_2012",
+                    "data_root": data_root,
+                    "activation": act_type,
+                    "alpha_lr": alpha_lr if alpha_lr is not None else lr,
+                    "seed": seed,
+                    "epochs": epochs,
+                    "epoch": epoch + 1,
+                    "progress_pct": float(((epoch + 1) / max(epochs, 1)) * 100.0),
+                    "epoch_loss": mean_epoch_loss,
+                    "epoch_seconds": epoch_seconds,
+                    "alpha_lr_final": current_alpha_lr,
+                    "alpha_clamp_events": alpha_clamp_events,
+                    "alpha_clamp_checks": alpha_clamp_checks,
+                    "alpha_history": alpha_logger.alpha_history,
+                },
+            )
         if not save_artifacts:
             print(f"[DETECTION] Epoch {epoch + 1}/{epochs} - Loss: {mean_epoch_loss:.4f} | alpha_lr={current_alpha_lr:.6f}", flush=True)
 
@@ -485,12 +541,6 @@ def train_single_seed_detection(
     overhead = overhead_tracker.save() if overhead_tracker is not None else {}
 
     if save_artifacts:
-        run_dir = create_run_directory(
-            str(PROJECT_ROOT / "outputs" / "runs" / "detection"),
-            "detection",
-            act_type,
-            [seed],
-        )
         write_json(
             run_dir / "results.json",
             {
@@ -514,6 +564,32 @@ def train_single_seed_detection(
                 **overhead,
             },
         )
+        if progress_path is not None:
+            write_json(
+                progress_path,
+                {
+                    "status": "completed",
+                    "task": "detection",
+                    "dataset_name": "pascal_voc_2012",
+                    "data_root": data_root,
+                    "activation": act_type,
+                    "alpha_lr": alpha_lr if alpha_lr is not None else lr,
+                    "seed": seed,
+                    "epochs": epochs,
+                    "progress_pct": 100.0,
+                    "lr": lr,
+                    "alpha_lr_final": current_alpha_lr if act_params else None,
+                    "image_size": image_size,
+                    "train_split_ratio": train_split_ratio,
+                    "max_train_samples": max_train_samples,
+                    "max_eval_samples": max_eval_samples,
+                    "map50": float(map50),
+                    "alpha_clamp_events": alpha_clamp_events,
+                    "alpha_clamp_checks": alpha_clamp_checks,
+                    "alpha_history": alpha_logger.alpha_history,
+                    **overhead,
+                },
+            )
         write_json(
             run_dir / "run_manifest.json",
             build_run_manifest(

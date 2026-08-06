@@ -197,6 +197,29 @@ def train_single_seed_diffusion(act_type: str, seed: int, epochs: int, device: t
     amp_enabled = bool(amp) and torch.cuda.is_available() and device.type == "cuda"
     alpha_clamp_events = 0
     alpha_clamp_checks = 0
+    run_dir = None
+    progress_path = None
+    if save_artifacts:
+        run_dir = create_run_directory(
+            str(PROJECT_ROOT / "outputs" / "runs" / "diffusion"),
+            "diffusion",
+            act_type,
+            [seed],
+        )
+        progress_path = run_dir / "progress.json"
+        write_json(
+            run_dir / "run_manifest.json",
+            build_run_manifest(
+                command=f"python {Path(__file__).name} --activation {act_type} --seeds {seed} --epochs {epochs}",
+                task="diffusion",
+                seeds=[seed],
+                activations=[act_type],
+                extra_config={
+                    "data_root": data_root,
+                    "epochs": epochs,
+                },
+            ),
+        )
 
     # Complete Epoch Training Run
     for epoch in range(epochs):
@@ -238,6 +261,27 @@ def train_single_seed_diffusion(act_type: str, seed: int, epochs: int, device: t
         alpha_logger.step()
         train_seconds = time.perf_counter() - train_start
         mean_epoch_loss = epoch_loss_total / max(epoch_batches, 1)
+        if save_artifacts and progress_path is not None:
+            write_json(
+                progress_path,
+                {
+                    "status": "running",
+                    "task": "diffusion",
+                    "data_root": data_root,
+                    "activation": act_type,
+                    "alpha_lr": alpha_lr if alpha_lr is not None else 2e-4,
+                    "seed": seed,
+                    "epochs": epochs,
+                    "epoch": epoch + 1,
+                    "progress_pct": float(((epoch + 1) / max(epochs, 1)) * 100.0),
+                    "epoch_loss": mean_epoch_loss,
+                    "epoch_seconds": epoch_seconds,
+                    "alpha_lr_final": current_alpha_lr,
+                    "alpha_clamp_events": alpha_clamp_events,
+                    "alpha_clamp_checks": alpha_clamp_checks,
+                    "alpha_history": alpha_logger.alpha_history,
+                },
+            )
         if not save_artifacts:
             print(f"[DIFFUSION] Epoch {epoch + 1}/{epochs} - Loss: {mean_epoch_loss:.6f} | alpha_lr={current_alpha_lr:.6f}", flush=True)
 
@@ -266,12 +310,6 @@ def train_single_seed_diffusion(act_type: str, seed: int, epochs: int, device: t
     overhead = overhead_tracker.save() if overhead_tracker is not None else {}
     loss = float(total_loss / total_examples) if total_examples > 0 else float(np.mean(val_losses)) if val_losses else 0.0
 
-    run_dir = create_run_directory(
-        str(PROJECT_ROOT / "outputs" / "runs" / "diffusion"),
-        "diffusion",
-        act_type,
-        [seed],
-    )
     write_json(
         run_dir / "results.json",
         {
@@ -289,6 +327,26 @@ def train_single_seed_diffusion(act_type: str, seed: int, epochs: int, device: t
             **overhead,
         },
     )
+    if progress_path is not None:
+        write_json(
+            progress_path,
+            {
+                "status": "completed",
+                "task": "diffusion",
+                "data_root": data_root,
+                "activation": act_type,
+                "alpha_lr": alpha_lr if alpha_lr is not None else 2e-4,
+                "seed": seed,
+                "epochs": epochs,
+                "progress_pct": 100.0,
+                "alpha_lr_final": current_alpha_lr if act_params else None,
+                "mse": float(loss),
+                "alpha_clamp_events": alpha_clamp_events,
+                "alpha_clamp_checks": alpha_clamp_checks,
+                "alpha_history": alpha_logger.alpha_history,
+                **overhead,
+            },
+        )
     write_json(
         run_dir / "run_manifest.json",
         build_run_manifest(
