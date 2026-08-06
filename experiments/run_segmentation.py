@@ -270,7 +270,8 @@ def train_single_seed_segmentation(act_type: str, seed: int, epochs: int, device
         epoch_seconds.append(time.perf_counter() - epoch_start)
         alpha_logger.step()
         mean_epoch_loss = epoch_loss_total / max(epoch_batches, 1)
-        print(f"[SEGMENTATION] Epoch {epoch + 1}/{epochs} - Loss: {mean_epoch_loss:.4f} | alpha_lr={current_alpha_lr:.6f}", flush=True)
+        if not save_artifacts:
+            print(f"[SEGMENTATION] Epoch {epoch + 1}/{epochs} - Loss: {mean_epoch_loss:.4f} | alpha_lr={current_alpha_lr:.6f}", flush=True)
 
     train_seconds = time.perf_counter() - train_start
     overhead = overhead_tracker.save() if overhead_tracker is not None else {}

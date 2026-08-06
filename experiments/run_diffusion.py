@@ -238,7 +238,8 @@ def train_single_seed_diffusion(act_type: str, seed: int, epochs: int, device: t
         alpha_logger.step()
         train_seconds = time.perf_counter() - train_start
         mean_epoch_loss = epoch_loss_total / max(epoch_batches, 1)
-        print(f"[DIFFUSION] Epoch {epoch + 1}/{epochs} - Loss: {mean_epoch_loss:.6f} | alpha_lr={current_alpha_lr:.6f}", flush=True)
+        if not save_artifacts:
+            print(f"[DIFFUSION] Epoch {epoch + 1}/{epochs} - Loss: {mean_epoch_loss:.6f} | alpha_lr={current_alpha_lr:.6f}", flush=True)
 
     model.eval()
     val_losses = []

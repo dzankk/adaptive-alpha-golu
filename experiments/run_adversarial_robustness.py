@@ -334,7 +334,8 @@ def train_single_seed_robustness(
         epoch_seconds.append(time.perf_counter() - epoch_start)
         alpha_logger.step()
         mean_epoch_loss = epoch_loss_total / max(epoch_batches, 1)
-        print(f"[ROBUSTNESS] Epoch {epoch + 1}/{epochs} - Loss: {mean_epoch_loss:.4f} | alpha_lr={current_alpha_lr:.6f}", flush=True)
+        if not save_artifacts:
+            print(f"[ROBUSTNESS] Epoch {epoch + 1}/{epochs} - Loss: {mean_epoch_loss:.4f} | alpha_lr={current_alpha_lr:.6f}", flush=True)
 
     train_seconds = time.perf_counter() - train_start
 
@@ -405,9 +406,6 @@ def train_single_seed_robustness(
                 },
             ),
         )
-        if alpha_logger.alpha_history:
-            alpha_logger.plot_trajectories(str(run_dir / "alpha_trajectories.png"))
-
     return clean_acc, pgd_acc
 def run_benchmark(seeds=None, epochs: int = 10, data_root: str = './data', amp: bool = False):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')

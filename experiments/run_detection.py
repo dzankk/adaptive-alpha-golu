@@ -476,7 +476,8 @@ def train_single_seed_detection(
         epoch_seconds.append(time.perf_counter() - epoch_start)
         alpha_logger.step()
         mean_epoch_loss = epoch_loss_total / max(epoch_batches, 1)
-        print(f"[DETECTION] Epoch {epoch + 1}/{epochs} - Loss: {mean_epoch_loss:.4f} | alpha_lr={current_alpha_lr:.6f}", flush=True)
+        if not save_artifacts:
+            print(f"[DETECTION] Epoch {epoch + 1}/{epochs} - Loss: {mean_epoch_loss:.4f} | alpha_lr={current_alpha_lr:.6f}", flush=True)
 
     train_seconds = time.perf_counter() - train_start
 
@@ -537,9 +538,6 @@ def train_single_seed_detection(
                 },
             ),
         )
-        if alpha_logger.alpha_history:
-            alpha_logger.plot_trajectories(str(run_dir / "alpha_trajectories.png"))
-
     return float(map50)
 
 

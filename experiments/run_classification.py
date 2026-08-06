@@ -374,6 +374,35 @@ def train_single_seed(
     if torch.cuda.is_available():
         torch.cuda.reset_peak_memory_stats(device)
     amp_enabled = bool(amp) and torch.cuda.is_available() and device.type == "cuda"
+    run_dir = None
+    progress_path = None
+    if save_artifacts:
+        run_dir = create_run_directory(
+            str(PROJECT_ROOT / "outputs" / "runs" / "classification"),
+            "classification",
+            act_type,
+            [seed],
+        )
+        progress_path = run_dir / "progress.json"
+        write_json(
+            run_dir / "run_manifest.json",
+            build_run_manifest(
+                command=f"python {Path(__file__).name} --activation {act_type} --dataset-name {dataset_name} --seeds {seed} --epochs {epochs}",
+                task="classification",
+                seeds=[seed],
+                activations=[act_type],
+                extra_config={
+                    "dataset_name": dataset_name,
+                    "data_root": data_root,
+                    "epochs": epochs,
+                    "val_split": val_split,
+                    "eval_split": eval_split,
+                    "alpha_lr_scheduler": alpha_lr_scheduler,
+                    "alpha_lr": alpha_lr,
+                    "seed": seed,
+                },
+            ),
+        )
 
     def update_alpha_lr(epoch_index: int) -> float:
         if not act_params:
@@ -423,7 +452,30 @@ def train_single_seed(
         epoch_seconds.append(time.perf_counter() - epoch_start)
         alpha_logger.step()
         mean_epoch_loss = epoch_loss_total / max(epoch_batches, 1)
-        print(f"[CLASSIFICATION] Epoch {epoch + 1}/{epochs} - Loss: {mean_epoch_loss:.4f} | alpha_lr={current_alpha_lr:.6f}", flush=True)
+        if save_artifacts and progress_path is not None:
+            write_json(
+                progress_path,
+                {
+                    "status": "running",
+                    "task": "classification",
+                    "dataset_name": dataset_name,
+                    "data_root": data_root,
+                    "activation": act_type,
+                    "alpha_lr": alpha_lr,
+                    "seed": seed,
+                    "epochs": epochs,
+                    "epoch": epoch + 1,
+                    "progress_pct": float(((epoch + 1) / max(epochs, 1)) * 100.0),
+                    "epoch_loss": mean_epoch_loss,
+                    "epoch_seconds": epoch_seconds,
+                    "alpha_lr_final": current_alpha_lr,
+                    "alpha_clamp_events": alpha_clamp_events,
+                    "alpha_clamp_checks": alpha_clamp_checks,
+                    "alpha_history": alpha_logger.alpha_history,
+                },
+            )
+        if not save_artifacts:
+            print(f"[CLASSIFICATION] Epoch {epoch + 1}/{epochs} - Loss: {mean_epoch_loss:.4f} | alpha_lr={current_alpha_lr:.6f}", flush=True)
 
     if torch.cuda.is_available():
         torch.cuda.synchronize(device)
@@ -439,15 +491,34 @@ def train_single_seed(
     overhead = overhead_tracker.save() if overhead_tracker is not None else {}
 
     if save_artifacts:
-        run_dir = create_run_directory(
-            str(PROJECT_ROOT / "outputs" / "runs" / "classification"),
-            "classification",
-            act_type,
-            [seed],
-        )
         write_json(
             run_dir / "results.json",
             {
+                "task": "classification",
+                "dataset_name": dataset_name,
+                "data_root": data_root,
+                "activation": act_type,
+                "alpha_lr": alpha_lr,
+                "seed": seed,
+                "epochs": epochs,
+                "progress_pct": 100.0,
+                "eval_split": eval_split,
+                "eval_loss": eval_loss,
+                "accuracy": acc,
+                "alpha_values": alphas,
+                "alpha_history": alpha_logger.alpha_history,
+                "train_seconds": train_seconds,
+                "epoch_seconds": epoch_seconds,
+                "alpha_lr_final": current_alpha_lr,
+                "alpha_clamp_events": alpha_clamp_events,
+                "alpha_clamp_checks": alpha_clamp_checks,
+                **overhead,
+            },
+        )
+        write_json(
+            progress_path,
+            {
+                "status": "completed",
                 "task": "classification",
                 "dataset_name": dataset_name,
                 "data_root": data_root,
@@ -468,27 +539,6 @@ def train_single_seed(
                 **overhead,
             },
         )
-        write_json(
-            run_dir / "run_manifest.json",
-            build_run_manifest(
-                command=f"python {Path(__file__).name} --activation {act_type} --dataset-name {dataset_name} --seeds {seed} --epochs {epochs}",
-                task="classification",
-                seeds=[seed],
-                activations=[act_type],
-                extra_config={
-                    "dataset_name": dataset_name,
-                    "data_root": data_root,
-                    "epochs": epochs,
-                    "val_split": val_split,
-                    "eval_split": eval_split,
-                    "alpha_lr_scheduler": alpha_lr_scheduler,
-                    "alpha_lr": alpha_lr,
-                    "seed": seed,
-                },
-            ),
-        )
-        if alpha_logger.alpha_history:
-            alpha_logger.plot_trajectories(str(run_dir / "alpha_trajectories.png"))
     
     if return_metrics:
         return {

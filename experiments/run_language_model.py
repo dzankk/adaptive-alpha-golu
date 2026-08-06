@@ -334,6 +334,33 @@ def train_single_seed_lm(
     amp_enabled = bool(amp) and torch.cuda.is_available() and "cuda" in str(device)
     alpha_clamp_events = 0
     alpha_clamp_checks = 0
+    run_dir = None
+    progress_path = None
+    if save_artifacts:
+        run_dir = create_run_directory(
+            str(PROJECT_ROOT / "outputs" / "runs" / "language_model"),
+            "language_model",
+            act_type,
+            [seed],
+        )
+        progress_path = run_dir / "progress.json"
+        write_json(
+            run_dir / "run_manifest.json",
+            build_run_manifest(
+                command=f"python {Path(__file__).name} --activation {act_type} --seeds {seed} --epochs {epochs}",
+                task="language_model",
+                seeds=[seed],
+                activations=[act_type],
+                extra_config={
+                    "dataset_name": dataset_name,
+                    "data_root": data_root,
+                    "epochs": epochs,
+                    "alpha_lr": alpha_lr if alpha_lr is not None else 1e-3,
+                    "seed": seed,
+                    "block_size": block_size,
+                },
+            ),
+        )
 
     train_loader_len = max(len(train_loader), 1)
     planned_steps = int(max_steps) if max_steps is not None and int(max_steps) > 0 else epochs * train_loader_len
@@ -374,11 +401,61 @@ def train_single_seed_lm(
             clamp_events, clamp_checks = clamp_alpha_golu_modules(model, min_alpha=0.2, max_alpha=3.0)
             alpha_clamp_events += clamp_events
             alpha_clamp_checks += clamp_checks
-            print(f"[LANGUAGE_MODEL] Step {global_step}/{planned_steps} (Epoch {epoch + 1}) - Loss: {float(loss.item()):.4f} | alpha_lr={current_alpha_lr:.6f}", flush=True)
+            if save_artifacts and progress_path is not None:
+                write_json(
+                    progress_path,
+                    {
+                        "status": "running",
+                        "task": "language_model",
+                        "dataset_name": dataset_name,
+                        "data_root": data_root,
+                        "activation": act_type,
+                        "alpha_lr": alpha_lr,
+                        "seed": seed,
+                        "epochs": epochs,
+                        "planned_steps": planned_steps,
+                        "global_step": global_step,
+                        "progress_pct": float((global_step / max(planned_steps, 1)) * 100.0),
+                        "epoch": epoch + 1,
+                        "step_loss": float(loss.item()),
+                        "epoch_seconds": epoch_seconds,
+                        "alpha_lr_final": current_alpha_lr,
+                        "alpha_clamp_events": alpha_clamp_events,
+                        "alpha_clamp_checks": alpha_clamp_checks,
+                        "alpha_history": alpha_logger.alpha_history,
+                    },
+                )
+            if not save_artifacts:
+                print(f"[LANGUAGE_MODEL] Step {global_step}/{planned_steps} (Epoch {epoch + 1}) - Loss: {float(loss.item()):.4f} | alpha_lr={current_alpha_lr:.6f}", flush=True)
         epoch_seconds.append(time.perf_counter() - epoch_start)
         alpha_logger.step()
         mean_epoch_loss = epoch_loss_total / max(epoch_batches, 1)
-        print(f"[LANGUAGE_MODEL] Epoch {epoch + 1} complete - Mean Loss: {mean_epoch_loss:.4f} | steps={global_step}/{planned_steps}", flush=True)
+        if save_artifacts and progress_path is not None:
+            write_json(
+                progress_path,
+                {
+                    "status": "running",
+                    "task": "language_model",
+                    "dataset_name": dataset_name,
+                    "data_root": data_root,
+                    "activation": act_type,
+                    "alpha_lr": alpha_lr,
+                    "seed": seed,
+                    "epochs": epochs,
+                    "planned_steps": planned_steps,
+                    "global_step": global_step,
+                    "progress_pct": float((global_step / max(planned_steps, 1)) * 100.0),
+                    "epoch": epoch + 1,
+                    "epoch_loss": mean_epoch_loss,
+                    "epoch_seconds": epoch_seconds,
+                    "alpha_lr_final": current_alpha_lr,
+                    "alpha_clamp_events": alpha_clamp_events,
+                    "alpha_clamp_checks": alpha_clamp_checks,
+                    "alpha_history": alpha_logger.alpha_history,
+                },
+            )
+        if not save_artifacts:
+            print(f"[LANGUAGE_MODEL] Epoch {epoch + 1} complete - Mean Loss: {mean_epoch_loss:.4f} | steps={global_step}/{planned_steps}", flush=True)
         epoch += 1
 
     model.eval()
@@ -399,12 +476,6 @@ def train_single_seed_lm(
     overhead = overhead_tracker.save() if overhead_tracker is not None else {}
 
     if save_artifacts:
-        run_dir = create_run_directory(
-            str(PROJECT_ROOT / "outputs" / "runs" / "language_model"),
-            "language_model",
-            act_type,
-            [seed],
-        )
         write_json(
             run_dir / "results.json",
             {
@@ -425,25 +496,30 @@ def train_single_seed_lm(
                 **overhead,
             },
         )
-        write_json(
-            run_dir / "run_manifest.json",
-            build_run_manifest(
-                command=f"python {Path(__file__).name} --activation {act_type} --seeds {seed} --epochs {epochs}",
-                task="language_model",
-                seeds=[seed],
-                activations=[act_type],
-                extra_config={
+        if progress_path is not None:
+            write_json(
+                progress_path,
+                {
+                    "status": "completed",
+                    "task": "language_model",
                     "dataset_name": dataset_name,
                     "data_root": data_root,
-                    "epochs": epochs,
-                    "alpha_lr": alpha_lr if alpha_lr is not None else 1e-3,
+                    "activation": act_type,
+                    "alpha_lr": alpha_lr,
                     "seed": seed,
-                    "block_size": block_size,
+                    "epochs": epochs,
+                    "planned_steps": planned_steps,
+                    "global_step": global_step,
+                    "progress_pct": 100.0,
+                    "perplexity": float(perplexity),
+                    "avg_loss": float(avg_loss),
+                    "alpha_lr_final": current_alpha_lr if act_params else None,
+                    "alpha_clamp_events": alpha_clamp_events,
+                    "alpha_clamp_checks": alpha_clamp_checks,
+                    "alpha_history": alpha_logger.alpha_history,
+                    **overhead,
                 },
-            ),
-        )
-        if alpha_logger.alpha_history:
-            alpha_logger.plot_trajectories(str(run_dir / "alpha_trajectories.png"))
+            )
 
     return float(perplexity)
 
