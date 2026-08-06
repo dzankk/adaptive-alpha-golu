@@ -531,7 +531,7 @@ def handle_run_all(args, summary_only: bool = False):
             for seed in seeds:
                 seed_key = str(seed)
                 if seed_key in completed_scores:
-                    print(f"Seed {seed} -> Score: {float(completed_scores[seed_key]):.4f}")
+                    print(f"[{task_name.upper()}|{act.upper()}|Seed {seed}] Score: {float(completed_scores[seed_key]):.4f}")
                     continue
 
                 alpha_lr = task_alpha_lrs.get(task_name)
@@ -549,7 +549,7 @@ def handle_run_all(args, summary_only: bool = False):
                     max_steps=task_steps,
                 )
                 accs.append(acc)
-                print(f"Seed {seed} -> Score: {acc:.4f}")
+                print(f"[{task_name.upper()}|{act.upper()}|Seed {seed}] Score: {acc:.4f}")
 
                 completed_scores[seed_key] = acc
                 stats = compute_summary_statistics(accs)
