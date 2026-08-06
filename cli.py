@@ -129,13 +129,14 @@ def _merge_benchmark_results(base_results: dict, incoming_results: dict) -> dict
     return merged
 
 
-def _invoke_task_runner(runner_fn, act: str, *, seed: int, data_root: str, alpha_lr: float | None, save_artifacts: bool, amp: bool):
+def _invoke_task_runner(runner_fn, act: str, *, seed: int, data_root: str, alpha_lr: float | None, save_artifacts: bool, amp: bool, epochs: int | None = None):
     candidate_kwargs = {
         "seed": seed,
         "data_root": data_root,
         "alpha_lr": alpha_lr,
         "save_artifacts": save_artifacts,
         "amp": amp,
+        "epochs": epochs,
     }
     signature = inspect.signature(runner_fn)
     accepted_kwargs = {
@@ -949,7 +950,7 @@ def main():
 
     # Command: smoke_run
     smoke_parser = subparsers.add_parser("smoke_run", help="Run a fast static-vs-Alpha-GoLU smoke benchmark across all tasks")
-    smoke_parser.add_argument("--config", type=str, default="configs/paper_benchmark_alpha_lr_2e3.json", help="Benchmark config file used for task alpha hyperparameters")
+    smoke_parser.add_argument("--config", type=str, default="configs/smoke_benchmark.json", help="Benchmark config file used for task alpha hyperparameters")
     smoke_parser.add_argument("--data-root", type=str, default="./data", help="Dataset cache root used when config does not specify one")
     smoke_parser.add_argument("--min-free-gb", type=float, default=20.0, help="Minimum free disk space required before launching")
     smoke_parser.add_argument("--amp", action="store_true", help="Enable BF16 automatic mixed precision on CUDA")
@@ -959,7 +960,7 @@ def main():
     task_order_parser.add_argument("--tasks", type=str, nargs="+", default=None, choices=list(TASK_MAP.keys()), help="Optional subset of tasks to run in the recommended order")
     task_order_parser.add_argument("--activations", type=str, nargs="+", default=CANONICAL_ACTIVATIONS, choices=SUPPORTED_ACTIVATIONS, help="Activations to evaluate")
     task_order_parser.add_argument("--seeds", type=int, nargs="+", default=DEFAULT_SEEDS, help="Random seeds for statistical testing")
-    task_order_parser.add_argument("--config", type=str, default=None, help="Path to a JSON benchmark config file")
+    task_order_parser.add_argument("--config", type=str, default="configs/full_benchmark.json", help="Path to a JSON benchmark config file")
     task_order_parser.add_argument("--data-root", type=str, default="./data", help="Dataset cache root used when config does not specify one")
     task_order_parser.add_argument("--min-free-gb", type=float, default=20.0, help="Minimum free disk space required before launching")
     task_order_parser.add_argument("--save-artifacts", action="store_true", help="Save per-seed run JSONs, manifests, and trajectory plots")

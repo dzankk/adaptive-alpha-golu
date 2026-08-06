@@ -1,0 +1,58 @@
+{
+    "name": "full_benchmark",
+    "tier": "full_benchmark",
+    "tasks": [
+        "classification",
+        "detection",
+        "segmentation",
+        "diffusion",
+        "language_model",
+        "robustness"
+    ],
+    "activations": [
+        "relu",
+        "gelu",
+        "swish",
+        "prelu",
+        "pgelu",
+        "adaptive_swish",
+        "golu_static",
+        "alpha_golu"
+    ],
+    "seeds": [42, 123, 999],
+    "data_root": "./data",
+    "epochs_by_task": {
+        "classification": 100,
+        "detection": 12,
+        "segmentation": 12,
+        "diffusion": 50,
+        "language_model": 20,
+        "robustness": 20
+    },
+    "alpha_lr_by_task": {
+        "classification": 0.0005,
+        "detection": 0.0001,
+        "segmentation": 0.0002,
+        "diffusion": 0.001,
+        "language_model": 0.001,
+        "robustness": 0.0005
+    },
+    "alpha_lr_warmup_epochs": {
+        "classification": 1,
+        "detection": 1,
+        "segmentation": 1,
+        "diffusion": 1,
+        "language_model": 1,
+        "robustness": 1
+    },
+    "alpha_grad_clip_norm": {
+        "classification": 1.0,
+        "detection": 1.0,
+        "segmentation": 1.0,
+        "diffusion": 1.0,
+        "language_model": 1.0,
+        "robustness": 1.0
+    },
+    "output_root": "outputs/runs/full_benchmark",
+    "summary_path": "outputs/benchmark_results_full.json"
+}

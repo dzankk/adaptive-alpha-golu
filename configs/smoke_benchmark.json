@@ -1,0 +1,52 @@
+{
+    "name": "smoke_benchmark",
+    "tier": "smoke",
+    "tasks": [
+        "classification",
+        "detection",
+        "segmentation",
+        "diffusion",
+        "language_model",
+        "robustness"
+    ],
+    "activations": [
+        "golu_static",
+        "alpha_golu"
+    ],
+    "seeds": [42, 123],
+    "data_root": "./data",
+    "epochs_by_task": {
+        "classification": 10,
+        "detection": 5,
+        "segmentation": 5,
+        "diffusion": 5,
+        "language_model": 5,
+        "robustness": 5
+    },
+    "alpha_lr_by_task": {
+        "classification": 0.002,
+        "detection": 0.0001,
+        "segmentation": 0.0002,
+        "diffusion": 0.001,
+        "language_model": 0.001,
+        "robustness": 0.0005
+    },
+    "alpha_lr_warmup_epochs": {
+        "classification": 1,
+        "detection": 1,
+        "segmentation": 1,
+        "diffusion": 1,
+        "language_model": 1,
+        "robustness": 1
+    },
+    "alpha_grad_clip_norm": {
+        "classification": 1.0,
+        "detection": 1.0,
+        "segmentation": 1.0,
+        "diffusion": 1.0,
+        "language_model": 1.0,
+        "robustness": 1.0
+    },
+    "output_root": "outputs/runs/smoke_benchmark",
+    "summary_path": "outputs/benchmark_results_smoke.json"
+}
