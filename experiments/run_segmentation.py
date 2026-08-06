@@ -1,8 +1,8 @@
 """
-Benchmark: Semantic Segmentation (U-Net)
+Benchmark: Semantic Segmentation (DeepLabV3)
 Measures pixel-level target segmentation performance (mIoU) across activation functions.
-Demonstrates layer skip-connections combined with parameter-group optimization 
-(disabling weight decay for trainable activation variables like alpha and beta).
+Uses a pretrained ImageNet ResNet backbone for standard fine-tuning and isolates
+trainable activation variables like alpha and beta into separate optimizer groups.
 """
 
 import math
@@ -18,6 +18,7 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader, Dataset, random_split
 from torchvision.datasets import VOCSegmentation
+from torchvision.models.segmentation import DeepLabV3_ResNet50_Weights, deeplabv3_resnet50
 from torchvision.transforms import functional as TF
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -101,51 +102,36 @@ def get_optimizer(
 
 
 # ==========================================
-# 2. U-Net Architecture
+# 2. DeepLabV3 Architecture
 # ==========================================
-class UNetBlock(nn.Module):
-    def __init__(self, in_ch: int, out_ch: int, act_type: str):
+class ActivationSegmentationHead(nn.Module):
+    def __init__(self, in_channels: int, num_classes: int, act_type: str):
         super().__init__()
-        self.conv = nn.Sequential(
-            nn.Conv2d(in_ch, out_ch, 3, padding=1, bias=False),
-            nn.BatchNorm2d(out_ch),
+        self.block = nn.Sequential(
+            nn.Conv2d(in_channels, 256, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(256),
             get_activation(act_type),
-            nn.Conv2d(out_ch, out_ch, 3, padding=1, bias=False),
-            nn.BatchNorm2d(out_ch),
-            get_activation(act_type)
+            nn.Conv2d(256, 256, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(256),
+            get_activation(act_type),
+            nn.Conv2d(256, num_classes, kernel_size=1),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.conv(x)
+        return self.block(x)
 
 
-class UNet(nn.Module):
-    def __init__(self, in_channels: int = 3, num_classes: int = 21, act_type: str = 'relu'):
+class PretrainedDeepLabV3(nn.Module):
+    def __init__(self, act_type: str, num_classes: int = 21):
         super().__init__()
-        self.enc1 = UNetBlock(in_channels, 32, act_type)
-        self.pool1 = nn.MaxPool2d(2)
-        self.enc2 = UNetBlock(32, 64, act_type)
-        self.pool2 = nn.MaxPool2d(2)
-        
-        self.bottleneck = UNetBlock(64, 128, act_type)
-
-        self.up2 = nn.ConvTranspose2d(128, 64, 2, stride=2)
-        self.dec2 = UNetBlock(128, 64, act_type)
-        self.up1 = nn.ConvTranspose2d(64, 32, 2, stride=2)
-        self.dec1 = UNetBlock(64, 32, act_type)
-
-        self.head = nn.Conv2d(32, num_classes, 1)
+        pretrained_model = deeplabv3_resnet50(weights=DeepLabV3_ResNet50_Weights.DEFAULT)
+        self.backbone = pretrained_model.backbone
+        self.classifier = ActivationSegmentationHead(self.backbone.out_channels, num_classes, act_type)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        e1 = self.enc1(x)
-        e2 = self.enc2(self.pool1(e1))
-        b = self.bottleneck(self.pool2(e2))
-        
-        d2 = self.up2(b)
-        d2 = self.dec2(torch.cat([d2, e2], dim=1))
-        d1 = self.up1(d2)
-        d1 = self.dec1(torch.cat([d1, e1], dim=1))
-        return self.head(d1)
+        features = self.backbone(x)["out"]
+        logits = self.classifier(features)
+        return F.interpolate(logits, size=x.shape[-2:], mode="bilinear", align_corners=False)
 
 
 # ==========================================
@@ -223,7 +209,7 @@ def train_single_seed_segmentation(act_type: str, seed: int, epochs: int, device
     train_loader = DataLoader(train_ds, batch_size=8, shuffle=True, generator=loader_g, **train_loader_kwargs)
     val_loader = DataLoader(val_ds, batch_size=8, shuffle=False, generator=loader_g, **val_loader_kwargs)
 
-    model = UNet(act_type=act_type, num_classes=VOC_SEG_CLASSES).to(device)
+    model = PretrainedDeepLabV3(act_type=act_type, num_classes=VOC_SEG_CLASSES).to(device)
     overhead_tracker = OverheadTracker(task_name="segmentation", activation_name=act_type, model=model, device=device) if overhead_tracking_enabled() else None
     alpha_logger = AlphaTrajectoryLogger(model)
     alpha_lr, alpha_warmup_epochs, alpha_grad_clip_norm = resolve_task_alpha_hparams(
@@ -388,7 +374,7 @@ def train_single_seed_segmentation(act_type: str, seed: int, epochs: int, device
     return miou
 
 
-def run_segmentation_benchmark(seeds=None, epochs=10, data_root: str = './data', alpha_lr: float | None = None, config_path: str | None = "configs/paper_benchmark.json", amp: bool = False):
+def run_segmentation_benchmark(seeds=None, epochs=12, data_root: str = './data', alpha_lr: float | None = None, config_path: str | None = "configs/paper_benchmark.json", amp: bool = False):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     seeds = seeds or [42, 123, 999, 2024, 2025]
     print(f"Running Segmentation Benchmark on {device} (N={len(seeds)})")
@@ -416,7 +402,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Pascal VOC segmentation benchmark")
     parser.add_argument("--activation", type=str, default="alpha_golu", help="Single activation to evaluate")
     parser.add_argument("--seeds", type=int, nargs="+", default=[42, 123, 999, 2024, 2025], help="Random seeds")
-    parser.add_argument("--epochs", type=int, default=10, help="Training epochs")
+    parser.add_argument("--epochs", type=int, default=12, help="Training epochs")
     parser.add_argument("--data-root", type=str, default="./data", help="Dataset cache root")
     parser.add_argument("--alpha-lr", type=float, default=None, help="Learning rate for activation parameters; defaults to configs/paper_benchmark.json")
     parser.add_argument("--config", type=str, default="configs/paper_benchmark.json", help="Benchmark config file used for task alpha hyperparameters")

@@ -24,7 +24,7 @@
     "epochs_by_task": {
         "classification": 50,
         "detection": 12,
-        "segmentation": 50,
+        "segmentation": 12,
         "diffusion": 30,
         "robustness": 40
     },
