@@ -102,6 +102,80 @@ def _load_json_file(path: Path) -> dict:
     return data if isinstance(data, dict) else {}
 
 
+def _task_run_root(task_name: str) -> Path:
+    folder_map = {
+        "classification": "classification",
+        "detection": "detection",
+        "segmentation": "segmentation",
+        "diffusion": "diffusion",
+        "language_model": "language_model",
+        "robustness": "adversarial_robustness",
+    }
+    task_folder = folder_map.get(task_name, task_name)
+    return Path(__file__).resolve().parent / "outputs" / "runs" / task_folder
+
+
+def _extract_metric_from_result(task_name: str, payload: dict) -> float | None:
+    metric_key = TASK_METRIC_KEYS.get(task_name)
+    if not metric_key:
+        return None
+
+    candidate_keys = [metric_key]
+    if task_name == "robustness":
+        candidate_keys.append("pgd_acc")
+
+    for key in candidate_keys:
+        raw_value = payload.get(key)
+        if isinstance(raw_value, (int, float)) and math.isfinite(float(raw_value)):
+            value = float(raw_value)
+            if value > 0.0:
+                return value
+    return None
+
+
+def _has_valid_seed_result(task_name: str, activation: str, seed: int) -> bool:
+    run_root = _task_run_root(task_name)
+    if not run_root.exists():
+        return False
+
+    pattern = f"*_{task_name}_{activation}_seeds-{seed}"
+    candidates = sorted(
+        [path for path in run_root.glob(pattern) if path.is_dir()],
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    for run_dir in candidates:
+        result_path = run_dir / "results.json"
+        if not result_path.exists():
+            continue
+        try:
+            payload = _load_json_file(result_path)
+        except (OSError, json.JSONDecodeError):
+            continue
+        if _extract_metric_from_result(task_name, payload) is not None:
+            return True
+    return False
+
+
+def _filter_valid_completed_scores(task_name: str, activation: str, completed_scores: dict) -> dict[str, float]:
+    valid_scores: dict[str, float] = {}
+    for seed_key, raw_score in completed_scores.items():
+        try:
+            seed = int(seed_key)
+        except (TypeError, ValueError):
+            continue
+
+        if not isinstance(raw_score, (int, float)):
+            continue
+        score = float(raw_score)
+        if not math.isfinite(score) or score <= 0.0:
+            continue
+
+        if _has_valid_seed_result(task_name, activation, seed):
+            valid_scores[str(seed)] = score
+    return valid_scores
+
+
 def _merge_benchmark_results(base_results: dict, incoming_results: dict) -> dict:
     merged = dict(base_results)
     for task_name, task_payload in incoming_results.items():
@@ -407,6 +481,7 @@ def handle_run(args):
             pass
     resume_state = {} if args.fresh else _load_json_file(resume_path)
     saved_scores = resume_state.get("scores", {}) if isinstance(resume_state.get("scores", {}), dict) else {}
+    saved_scores = _filter_valid_completed_scores(task, act, saved_scores)
 
     if task not in TASK_MAP:
         print(f"[Error] Task '{task}' not recognized. Choose from: {list(TASK_MAP.keys())}")
@@ -517,6 +592,7 @@ def handle_run_all(args, summary_only: bool = False):
             print(f"\n--- Activation: {act.upper()} ---")
             existing_entry = task_results.get(act, {}) if isinstance(task_results.get(act, {}), dict) else {}
             completed_scores = existing_entry.get("completed_scores", {}) if isinstance(existing_entry.get("completed_scores", {}), dict) else {}
+            completed_scores = _filter_valid_completed_scores(task_name, act, completed_scores)
             accs = [float(completed_scores[str(seed)]) for seed in seeds if str(seed) in completed_scores]
 
             for seed in seeds:
