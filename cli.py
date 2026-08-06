@@ -11,6 +11,7 @@ usage examples:
 """
 
 import argparse
+import inspect
 import math
 import json
 import os
@@ -117,6 +118,23 @@ def _merge_benchmark_results(base_results: dict, incoming_results: dict) -> dict
             combined_task[activation_name] = merged_activation
         merged[task_name] = combined_task
     return merged
+
+
+def _invoke_task_runner(runner_fn, act: str, *, seed: int, data_root: str, alpha_lr: float | None, save_artifacts: bool, amp: bool):
+    candidate_kwargs = {
+        "seed": seed,
+        "data_root": data_root,
+        "alpha_lr": alpha_lr,
+        "save_artifacts": save_artifacts,
+        "amp": amp,
+    }
+    signature = inspect.signature(runner_fn)
+    accepted_kwargs = {
+        name: value
+        for name, value in candidate_kwargs.items()
+        if name in signature.parameters
+    }
+    return runner_fn(act, **accepted_kwargs)
 
 
 def _save_json_file(path: Path, payload: dict) -> None:
@@ -465,7 +483,7 @@ def handle_run_all(args, summary_only: bool = False):
                     continue
 
                 alpha_lr = task_alpha_lrs.get(task_name)
-                acc = runner_fn(act, seed=seed, data_root=data_root, alpha_lr=alpha_lr, save_artifacts=args.save_artifacts, amp=args.amp)
+                acc = _invoke_task_runner(runner_fn, act, seed=seed, data_root=data_root, alpha_lr=alpha_lr, save_artifacts=args.save_artifacts, amp=args.amp)
                 accs.append(acc)
                 print(f"Seed {seed} -> Score: {acc:.4f}")
 
