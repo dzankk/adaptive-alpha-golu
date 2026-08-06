@@ -1,9 +1,10 @@
 """
-Benchmark: Adversarial Robustness on CIFAR-10 (ResNet-18)
-=========================================================
-Evaluates clean accuracy vs. PGD-10 adversarial attack robustness 
-across ReLU, GELU, Swish, PReLU, PGELU, Static GoLU, Adaptive Alpha-GoLU, and Adaptive Swish.
-Includes proper Gompertz math, deterministic PGD evaluation, and CUDA seed resetting.
+Benchmark: Corruption Robustness on CIFAR-10 (ResNet-18)
+========================================================
+Evaluates clean accuracy vs. lightweight corruption robustness across
+ReLU, GELU, Swish, PReLU, PGELU, Static GoLU, Adaptive Alpha-GoLU, and
+Adaptive Swish using Gaussian noise, shot noise, and blur perturbations.
+Includes deterministic evaluation and CUDA seed resetting.
 """
 
 import math
@@ -187,10 +188,16 @@ class ResNet18(nn.Module):
 
 
 # ==========================================
-# 4. Adversarial Attack Utilities
+# 4. Corruption Evaluation Utilities
 # ==========================================
 CIFAR_MEAN = torch.tensor([0.4914, 0.4822, 0.4465]).view(1, 3, 1, 1)
 CIFAR_STD = torch.tensor([0.2023, 0.1994, 0.2010]).view(1, 3, 1, 1)
+
+CORRUPTION_SUITE = {
+    "gaussian_noise": {"sigma": 0.1},
+    "shot_noise": {"severity": 0.03},
+    "blur": {"kernel_size": 5, "sigma": 1.0},
+}
 
 
 def get_normalized_bounds(device):
@@ -201,40 +208,45 @@ def get_normalized_bounds(device):
     return min_val, max_val
 
 
-def pgd_attack(model, images, labels, eps=8/255, alpha=2/255, iters=10):
-    """Standard PGD-10 Attack with strictly bounded random initialization."""
-    device = images.device
-    min_val, max_val = get_normalized_bounds(device)
-    std = CIFAR_STD.to(device)
+def denormalize_images(images: torch.Tensor) -> torch.Tensor:
+    mean = CIFAR_MEAN.to(images.device)
+    std = CIFAR_STD.to(images.device)
+    return torch.clamp(images * std + mean, 0.0, 1.0)
 
-    eps_norm = eps / std
-    alpha_norm = alpha / std
 
-    ori_images = images.clone().detach()
-    
-    # Standard random initialization within epsilon ball & valid image space
-    random_noise = torch.empty_like(images).uniform_(-1.0, 1.0) * eps_norm
-    perturbed = torch.clamp(ori_images + random_noise, ori_images - eps_norm, ori_images + eps_norm)
-    perturbed = torch.clamp(perturbed, min_val, max_val).detach()
+def normalize_images(images: torch.Tensor) -> torch.Tensor:
+    mean = CIFAR_MEAN.to(images.device)
+    std = CIFAR_STD.to(images.device)
+    return (images - mean) / std
 
-    for _ in range(iters):
-        perturbed.requires_grad = True
-        outputs = model(perturbed)
-        loss = nn.CrossEntropyLoss()(outputs, labels)
-        
-        model.zero_grad()
-        loss.backward()
 
-        if perturbed.grad is None:
-            break
+def apply_gaussian_noise(images: torch.Tensor, sigma: float = 0.1) -> torch.Tensor:
+    return torch.clamp(images + torch.randn_like(images) * sigma, 0.0, 1.0)
 
-        adv_images = perturbed + alpha_norm * perturbed.grad.sign()
-        diff = adv_images - ori_images
-        
-        eta = torch.clamp(diff, -eps_norm, eps_norm)
-        perturbed = torch.clamp(ori_images + eta, min_val, max_val).detach()
 
-    return perturbed
+def apply_shot_noise(images: torch.Tensor, severity: float = 0.03) -> torch.Tensor:
+    scale = max(1.0, 1.0 / max(severity, 1e-6))
+    noisy = torch.poisson(images.clamp(0.0, 1.0) * scale) / scale
+    return torch.clamp(noisy, 0.0, 1.0)
+
+
+def apply_blur(images: torch.Tensor, kernel_size: int = 5, sigma: float = 1.0) -> torch.Tensor:
+    blurred = [transforms.functional.gaussian_blur(image, kernel_size=kernel_size, sigma=[sigma, sigma]) for image in images]
+    return torch.stack(blurred, dim=0)
+
+
+def corrupt_batch(images: torch.Tensor, corruption_name: str) -> torch.Tensor:
+    pixel_images = denormalize_images(images)
+    if corruption_name == "gaussian_noise":
+        corrupted = apply_gaussian_noise(pixel_images, sigma=CORRUPTION_SUITE[corruption_name]["sigma"])
+    elif corruption_name == "shot_noise":
+        corrupted = apply_shot_noise(pixel_images, severity=CORRUPTION_SUITE[corruption_name]["severity"])
+    elif corruption_name == "blur":
+        params = CORRUPTION_SUITE[corruption_name]
+        corrupted = apply_blur(pixel_images, kernel_size=params["kernel_size"], sigma=params["sigma"])
+    else:
+        raise ValueError(f"Unknown corruption: {corruption_name}")
+    return normalize_images(corrupted)
 
 
 # ==========================================
@@ -324,10 +336,9 @@ def train_single_seed_robustness(
                     "activation": act_type,
                     "data_root": data_root,
                     "seed": seed,
-                    "attack": {
-                        "eps": 8 / 255,
-                        "alpha": 2 / 255,
-                        "iters": 10,
+                    "evaluation": {
+                        "suite": "corruption",
+                        "corruptions": CORRUPTION_SUITE,
                     },
                 },
             ),
@@ -391,7 +402,8 @@ def train_single_seed_robustness(
     train_seconds = time.perf_counter() - train_start
 
     model.eval()
-    clean_correct, pgd_correct, total = 0, 0, 0
+    clean_correct, total = 0, 0
+    corruption_correct = {name: 0 for name in CORRUPTION_SUITE}
 
     for images, labels in test_loader:
         images, labels = images.to(device, non_blocking=True), labels.to(device, non_blocking=True)
@@ -400,17 +412,20 @@ def train_single_seed_robustness(
             with bf16_autocast(amp_enabled):
                 clean_correct += (model(images).argmax(1) == labels).sum().item()
 
-        with torch.enable_grad():
-            adv_pgd = pgd_attack(model, images, labels)
-
-        with torch.no_grad():
-            with bf16_autocast(amp_enabled):
-                pgd_correct += (model(adv_pgd).argmax(1) == labels).sum().item()
+        for corruption_name in CORRUPTION_SUITE:
+            corrupted_images = corrupt_batch(images, corruption_name)
+            with torch.no_grad():
+                with bf16_autocast(amp_enabled):
+                    corruption_correct[corruption_name] += (model(corrupted_images).argmax(1) == labels).sum().item()
 
         total += labels.size(0)
 
     clean_acc = (clean_correct / total) * 100.0 if total > 0 else 0.0
-    pgd_acc = (pgd_correct / total) * 100.0 if total > 0 else 0.0
+    corruption_accs = {
+        name: (correct / total) * 100.0 if total > 0 else 0.0
+        for name, correct in corruption_correct.items()
+    }
+    corruption_acc = float(np.mean(list(corruption_accs.values()))) if corruption_accs else 0.0
     overhead = overhead_tracker.save() if overhead_tracker is not None else {}
 
     if save_artifacts:
@@ -424,7 +439,8 @@ def train_single_seed_robustness(
                 "alpha_lr": alpha_lr if alpha_lr is not None else 1e-3,
                 "alpha_lr_final": current_alpha_lr if act_params else None,
                 "clean_acc": clean_acc,
-                "pgd_acc": pgd_acc,
+                "corruption_acc": corruption_acc,
+                **{f"{name}_acc": value for name, value in corruption_accs.items()},
                 "alpha_clamp_events": alpha_clamp_events,
                 "alpha_clamp_checks": alpha_clamp_checks,
                 "alpha_history": alpha_logger.alpha_history,
@@ -445,7 +461,8 @@ def train_single_seed_robustness(
                     "progress_pct": 100.0,
                     "alpha_lr_final": current_alpha_lr if act_params else None,
                     "clean_acc": clean_acc,
-                    "pgd_acc": pgd_acc,
+                    "corruption_acc": corruption_acc,
+                    **{f"{name}_acc": value for name, value in corruption_accs.items()},
                     "alpha_clamp_events": alpha_clamp_events,
                     "alpha_clamp_checks": alpha_clamp_checks,
                     "alpha_history": alpha_logger.alpha_history,
@@ -472,17 +489,17 @@ def train_single_seed_robustness(
                 },
             ),
         )
-    return clean_acc, pgd_acc
+    return clean_acc, corruption_acc
 def run_benchmark(seeds=None, epochs: int = 10, data_root: str = './data', amp: bool = False):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Running Full Adversarial Robustness Benchmark on {device}")
+    print(f"Running Corruption Robustness Benchmark on {device}")
     activations = ['relu', 'gelu', 'swish', 'prelu', 'pgelu', 'golu_static', 'alpha_golu', 'swish_adaptive']
     seeds = seeds or [42, 123, 999, 2024, 2025]
 
     for act_type in activations:
         print(f"\n--- Activation: {act_type.upper()} ---")
         for seed in seeds:
-            clean_acc, pgd_acc = train_single_seed_robustness(
+            clean_acc, corruption_acc = train_single_seed_robustness(
                 act_type=act_type,
                 seed=seed,
                 epochs=epochs,
@@ -491,13 +508,13 @@ def run_benchmark(seeds=None, epochs: int = 10, data_root: str = './data', amp: 
                 save_artifacts=True,
                 amp=amp,
             )
-            print(f"Seed {seed} -> Clean Acc: {clean_acc:.2f}% | PGD-10 Robust Acc: {pgd_acc:.2f}%")
+            print(f"Seed {seed} -> Clean Acc: {clean_acc:.2f}% | Corruption Acc: {corruption_acc:.2f}%")
 
 
 def train_and_eval(activation: str = 'alpha_golu', seed: int = 42, epochs: int = 10, data_root: str = './data', alpha_lr: float | None = None, save_artifacts: bool = False, amp: bool = False) -> float:
-    """Returns Robust Accuracy under PGD attack."""
+    """Returns mean corruption accuracy."""
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    _, robust_acc = train_single_seed_robustness(
+    _, corruption_acc = train_single_seed_robustness(
         act_type=activation,
         seed=seed,
         epochs=epochs,
@@ -508,7 +525,7 @@ def train_and_eval(activation: str = 'alpha_golu', seed: int = 42, epochs: int =
         save_artifacts=save_artifacts,
         amp=amp,
     )
-    return float(robust_acc)
+    return float(corruption_acc)
 
 
 if __name__ == '__main__':
@@ -529,9 +546,9 @@ if __name__ == '__main__':
         run_benchmark(seeds=args.seeds, epochs=args.epochs, data_root=args.data_root, amp=args.amp)
     else:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        print(f"Running Adversarial Robustness Benchmark on {device}")
+        print(f"Running Corruption Robustness Benchmark on {device}")
         for seed in args.seeds:
-            robust_acc = train_and_eval(
+            corruption_acc = train_and_eval(
                 activation=args.activation,
                 seed=seed,
                 epochs=args.epochs,
@@ -541,4 +558,4 @@ if __name__ == '__main__':
                 save_artifacts=True,
                 amp=args.amp,
             )
-            print(f"Activation: {args.activation.ljust(15)} | Seed {seed} | PGD-10 Robust Acc: {robust_acc:.2f}%")
+            print(f"Activation: {args.activation.ljust(15)} | Seed {seed} | Corruption Acc: {corruption_acc:.2f}%")

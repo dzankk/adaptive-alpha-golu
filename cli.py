@@ -70,7 +70,7 @@ TASK_METRIC_KEYS = {
     "segmentation": "miou",
     "diffusion": "mse",
     "language_model": "perplexity",
-    "robustness": "pgd_acc",
+    "robustness": "corruption_acc",
 }
 
 LOWER_IS_BETTER_TASKS = {"diffusion", "language_model"}
