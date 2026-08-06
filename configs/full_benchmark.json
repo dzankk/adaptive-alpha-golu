@@ -10,24 +10,26 @@
         "robustness"
     ],
     "activations": [
+        "golu_static",
+        "alpha_golu",
         "relu",
         "gelu",
         "swish",
         "prelu",
         "pgelu",
-        "adaptive_swish",
-        "golu_static",
-        "alpha_golu"
+        "adaptive_swish"
     ],
     "seeds": [42, 123, 999],
     "data_root": "./data",
     "epochs_by_task": {
-        "classification": 100,
+        "classification": 40,
         "detection": 12,
-        "segmentation": 12,
-        "diffusion": 50,
-        "language_model": 20,
-        "robustness": 20
+        "segmentation": 20,
+        "diffusion": 30,
+        "robustness": 40
+    },
+    "steps_by_task": {
+        "language_model": 10000
     },
     "alpha_lr_by_task": {
         "classification": 0.0005,
