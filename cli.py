@@ -146,6 +146,25 @@ def _invoke_task_runner(runner_fn, act: str, *, seed: int, data_root: str, alpha
     return runner_fn(act, **accepted_kwargs)
 
 
+def _resolve_task_epochs(config: dict, task_name: str) -> int | None:
+    epochs_by_task = config.get("epochs_by_task", {})
+    if isinstance(epochs_by_task, dict):
+        value = epochs_by_task.get(task_name)
+        if isinstance(value, int) and value > 0:
+            return value
+
+    epochs_map = config.get("epochs", {})
+    if isinstance(epochs_map, dict):
+        value = epochs_map.get(task_name)
+        if isinstance(value, int) and value > 0:
+            return value
+
+    value = config.get("epochs")
+    if isinstance(value, int) and value > 0:
+        return value
+    return None
+
+
 def _save_json_file(path: Path, payload: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as handle:
@@ -492,7 +511,8 @@ def handle_run_all(args, summary_only: bool = False):
                     continue
 
                 alpha_lr = task_alpha_lrs.get(task_name)
-                acc = _invoke_task_runner(runner_fn, act, seed=seed, data_root=data_root, alpha_lr=alpha_lr, save_artifacts=args.save_artifacts, amp=args.amp)
+                task_epochs = _resolve_task_epochs(config, task_name)
+                acc = _invoke_task_runner(runner_fn, act, seed=seed, data_root=data_root, alpha_lr=alpha_lr, save_artifacts=args.save_artifacts, amp=args.amp, epochs=task_epochs)
                 accs.append(acc)
                 print(f"Seed {seed} -> Score: {acc:.4f}")
 
