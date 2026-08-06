@@ -92,6 +92,33 @@ def _load_json_file(path: Path) -> dict:
     return data if isinstance(data, dict) else {}
 
 
+def _merge_benchmark_results(base_results: dict, incoming_results: dict) -> dict:
+    merged = dict(base_results)
+    for task_name, task_payload in incoming_results.items():
+        if not isinstance(task_payload, dict):
+            continue
+        existing_task = merged.get(task_name, {}) if isinstance(merged.get(task_name, {}), dict) else {}
+        combined_task = dict(existing_task)
+        for activation_name, activation_payload in task_payload.items():
+            if activation_name.startswith("p_value_"):
+                combined_task[activation_name] = activation_payload
+                continue
+            if not isinstance(activation_payload, dict):
+                continue
+            existing_activation = combined_task.get(activation_name, {}) if isinstance(combined_task.get(activation_name, {}), dict) else {}
+            merged_activation = dict(existing_activation)
+            if "scores" in activation_payload:
+                merged_activation["scores"] = activation_payload["scores"]
+            if "completed_scores" in activation_payload:
+                merged_activation["completed_scores"] = activation_payload["completed_scores"]
+            for metric_key in ("mean", "std", "sem", "p_value", "p_value_welch_alpha_vs_static"):
+                if metric_key in activation_payload:
+                    merged_activation[metric_key] = activation_payload[metric_key]
+            combined_task[activation_name] = merged_activation
+        merged[task_name] = combined_task
+    return merged
+
+
 def _save_json_file(path: Path, payload: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as handle:
@@ -412,7 +439,9 @@ def handle_run_all(args, summary_only: bool = False):
             except OSError:
                 pass
         resume_state = {} if args.fresh else _load_json_file(resume_path)
-        all_task_results = resume_state.get("all_task_results", {}) if isinstance(resume_state.get("all_task_results", {}), dict) else {}
+        existing_summary = {} if args.fresh else _load_json_file(Path(summary_path))
+        resume_results = resume_state.get("all_task_results", {}) if isinstance(resume_state.get("all_task_results", {}), dict) else {}
+        all_task_results = _merge_benchmark_results(existing_summary, resume_results)
     else:
         all_task_results = {}
 
