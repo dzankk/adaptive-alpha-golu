@@ -974,6 +974,7 @@ def main():
     run_all_parser.add_argument("--save-artifacts", action="store_true", help="Save per-seed run JSONs, manifests, and trajectory plots")
     run_all_parser.add_argument("--amp", action="store_true", help="Enable BF16 automatic mixed precision on CUDA")
     run_all_parser.add_argument("--fresh", action="store_true", help="Ignore any saved resume state and start this run from scratch")
+    run_all_parser.add_argument("--resume", action="store_true", help="Alias for the default resumable mode")
 
     # Command: smoke_run
     smoke_parser = subparsers.add_parser("smoke_run", help="Run a fast static-vs-Alpha-GoLU smoke benchmark across all tasks")
@@ -993,6 +994,7 @@ def main():
     task_order_parser.add_argument("--save-artifacts", action="store_true", help="Save per-seed run JSONs, manifests, and trajectory plots")
     task_order_parser.add_argument("--amp", action="store_true", help="Enable BF16 automatic mixed precision on CUDA")
     task_order_parser.add_argument("--fresh", action="store_true", help="Ignore any saved resume state and start this run from scratch")
+    task_order_parser.add_argument("--resume", action="store_true", help="Alias for the default resumable mode")
 
     # Command: preflight
     preflight_parser = subparsers.add_parser("preflight", help="Run environment and storage checks before a long benchmark run")
