@@ -395,6 +395,8 @@ def train_single_seed(
         epoch_start = time.perf_counter()
         current_alpha_lr = update_alpha_lr(epoch)
         model.train()
+        epoch_loss_total = 0.0
+        epoch_batches = 0
         for inputs, labels in trainloader:
             inputs, labels = inputs.to(device, non_blocking=True), labels.to(device, non_blocking=True)
             optimizer.zero_grad()
@@ -412,12 +414,16 @@ def train_single_seed(
                 overhead_tracker.end_backward()
             clip_activation_gradients(model, max_norm=alpha_grad_clip_norm)
             optimizer.step()
+            epoch_loss_total += float(loss.item())
+            epoch_batches += 1
             clamp_events, clamp_checks = clamp_alpha_golu_modules(model, min_alpha=0.2, max_alpha=3.0)
             alpha_clamp_events += clamp_events
             alpha_clamp_checks += clamp_checks
         scheduler.step()
         epoch_seconds.append(time.perf_counter() - epoch_start)
         alpha_logger.step()
+        mean_epoch_loss = epoch_loss_total / max(epoch_batches, 1)
+        print(f"[CLASSIFICATION] Epoch {epoch + 1}/{epochs} - Loss: {mean_epoch_loss:.4f} | alpha_lr={current_alpha_lr:.6f}", flush=True)
 
     if torch.cuda.is_available():
         torch.cuda.synchronize(device)

@@ -129,7 +129,7 @@ def _merge_benchmark_results(base_results: dict, incoming_results: dict) -> dict
     return merged
 
 
-def _invoke_task_runner(runner_fn, act: str, *, seed: int, data_root: str, alpha_lr: float | None, save_artifacts: bool, amp: bool, epochs: int | None = None):
+def _invoke_task_runner(runner_fn, act: str, *, seed: int, data_root: str, alpha_lr: float | None, save_artifacts: bool, amp: bool, epochs: int | None = None, max_steps: int | None = None):
     candidate_kwargs = {
         "seed": seed,
         "data_root": data_root,
@@ -137,6 +137,7 @@ def _invoke_task_runner(runner_fn, act: str, *, seed: int, data_root: str, alpha
         "save_artifacts": save_artifacts,
         "amp": amp,
         "epochs": epochs,
+        "max_steps": max_steps,
     }
     signature = inspect.signature(runner_fn)
     accepted_kwargs = {
@@ -145,6 +146,25 @@ def _invoke_task_runner(runner_fn, act: str, *, seed: int, data_root: str, alpha
         if name in signature.parameters
     }
     return runner_fn(act, **accepted_kwargs)
+
+
+def _resolve_task_steps(config: dict, task_name: str) -> int | None:
+    steps_by_task = config.get("steps_by_task", {})
+    if isinstance(steps_by_task, dict):
+        value = steps_by_task.get(task_name)
+        if isinstance(value, int) and value > 0:
+            return value
+
+    steps_map = config.get("steps", {})
+    if isinstance(steps_map, dict):
+        value = steps_map.get(task_name)
+        if isinstance(value, int) and value > 0:
+            return value
+
+    value = config.get("steps")
+    if isinstance(value, int) and value > 0:
+        return value
+    return None
 
 
 def _resolve_task_epochs(config: dict, task_name: str) -> int | None:
@@ -513,7 +533,19 @@ def handle_run_all(args, summary_only: bool = False):
 
                 alpha_lr = task_alpha_lrs.get(task_name)
                 task_epochs = _resolve_task_epochs(config, task_name)
-                acc = _invoke_task_runner(runner_fn, act, seed=seed, data_root=data_root, alpha_lr=alpha_lr, save_artifacts=args.save_artifacts, amp=args.amp, epochs=task_epochs)
+                task_steps = _resolve_task_steps(config, task_name)
+                print(f"[{task_name.upper()}|{act.upper()}|Seed {seed}] Starting", flush=True)
+                acc = _invoke_task_runner(
+                    runner_fn,
+                    act,
+                    seed=seed,
+                    data_root=data_root,
+                    alpha_lr=alpha_lr,
+                    save_artifacts=args.save_artifacts,
+                    amp=args.amp,
+                    epochs=task_epochs,
+                    max_steps=task_steps,
+                )
                 accs.append(acc)
                 print(f"Seed {seed} -> Score: {acc:.4f}")
 

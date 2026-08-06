@@ -243,6 +243,8 @@ def train_single_seed_segmentation(act_type: str, seed: int, epochs: int, device
         epoch_start = time.perf_counter()
         model.train()
         current_alpha_lr = set_alpha_lr(epoch)
+        epoch_loss_total = 0.0
+        epoch_batches = 0
         for x, y in train_loader:
             x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
             optimizer.zero_grad()
@@ -260,11 +262,15 @@ def train_single_seed_segmentation(act_type: str, seed: int, epochs: int, device
                 overhead_tracker.end_backward()
             clip_activation_gradients(model, max_norm=alpha_grad_clip_norm)
             optimizer.step()
+            epoch_loss_total += float(loss.item())
+            epoch_batches += 1
             clamp_events, clamp_checks = clamp_alpha_golu_modules(model, min_alpha=0.2, max_alpha=3.0)
             alpha_clamp_events += clamp_events
             alpha_clamp_checks += clamp_checks
         epoch_seconds.append(time.perf_counter() - epoch_start)
         alpha_logger.step()
+        mean_epoch_loss = epoch_loss_total / max(epoch_batches, 1)
+        print(f"[SEGMENTATION] Epoch {epoch + 1}/{epochs} - Loss: {mean_epoch_loss:.4f} | alpha_lr={current_alpha_lr:.6f}", flush=True)
 
     train_seconds = time.perf_counter() - train_start
     overhead = overhead_tracker.save() if overhead_tracker is not None else {}

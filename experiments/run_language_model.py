@@ -32,7 +32,6 @@ from models.alpha_golu import AlphaGoLU as AdaptiveAlphaGoLU, StaticGoLU
 from diagnostics.trajectory_logger import AlphaTrajectoryLogger
 from utils.run_artifacts import build_run_manifest, create_run_directory, write_json
 from utils.overhead_tracker import OverheadTracker
-from utils.train_tuning import bf16_autocast, build_adamw_with_activation_groups, clip_activation_gradients, clamp_alpha_golu_modules, configure_benchmark_runtime, default_loader_kwargs, resolve_task_alpha_hparams
 from utils.train_tuning import bf16_autocast, build_adamw_with_activation_groups, clip_activation_gradients, clamp_alpha_golu_modules, configure_benchmark_runtime, default_loader_kwargs, overhead_tracking_enabled, resolve_task_alpha_hparams
 
 
@@ -308,6 +307,7 @@ def train_single_seed_lm(
     config_path: str | None = "configs/paper_benchmark.json",
     save_artifacts: bool = False,
     amp: bool = False,
+    max_steps: int | None = None,
 ) -> float:
     reset_all_seeds(seed)
 
@@ -335,11 +335,20 @@ def train_single_seed_lm(
     alpha_clamp_events = 0
     alpha_clamp_checks = 0
 
-    for epoch in range(epochs):
+    train_loader_len = max(len(train_loader), 1)
+    planned_steps = int(max_steps) if max_steps is not None and int(max_steps) > 0 else epochs * train_loader_len
+    global_step = 0
+    epoch = 0
+
+    while global_step < planned_steps and (max_steps is not None or epoch < max(epochs, 1)):
         epoch_start = time.perf_counter()
         model.train()
         current_alpha_lr = set_alpha_lr(epoch)
+        epoch_loss_total = 0.0
+        epoch_batches = 0
         for batch in train_loader:
+            if global_step >= planned_steps:
+                break
             batch = batch.to(device, non_blocking=True)
             inputs, targets = batch[:, :-1], batch[:, 1:]
             if overhead_tracker is not None:
@@ -359,11 +368,18 @@ def train_single_seed_lm(
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             clip_activation_gradients(model, max_norm=alpha_grad_clip_norm)
             optimizer.step()
+            global_step += 1
+            epoch_loss_total += float(loss.item())
+            epoch_batches += 1
             clamp_events, clamp_checks = clamp_alpha_golu_modules(model, min_alpha=0.2, max_alpha=3.0)
             alpha_clamp_events += clamp_events
             alpha_clamp_checks += clamp_checks
+            print(f"[LANGUAGE_MODEL] Step {global_step}/{planned_steps} (Epoch {epoch + 1}) - Loss: {float(loss.item()):.4f} | alpha_lr={current_alpha_lr:.6f}", flush=True)
         epoch_seconds.append(time.perf_counter() - epoch_start)
         alpha_logger.step()
+        mean_epoch_loss = epoch_loss_total / max(epoch_batches, 1)
+        print(f"[LANGUAGE_MODEL] Epoch {epoch + 1} complete - Mean Loss: {mean_epoch_loss:.4f} | steps={global_step}/{planned_steps}", flush=True)
+        epoch += 1
 
     model.eval()
     total_loss = 0.0
@@ -432,7 +448,7 @@ def train_single_seed_lm(
     return float(perplexity)
 
 
-def run_lm_benchmark(seeds=None, epochs=5, data_root: str = "./data", alpha_lr: float | None = None, config_path: str | None = "configs/paper_benchmark.json", amp: bool = False):
+def run_lm_benchmark(seeds=None, epochs=5, data_root: str = "./data", alpha_lr: float | None = None, config_path: str | None = "configs/paper_benchmark.json", amp: bool = False, max_steps: int | None = None):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     seeds = seeds or [42, 123, 999, 2024, 2025]
     print(f"Running WikiText-2 Language Model Benchmark on {device}...")
@@ -442,17 +458,17 @@ def run_lm_benchmark(seeds=None, epochs=5, data_root: str = "./data", alpha_lr: 
     for act_type in activations:
         ppls = []
         for s in seeds:
-            ppl = train_single_seed_lm(act_type=act_type, seed=s, epochs=epochs, device=device, data_root=data_root, alpha_lr=alpha_lr, config_path=config_path, save_artifacts=True, amp=amp)
+            ppl = train_single_seed_lm(act_type=act_type, seed=s, epochs=epochs, device=device, data_root=data_root, alpha_lr=alpha_lr, config_path=config_path, save_artifacts=True, amp=amp, max_steps=max_steps)
             ppls.append(ppl)
             print(f"[{act_type.upper():<14} | Seed {s}] Validation Perplexity: {ppl:.2f}")
 
         print(f"  --> {act_type.upper():<14} Mean PPL: {np.mean(ppls):.2f} ± {np.std(ppls):.2f}\n")
 
 
-def train_and_eval(activation: str = "alpha_golu", seed: int = 42, epochs: int = 5, data_root: str = "./data", alpha_lr: float | None = None, config_path: str | None = "configs/paper_benchmark.json", save_artifacts: bool = False, amp: bool = False) -> float:
+def train_and_eval(activation: str = "alpha_golu", seed: int = 42, epochs: int = 5, data_root: str = "./data", alpha_lr: float | None = None, config_path: str | None = "configs/paper_benchmark.json", save_artifacts: bool = False, amp: bool = False, max_steps: int | None = None) -> float:
     """Returns validation perplexity on WikiText-2."""
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    perplexity = train_single_seed_lm(act_type=activation, seed=seed, epochs=epochs, device=device, data_root=data_root, alpha_lr=alpha_lr, config_path=config_path, save_artifacts=save_artifacts, amp=amp)
+    perplexity = train_single_seed_lm(act_type=activation, seed=seed, epochs=epochs, device=device, data_root=data_root, alpha_lr=alpha_lr, config_path=config_path, save_artifacts=save_artifacts, amp=amp, max_steps=max_steps)
     return float(perplexity)
 
 
@@ -466,15 +482,16 @@ if __name__ == "__main__":
     parser.add_argument("--data-root", type=str, default="./data", help="Dataset cache root")
     parser.add_argument("--alpha-lr", type=float, default=None, help="Learning rate for language-model activation parameters; defaults to configs/paper_benchmark.json")
     parser.add_argument("--config", type=str, default="configs/paper_benchmark.json", help="Benchmark config file used for task alpha hyperparameters")
+    parser.add_argument("--max-steps", type=int, default=None, help="Optional step budget for language-model training")
     parser.add_argument("--benchmark", action="store_true", help="Run the full activation sweep")
     parser.add_argument("--amp", action="store_true", help="Enable BF16 automatic mixed precision on CUDA")
     args = parser.parse_args()
 
     if args.benchmark:
-        run_lm_benchmark(seeds=args.seeds, epochs=args.epochs, data_root=args.data_root, alpha_lr=args.alpha_lr, config_path=args.config, amp=args.amp)
+        run_lm_benchmark(seeds=args.seeds, epochs=args.epochs, data_root=args.data_root, alpha_lr=args.alpha_lr, config_path=args.config, amp=args.amp, max_steps=args.max_steps)
     else:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"Running WikiText-2 Language Model Benchmark on {device}...")
         for seed in args.seeds:
-            ppl = train_and_eval(activation=args.activation, seed=seed, epochs=args.epochs, data_root=args.data_root, alpha_lr=args.alpha_lr, config_path=args.config, amp=args.amp)
+            ppl = train_and_eval(activation=args.activation, seed=seed, epochs=args.epochs, data_root=args.data_root, alpha_lr=args.alpha_lr, config_path=args.config, amp=args.amp, max_steps=args.max_steps)
             print(f"[{args.activation.upper():<14} | Seed {seed}] Validation Perplexity: {ppl:.2f}")

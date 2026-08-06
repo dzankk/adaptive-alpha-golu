@@ -203,6 +203,8 @@ def train_single_seed_diffusion(act_type: str, seed: int, epochs: int, device: t
         epoch_start = time.perf_counter()
         model.train()
         current_alpha_lr = set_alpha_lr(epoch)
+        epoch_loss_total = 0.0
+        epoch_batches = 0
         for x0, _ in trainloader:
             x0 = x0.to(device, non_blocking=True)
             t = torch.randint(0, timesteps, (x0.size(0),), device=device).long()
@@ -227,12 +229,16 @@ def train_single_seed_diffusion(act_type: str, seed: int, epochs: int, device: t
                 overhead_tracker.end_backward()
             clip_activation_gradients(model, max_norm=alpha_grad_clip_norm)
             optimizer.step()
+            epoch_loss_total += float(loss.item())
+            epoch_batches += 1
             clamp_events, clamp_checks = clamp_alpha_golu_modules(model, min_alpha=0.2, max_alpha=3.0)
             alpha_clamp_events += clamp_events
             alpha_clamp_checks += clamp_checks
         epoch_seconds.append(time.perf_counter() - epoch_start)
         alpha_logger.step()
         train_seconds = time.perf_counter() - train_start
+        mean_epoch_loss = epoch_loss_total / max(epoch_batches, 1)
+        print(f"[DIFFUSION] Epoch {epoch + 1}/{epochs} - Loss: {mean_epoch_loss:.6f} | alpha_lr={current_alpha_lr:.6f}", flush=True)
 
     model.eval()
     val_losses = []
