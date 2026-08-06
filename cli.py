@@ -487,11 +487,12 @@ def handle_run_all(args, summary_only: bool = False):
             sys.exit(1)
         selected_tasks.append(normalized_task)
     
-    print("\n================ Launching Full Paper Benchmark Suite ================")
-    print(f"Activations to test ({len(activations)}): {', '.join(activations)}")
-    print(f"Seeds ({len(seeds)}): {seeds}")
-    if args.config:
-        print(f"[Config] Loaded benchmark config from {args.config}")
+    if not args.save_artifacts:
+        print("\n================ Launching Full Paper Benchmark Suite ================")
+        print(f"Activations to test ({len(activations)}): {', '.join(activations)}")
+        print(f"Seeds ({len(seeds)}): {seeds}")
+        if args.config:
+            print(f"[Config] Loaded benchmark config from {args.config}")
 
     resume_path = None
     if not summary_only:
@@ -516,11 +517,13 @@ def handle_run_all(args, summary_only: bool = False):
 
     for task_name in selected_tasks:
         runner_fn = TASK_MAP[task_name]
-        print(f"\n\n################ Task: {task_name.upper()} ################")
+        if not args.save_artifacts:
+            print(f"\n\n################ Task: {task_name.upper()} ################")
         task_results = all_task_results.get(task_name, {}) if isinstance(all_task_results.get(task_name, {}), dict) else {}
         
         for act in activations:
-            print(f"\n--- Activation: {act.upper()} ---")
+            if not args.save_artifacts:
+                print(f"\n--- Activation: {act.upper()} ---")
             existing_entry = task_results.get(act, {}) if isinstance(task_results.get(act, {}), dict) else {}
             completed_scores = existing_entry.get("completed_scores", {}) if isinstance(existing_entry.get("completed_scores", {}), dict) else {}
             accs = [float(completed_scores[str(seed)]) for seed in seeds if str(seed) in completed_scores]
@@ -528,13 +531,12 @@ def handle_run_all(args, summary_only: bool = False):
             for seed in seeds:
                 seed_key = str(seed)
                 if seed_key in completed_scores:
-                    print(f"Seed {seed} -> Score: {float(completed_scores[seed_key]):.4f} (already completed)")
+                    print(f"Seed {seed} -> Score: {float(completed_scores[seed_key]):.4f}")
                     continue
 
                 alpha_lr = task_alpha_lrs.get(task_name)
                 task_epochs = _resolve_task_epochs(config, task_name)
                 task_steps = _resolve_task_steps(config, task_name)
-                print(f"[{task_name.upper()}|{act.upper()}|Seed {seed}] Starting", flush=True)
                 acc = _invoke_task_runner(
                     runner_fn,
                     act,
@@ -587,7 +589,8 @@ def handle_run_all(args, summary_only: bool = False):
                 task_results["alpha_golu"]["scores"]
             )
             all_task_results[task_name]["p_value_welch_alpha_vs_static"] = p_val
-            print(f"\n[Statistical Significance] Welch t-test (Alpha-GoLU vs Static): p = {p_val:.4f}")
+            if not args.save_artifacts:
+                print(f"\n[Statistical Significance] Welch t-test (Alpha-GoLU vs Static): p = {p_val:.4f}")
 
     json_path = summary_path
     with open(json_path, "w") as f:
@@ -620,10 +623,11 @@ def handle_run_all(args, summary_only: bool = False):
                 resume_path.unlink()
             except OSError:
                 pass
-    print(f"\n[IO] Saved benchmark JSON summary to {json_path}")
-    if run_dir is not None:
-        print(f"[IO] Saved full-suite run artifacts to {run_dir}")
-    print("\n================ All Experiments Completed Successfully! ================")
+    if not args.save_artifacts:
+        print(f"\n[IO] Saved benchmark JSON summary to {json_path}")
+        if run_dir is not None:
+            print(f"[IO] Saved full-suite run artifacts to {run_dir}")
+        print("\n================ All Experiments Completed Successfully! ================")
 
 
 def handle_smoke_run(args):
