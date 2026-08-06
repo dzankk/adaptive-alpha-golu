@@ -75,6 +75,15 @@ TASK_METRIC_KEYS = {
 
 LOWER_IS_BETTER_TASKS = {"diffusion", "language_model"}
 
+FAST_TO_SLOW_TASK_ORDER = [
+    "classification",
+    "robustness",
+    "language_model",
+    "segmentation",
+    "detection",
+    "diffusion",
+]
+
 
 def _stable_signature(payload: dict) -> str:
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
@@ -574,6 +583,21 @@ def handle_smoke_run(args):
     handle_run_all(args, summary_only=True)
 
 
+def handle_task_order(args):
+    """Runs tasks in a recommended fast-to-slow publication order."""
+    requested_tasks = args.tasks if args.tasks else FAST_TO_SLOW_TASK_ORDER
+    ordered_tasks = []
+    for task_name in FAST_TO_SLOW_TASK_ORDER:
+        if task_name in requested_tasks:
+            ordered_tasks.append(task_name)
+    for task_name in requested_tasks:
+        if task_name not in ordered_tasks:
+            ordered_tasks.append(task_name)
+
+    args.tasks = ordered_tasks
+    handle_run_all(args)
+
+
 def handle_generate_table(args):
     """Generates a publication-ready LaTeX benchmark table from JSON results with bold/underline highlighting."""
     json_path = args.results_path
@@ -910,6 +934,18 @@ def main():
     smoke_parser.add_argument("--min-free-gb", type=float, default=20.0, help="Minimum free disk space required before launching")
     smoke_parser.add_argument("--amp", action="store_true", help="Enable BF16 automatic mixed precision on CUDA")
 
+    # Command: task_order
+    task_order_parser = subparsers.add_parser("task_order", help="Run tasks in a recommended fast-to-slow order")
+    task_order_parser.add_argument("--tasks", type=str, nargs="+", default=None, choices=list(TASK_MAP.keys()), help="Optional subset of tasks to run in the recommended order")
+    task_order_parser.add_argument("--activations", type=str, nargs="+", default=CANONICAL_ACTIVATIONS, choices=SUPPORTED_ACTIVATIONS, help="Activations to evaluate")
+    task_order_parser.add_argument("--seeds", type=int, nargs="+", default=DEFAULT_SEEDS, help="Random seeds for statistical testing")
+    task_order_parser.add_argument("--config", type=str, default=None, help="Path to a JSON benchmark config file")
+    task_order_parser.add_argument("--data-root", type=str, default="./data", help="Dataset cache root used when config does not specify one")
+    task_order_parser.add_argument("--min-free-gb", type=float, default=20.0, help="Minimum free disk space required before launching")
+    task_order_parser.add_argument("--save-artifacts", action="store_true", help="Save per-seed run JSONs, manifests, and trajectory plots")
+    task_order_parser.add_argument("--amp", action="store_true", help="Enable BF16 automatic mixed precision on CUDA")
+    task_order_parser.add_argument("--fresh", action="store_true", help="Ignore any saved resume state and start this run from scratch")
+
     # Command: preflight
     preflight_parser = subparsers.add_parser("preflight", help="Run environment and storage checks before a long benchmark run")
     preflight_parser.add_argument("--data-root", type=str, default="./data", help="Dataset cache root to check")
@@ -959,6 +995,8 @@ def main():
         handle_run_all(args)
     elif args.command == "smoke_run":
         handle_smoke_run(args)
+    elif args.command == "task_order":
+        handle_task_order(args)
     elif args.command == "generate_table":
         handle_generate_table(args)
     elif args.command == "generate_overhead_table":
