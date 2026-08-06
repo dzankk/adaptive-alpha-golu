@@ -22,7 +22,7 @@
     "seeds": [42, 123, 999],
     "data_root": "./data",
     "epochs_by_task": {
-        "classification": 40,
+        "classification": 50,
         "detection": 12,
         "segmentation": 20,
         "diffusion": 30,
