@@ -29,6 +29,7 @@ from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
 from torchvision.models.detection.rpn import AnchorGenerator
 from torchvision.ops import box_iou
 from torchvision.transforms import functional as TF
+from torchvision.models import ResNet50_Weights
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -234,7 +235,7 @@ class ActivationBoxHead(nn.Module):
 
 
 def build_detection_model(act_type: str, num_classes: int = 21) -> FasterRCNN:
-    backbone = resnet_fpn_backbone(backbone_name="resnet50", weights=None, trainable_layers=3)
+    backbone = resnet_fpn_backbone(backbone_name="resnet50", weights=ResNet50_Weights.DEFAULT, trainable_layers=3)
     anchor_generator = AnchorGenerator(
         sizes=((32,), (64,), (128,), (256,), (512,)),
         aspect_ratios=((0.5, 1.0, 2.0),) * 5,
