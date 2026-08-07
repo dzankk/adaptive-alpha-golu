@@ -30,7 +30,7 @@ from models.alpha_golu import AlphaGoLU as AdaptiveAlphaGoLU, StaticGoLU
 from diagnostics.trajectory_logger import AlphaTrajectoryLogger
 from utils.overhead_tracker import OverheadTracker
 from utils.run_artifacts import build_run_manifest, create_run_directory, write_json
-from utils.train_tuning import bf16_autocast, clip_activation_gradients, clamp_alpha_golu_modules, configure_benchmark_runtime, default_loader_kwargs, overhead_tracking_enabled, resolve_task_alpha_hparams
+from utils.train_tuning import bf16_autocast, clip_activation_gradients, clamp_alpha_golu_modules, configure_benchmark_runtime, default_loader_kwargs, overhead_tracking_enabled, resolve_task_alpha_hparams, split_model_parameters
 
 
 # ==========================================
@@ -259,6 +259,23 @@ def get_optimizer(
     return optimizer
 
 
+def compute_parameter_grad_norm(parameters: list[torch.nn.Parameter], norm_type: float = 2.0) -> float:
+    grad_norms = []
+    for parameter in parameters:
+        if parameter.grad is None:
+            continue
+        grad = parameter.grad.detach()
+        if not torch.isfinite(grad).all():
+            return float("nan")
+        grad_norms.append(float(torch.linalg.vector_norm(grad.float(), ord=norm_type).item()))
+
+    if not grad_norms:
+        return 0.0
+
+    stacked = torch.tensor(grad_norms, dtype=torch.float32)
+    return float(torch.linalg.vector_norm(stacked, ord=norm_type).item())
+
+
 # ==========================================
 # 2. DeepLabV3 Architecture
 # ==========================================
@@ -294,6 +311,21 @@ class ImageNetBackboneDeepLabV3(nn.Module):
 
     def forward_outputs(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
         return self.model(x)
+
+    def named_backbone_parameters(self) -> list[tuple[str, torch.nn.Parameter]]:
+        return [(name, parameter) for name, parameter in self.named_parameters() if name.startswith("model.backbone.")]
+
+    def named_head_parameters(self) -> list[tuple[str, torch.nn.Parameter]]:
+        return [(name, parameter) for name, parameter in self.named_parameters() if not name.startswith("model.backbone.")]
+
+    def set_backbone_base_trainable(self, trainable: bool) -> None:
+        activation_ids = {id(parameter) for parameter in split_model_parameters(self)[1]}
+        for name, parameter in self.named_parameters():
+            if not name.startswith("model.backbone."):
+                continue
+            if id(parameter) in activation_ids:
+                continue
+            parameter.requires_grad_(trainable)
 
 
 # ==========================================
@@ -401,7 +433,7 @@ def set_seed(seed: int):
     configure_benchmark_runtime()
 
 
-def train_single_seed_segmentation(act_type: str, seed: int, epochs: int, device: torch.device, data_root: str = './data', base_lr: float = 2e-2, alpha_lr: float | None = None, config_path: str | None = "configs/paper_benchmark.json", save_artifacts: bool = False, amp: bool = False) -> float:
+def train_single_seed_segmentation(act_type: str, seed: int, epochs: int, device: torch.device, data_root: str = './data', base_lr: float = 2e-2, alpha_lr: float | None = None, alpha_lr_multiplier: float = 10.0, freeze_backbone_epochs: int = 2, config_path: str | None = "configs/paper_benchmark.json", save_artifacts: bool = False, amp: bool = False) -> float:
     set_seed(seed)
     
     full_dataset = PascalVOCSegmentationDataset(root=data_root, year='2012', image_set='train', image_size=256, train=True, download=True)
@@ -425,14 +457,40 @@ def train_single_seed_segmentation(act_type: str, seed: int, epochs: int, device
         alpha_lr,
         config_path=config_path,
     )
-    optimizer = get_optimizer(model, lr=base_lr)
+    activation_params = split_model_parameters(model)[1]
+    activation_param_ids = {id(parameter) for parameter in activation_params}
+    backbone_base_params: list[torch.nn.Parameter] = []
+    head_base_params: list[torch.nn.Parameter] = []
+    for name, parameter in model.named_parameters():
+        if id(parameter) in activation_param_ids:
+            continue
+        if name.startswith("model.backbone."):
+            backbone_base_params.append(parameter)
+        else:
+            head_base_params.append(parameter)
+
+    activation_lr_value = float(alpha_lr if alpha_lr is not None else base_lr * float(alpha_lr_multiplier))
+    optimizer = torch.optim.SGD(
+        [
+            {"params": backbone_base_params, "lr": float(base_lr), "weight_decay": 1e-4},
+            {"params": head_base_params, "lr": float(base_lr), "weight_decay": 1e-4},
+            {"params": activation_params, "lr": activation_lr_value, "weight_decay": 0.0},
+        ],
+        lr=float(base_lr),
+        momentum=0.9,
+        weight_decay=1e-4,
+    )
     scheduler = PolynomialLR(optimizer, total_iters=max(int(epochs) * max(len(train_loader), 1), 1), power=0.9)
     criterion = nn.CrossEntropyLoss(ignore_index=255)
     aux_loss_weight = 0.4
     epoch_seconds = []
     epoch_losses = []
     lr_history = []
+    activation_lr_history = []
     grad_norm_history = []
+    backbone_grad_norm_history = []
+    head_grad_norm_history = []
+    activation_grad_norm_history = []
     batch_grad_norm_history = []
     activation_stats_history: dict[str, dict[str, dict[str, float]]] = {}
     train_start = time.perf_counter()
@@ -474,6 +532,9 @@ def train_single_seed_segmentation(act_type: str, seed: int, epochs: int, device
                 "data_root": data_root,
                 "epochs": epochs,
                 "base_lr": base_lr,
+                "activation_lr": activation_lr_value,
+                "alpha_lr_multiplier": alpha_lr_multiplier,
+                "freeze_backbone_epochs": freeze_backbone_epochs,
                 "batch_size": train_batch_size,
                 "optimizer": "SGD",
                 "scheduler": "PolynomialLR",
@@ -484,13 +545,20 @@ def train_single_seed_segmentation(act_type: str, seed: int, epochs: int, device
 
     for epoch in range(epochs):
         epoch_start = time.perf_counter()
+        freeze_backbone = epoch < max(int(freeze_backbone_epochs), 0)
+        for parameter in backbone_base_params:
+            parameter.requires_grad_(not freeze_backbone)
         model.train()
         if epoch < 2:
             activation_probe.start_epoch()
         current_lr = float(optimizer.param_groups[0]["lr"])
+        current_activation_lr = float(optimizer.param_groups[-1]["lr"])
         epoch_loss_total = 0.0
         epoch_batches = 0
         epoch_grad_norm_total = 0.0
+        epoch_backbone_grad_norm_total = 0.0
+        epoch_head_grad_norm_total = 0.0
+        epoch_activation_grad_norm_total = 0.0
         epoch_batch_grad_norms = []
         for x, y in train_loader:
             x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
@@ -513,9 +581,15 @@ def train_single_seed_segmentation(act_type: str, seed: int, epochs: int, device
             if overhead_tracker is not None:
                 overhead_tracker.end_backward()
             grad_norm = compute_model_grad_norm(model)
-            if not math.isfinite(grad_norm):
+            backbone_grad_norm = compute_parameter_grad_norm(backbone_base_params)
+            head_grad_norm = compute_parameter_grad_norm(head_base_params)
+            activation_grad_norm = compute_parameter_grad_norm(activation_params)
+            if not (math.isfinite(grad_norm) and math.isfinite(backbone_grad_norm) and math.isfinite(head_grad_norm) and math.isfinite(activation_grad_norm)):
                 raise RuntimeError(f"Non-finite gradient norm detected for activation={act_type}, seed={seed}, epoch={epoch + 1}")
             epoch_grad_norm_total += grad_norm
+            epoch_backbone_grad_norm_total += backbone_grad_norm
+            epoch_head_grad_norm_total += head_grad_norm
+            epoch_activation_grad_norm_total += activation_grad_norm
             epoch_batch_grad_norms.append(grad_norm)
             clip_activation_gradients(model, max_norm=alpha_grad_clip_norm)
             optimizer.step()
@@ -527,10 +601,17 @@ def train_single_seed_segmentation(act_type: str, seed: int, epochs: int, device
             alpha_clamp_checks += clamp_checks
         mean_epoch_loss = epoch_loss_total / max(epoch_batches, 1)
         mean_epoch_grad_norm = epoch_grad_norm_total / max(epoch_batches, 1)
+        mean_epoch_backbone_grad_norm = epoch_backbone_grad_norm_total / max(epoch_batches, 1)
+        mean_epoch_head_grad_norm = epoch_head_grad_norm_total / max(epoch_batches, 1)
+        mean_epoch_activation_grad_norm = epoch_activation_grad_norm_total / max(epoch_batches, 1)
         epoch_seconds.append(time.perf_counter() - epoch_start)
         epoch_losses.append(mean_epoch_loss)
         lr_history.append(float(optimizer.param_groups[0]["lr"]))
+        activation_lr_history.append(current_activation_lr)
         grad_norm_history.append(mean_epoch_grad_norm)
+        backbone_grad_norm_history.append(mean_epoch_backbone_grad_norm)
+        head_grad_norm_history.append(mean_epoch_head_grad_norm)
+        activation_grad_norm_history.append(mean_epoch_activation_grad_norm)
         batch_grad_norm_history.append(epoch_batch_grad_norms)
         alpha_logger.step()
         final_epoch_loss = mean_epoch_loss
@@ -558,10 +639,18 @@ def train_single_seed_segmentation(act_type: str, seed: int, epochs: int, device
                     "epoch_loss_history": epoch_losses,
                     "epoch_seconds": epoch_seconds,
                     "lr_history": lr_history,
+                    "activation_lr_history": activation_lr_history,
                     "lr_current": current_lr,
+                    "activation_lr_current": current_activation_lr,
                     "grad_norm_history": grad_norm_history,
+                    "backbone_grad_norm_history": backbone_grad_norm_history,
+                    "head_grad_norm_history": head_grad_norm_history,
+                    "activation_grad_norm_history": activation_grad_norm_history,
                     "batch_grad_norm_history": batch_grad_norm_history,
                     "grad_norm_epoch": mean_epoch_grad_norm,
+                    "backbone_grad_norm_epoch": mean_epoch_backbone_grad_norm,
+                    "head_grad_norm_epoch": mean_epoch_head_grad_norm,
+                    "activation_grad_norm_epoch": mean_epoch_activation_grad_norm,
                     "activation_epoch_stats": activation_epoch_stats,
                     "activation_stats_history": activation_stats_history,
                     "alpha_clamp_events": alpha_clamp_events,
@@ -570,7 +659,7 @@ def train_single_seed_segmentation(act_type: str, seed: int, epochs: int, device
                 },
             )
         if not save_artifacts:
-            print(f"[SEGMENTATION] Epoch {epoch + 1}/{epochs} - Loss: {mean_epoch_loss:.4f} | grad_norm={mean_epoch_grad_norm:.4f} | lr={lr_history[-1]:.6f}", flush=True)
+            print(f"[SEGMENTATION] Epoch {epoch + 1}/{epochs} - Loss: {mean_epoch_loss:.4f} | grad_norm={mean_epoch_grad_norm:.4f} | backbone_grad={mean_epoch_backbone_grad_norm:.4f} | head_grad={mean_epoch_head_grad_norm:.4f} | act_grad={mean_epoch_activation_grad_norm:.4f} | lr={lr_history[-1]:.6f} | act_lr={activation_lr_history[-1]:.6f}", flush=True)
 
     train_seconds = time.perf_counter() - train_start
     overhead = overhead_tracker.save() if overhead_tracker is not None else {}
@@ -604,7 +693,11 @@ def train_single_seed_segmentation(act_type: str, seed: int, epochs: int, device
             "miou": float(miou),
             "epoch_loss_history": epoch_losses,
             "lr_history": lr_history,
+            "activation_lr_history": activation_lr_history,
             "grad_norm_history": grad_norm_history,
+            "backbone_grad_norm_history": backbone_grad_norm_history,
+            "head_grad_norm_history": head_grad_norm_history,
+            "activation_grad_norm_history": activation_grad_norm_history,
             "batch_grad_norm_history": batch_grad_norm_history,
             "activation_stats_history": activation_stats_history,
             "alpha_clamp_events": alpha_clamp_events,
@@ -630,7 +723,11 @@ def train_single_seed_segmentation(act_type: str, seed: int, epochs: int, device
                 "epoch_loss_history": epoch_losses,
                 "epoch_seconds": epoch_seconds,
                 "lr_history": lr_history,
+                "activation_lr_history": activation_lr_history,
                 "grad_norm_history": grad_norm_history,
+                "backbone_grad_norm_history": backbone_grad_norm_history,
+                "head_grad_norm_history": head_grad_norm_history,
+                "activation_grad_norm_history": activation_grad_norm_history,
                 "batch_grad_norm_history": batch_grad_norm_history,
                 "activation_stats_history": activation_stats_history,
                 "miou": float(miou),
@@ -661,7 +758,7 @@ def train_single_seed_segmentation(act_type: str, seed: int, epochs: int, device
     return miou
 
 
-def run_segmentation_benchmark(seeds=None, epochs=30, data_root: str = './data', base_lr: float = 2e-2, alpha_lr: float | None = None, config_path: str | None = "configs/paper_benchmark.json", amp: bool = False):
+def run_segmentation_benchmark(seeds=None, epochs=30, data_root: str = './data', base_lr: float = 2e-2, alpha_lr: float | None = None, alpha_lr_multiplier: float = 10.0, freeze_backbone_epochs: int = 2, config_path: str | None = "configs/paper_benchmark.json", amp: bool = False):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     seeds = seeds or [42, 123, 999, 2024, 2025]
     print(f"Running Segmentation Benchmark on {device} (N={len(seeds)})")
@@ -670,16 +767,16 @@ def run_segmentation_benchmark(seeds=None, epochs=30, data_root: str = './data',
     for act_type in activations:
         scores = []
         for s in seeds:
-            miou = train_single_seed_segmentation(act_type=act_type, seed=s, epochs=epochs, device=device, data_root=data_root, base_lr=base_lr, alpha_lr=alpha_lr, config_path=config_path, save_artifacts=True, amp=amp)
+            miou = train_single_seed_segmentation(act_type=act_type, seed=s, epochs=epochs, device=device, data_root=data_root, base_lr=base_lr, alpha_lr=alpha_lr, alpha_lr_multiplier=alpha_lr_multiplier, freeze_backbone_epochs=freeze_backbone_epochs, config_path=config_path, save_artifacts=True, amp=amp)
             scores.append(miou)
             print(f"Activation: {act_type.ljust(15)} | Seed {s} | Validation mIoU: {miou:.4f}")
         print(f"--> {act_type.upper()} Mean mIoU: {np.mean(scores):.4f} ± {np.std(scores):.4f}\n")
 
 
-def train_and_eval(activation: str = 'alpha_golu', seed: int = 42, epochs: int = 30, data_root: str = './data', base_lr: float = 2e-2, alpha_lr: float | None = None, config_path: str | None = "configs/paper_benchmark.json", save_artifacts: bool = False, amp: bool = False) -> float:
+def train_and_eval(activation: str = 'alpha_golu', seed: int = 42, epochs: int = 30, data_root: str = './data', base_lr: float = 2e-2, alpha_lr: float | None = None, alpha_lr_multiplier: float = 10.0, freeze_backbone_epochs: int = 2, config_path: str | None = "configs/paper_benchmark.json", save_artifacts: bool = False, amp: bool = False) -> float:
     """Returns Mean Intersection over Union (mIoU)."""
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    miou = train_single_seed_segmentation(act_type=activation, seed=seed, epochs=epochs, device=device, data_root=data_root, base_lr=base_lr, alpha_lr=alpha_lr, config_path=config_path, save_artifacts=save_artifacts, amp=amp)
+    miou = train_single_seed_segmentation(act_type=activation, seed=seed, epochs=epochs, device=device, data_root=data_root, base_lr=base_lr, alpha_lr=alpha_lr, alpha_lr_multiplier=alpha_lr_multiplier, freeze_backbone_epochs=freeze_backbone_epochs, config_path=config_path, save_artifacts=save_artifacts, amp=amp)
     return float(miou)
 
 
@@ -691,6 +788,8 @@ if __name__ == '__main__':
     parser.add_argument("--seeds", type=int, nargs="+", default=[42, 123, 999, 2024, 2025], help="Random seeds")
     parser.add_argument("--epochs", type=int, default=30, help="Training epochs")
     parser.add_argument("--lr", type=float, default=0.02, help="Base SGD learning rate (paper default: 0.02; alternative: 0.01)")
+    parser.add_argument("--alpha-lr-multiplier", type=float, default=10.0, help="Multiplier applied to base LR for activation parameters when alpha_lr is not set explicitly")
+    parser.add_argument("--freeze-backbone-epochs", type=int, default=2, help="Number of initial epochs to freeze backbone non-activation weights")
     parser.add_argument("--data-root", type=str, default="./data", help="Dataset cache root")
     parser.add_argument("--alpha-lr", type=float, default=None, help="Learning rate for activation parameters; defaults to configs/paper_benchmark.json")
     parser.add_argument("--config", type=str, default="configs/paper_benchmark.json", help="Benchmark config file used for task alpha hyperparameters")
@@ -699,10 +798,10 @@ if __name__ == '__main__':
     args = parser.parse_args()
 
     if args.benchmark:
-        run_segmentation_benchmark(seeds=args.seeds, epochs=args.epochs, data_root=args.data_root, base_lr=args.lr, alpha_lr=args.alpha_lr, config_path=args.config, amp=args.amp)
+        run_segmentation_benchmark(seeds=args.seeds, epochs=args.epochs, data_root=args.data_root, base_lr=args.lr, alpha_lr=args.alpha_lr, alpha_lr_multiplier=args.alpha_lr_multiplier, freeze_backbone_epochs=args.freeze_backbone_epochs, config_path=args.config, amp=args.amp)
     else:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"Running Segmentation Benchmark on {device} (N={len(args.seeds)})")
         for seed in args.seeds:
-            miou = train_and_eval(activation=args.activation, seed=seed, epochs=args.epochs, data_root=args.data_root, base_lr=args.lr, alpha_lr=args.alpha_lr, config_path=args.config, amp=args.amp)
+            miou = train_and_eval(activation=args.activation, seed=seed, epochs=args.epochs, data_root=args.data_root, base_lr=args.lr, alpha_lr=args.alpha_lr, alpha_lr_multiplier=args.alpha_lr_multiplier, freeze_backbone_epochs=args.freeze_backbone_epochs, config_path=args.config, amp=args.amp)
             print(f"Activation: {args.activation.ljust(15)} | Seed {seed} | Validation mIoU: {miou:.4f}")
