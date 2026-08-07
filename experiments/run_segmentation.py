@@ -16,7 +16,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.optim.lr_scheduler import PolynomialLR
-from torch.utils.data import DataLoader, Dataset, random_split
+from torch.utils.data import DataLoader, Dataset
 from torchvision.datasets import VOCSegmentation
 from torchvision.models import ResNet50_Weights
 from torchvision.models.segmentation import deeplabv3_resnet50
@@ -130,6 +130,9 @@ class ImageNetBackboneDeepLabV3(nn.Module):
         outputs = self.model(x)
         return outputs["out"]
 
+    def forward_outputs(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
+        return self.model(x)
+
 
 # ==========================================
 # 3. Real Dataset & Metrics
@@ -192,12 +195,7 @@ def train_single_seed_segmentation(act_type: str, seed: int, epochs: int, device
     
     full_dataset = PascalVOCSegmentationDataset(root=data_root, year='2012', image_set='train', image_size=256, download=True)
     val_dataset = PascalVOCSegmentationDataset(root=data_root, year='2012', image_set='val', image_size=256, download=True)
-    train_size = int(0.8 * len(full_dataset))
-    val_size = len(full_dataset) - train_size
-    train_ds, val_ds = random_split(
-        full_dataset, [train_size, val_size], generator=torch.Generator().manual_seed(seed)
-    )
-    # Use the actual Pascal VOC validation split for final reporting.
+    train_ds = full_dataset
     val_ds = val_dataset
 
     loader_g = torch.Generator().manual_seed(seed)
@@ -215,11 +213,13 @@ def train_single_seed_segmentation(act_type: str, seed: int, epochs: int, device
         config_path=config_path,
     )
     optimizer = get_optimizer(model, lr=base_lr)
-    scheduler = PolynomialLR(optimizer, total_iters=max(int(epochs), 1), power=0.9)
+    scheduler = PolynomialLR(optimizer, total_iters=max(int(epochs) * max(len(train_loader), 1), 1), power=0.9)
     criterion = nn.CrossEntropyLoss(ignore_index=255)
+    aux_loss_weight = 0.4
     epoch_seconds = []
     epoch_losses = []
     lr_history = []
+    grad_norm_history = []
     train_start = time.perf_counter()
     amp_enabled = bool(amp) and torch.cuda.is_available() and device.type == "cuda"
     alpha_clamp_events = 0
@@ -269,35 +269,42 @@ def train_single_seed_segmentation(act_type: str, seed: int, epochs: int, device
         epoch_start = time.perf_counter()
         model.train()
         current_lr = float(optimizer.param_groups[0]["lr"])
-        lr_history.append(current_lr)
         epoch_loss_total = 0.0
         epoch_batches = 0
+        epoch_grad_norm_total = 0.0
         for x, y in train_loader:
             x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
             optimizer.zero_grad()
             if overhead_tracker is not None:
                 overhead_tracker.start_forward()
             with bf16_autocast(amp_enabled):
-                out = model(x)
+                outputs = model.forward_outputs(x)
             if overhead_tracker is not None:
                 overhead_tracker.end_forward(batch_size=x.size(0))
-            loss = criterion(out.float(), y)
+            loss = criterion(outputs["out"].float(), y)
+            if "aux" in outputs and outputs["aux"] is not None:
+                aux_loss = criterion(outputs["aux"].float(), y)
+                loss = loss + aux_loss_weight * aux_loss
             if overhead_tracker is not None:
                 overhead_tracker.start_backward()
             loss.backward()
             if overhead_tracker is not None:
                 overhead_tracker.end_backward()
-            clip_activation_gradients(model, max_norm=alpha_grad_clip_norm)
+            grad_norm = clip_activation_gradients(model, max_norm=alpha_grad_clip_norm)
+            epoch_grad_norm_total += float(grad_norm)
             optimizer.step()
+            scheduler.step()
             epoch_loss_total += float(loss.item())
             epoch_batches += 1
             clamp_events, clamp_checks = clamp_alpha_golu_modules(model, min_alpha=0.2, max_alpha=3.0)
             alpha_clamp_events += clamp_events
             alpha_clamp_checks += clamp_checks
         mean_epoch_loss = epoch_loss_total / max(epoch_batches, 1)
+        mean_epoch_grad_norm = epoch_grad_norm_total / max(epoch_batches, 1)
         epoch_seconds.append(time.perf_counter() - epoch_start)
         epoch_losses.append(mean_epoch_loss)
-        scheduler.step()
+        lr_history.append(float(optimizer.param_groups[0]["lr"]))
+        grad_norm_history.append(mean_epoch_grad_norm)
         alpha_logger.step()
         final_epoch_loss = mean_epoch_loss
         if save_artifacts and progress_path is not None:
@@ -318,13 +325,15 @@ def train_single_seed_segmentation(act_type: str, seed: int, epochs: int, device
                     "epoch_seconds": epoch_seconds,
                     "lr_history": lr_history,
                     "lr_current": current_lr,
+                    "grad_norm_history": grad_norm_history,
+                    "grad_norm_epoch": mean_epoch_grad_norm,
                     "alpha_clamp_events": alpha_clamp_events,
                     "alpha_clamp_checks": alpha_clamp_checks,
                     "alpha_history": alpha_logger.alpha_history,
                 },
             )
         if not save_artifacts:
-            print(f"[SEGMENTATION] Epoch {epoch + 1}/{epochs} - Loss: {mean_epoch_loss:.4f} | lr={current_lr:.6f}", flush=True)
+            print(f"[SEGMENTATION] Epoch {epoch + 1}/{epochs} - Loss: {mean_epoch_loss:.4f} | grad_norm={mean_epoch_grad_norm:.4f} | lr={lr_history[-1]:.6f}", flush=True)
 
     train_seconds = time.perf_counter() - train_start
     overhead = overhead_tracker.save() if overhead_tracker is not None else {}
@@ -358,6 +367,7 @@ def train_single_seed_segmentation(act_type: str, seed: int, epochs: int, device
             "miou": float(miou),
             "epoch_loss_history": epoch_losses,
             "lr_history": lr_history,
+            "grad_norm_history": grad_norm_history,
             "alpha_clamp_events": alpha_clamp_events,
             "alpha_clamp_checks": alpha_clamp_checks,
             "alpha_history": alpha_logger.alpha_history,
@@ -381,6 +391,7 @@ def train_single_seed_segmentation(act_type: str, seed: int, epochs: int, device
                 "epoch_loss_history": epoch_losses,
                 "epoch_seconds": epoch_seconds,
                 "lr_history": lr_history,
+                "grad_norm_history": grad_norm_history,
                 "miou": float(miou),
                 "alpha_clamp_events": alpha_clamp_events,
                 "alpha_clamp_checks": alpha_clamp_checks,
