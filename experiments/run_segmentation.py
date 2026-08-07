@@ -62,6 +62,168 @@ class SwishAdaptive(nn.Module):
         return x * torch.sigmoid(self.beta * x)
 
 
+class ActivationStatsProbe:
+    """Collects activation-input and activation-output statistics for a model epoch."""
+
+    def __init__(self, model: nn.Module):
+        self.model = model
+        self.handles: list[torch.utils.hooks.RemovableHandle] = []
+        self.layer_names: list[str] = []
+        self.stats: dict[str, dict[str, float]] = {}
+        self.active = False
+        self._register_hooks()
+
+    def _track_module(self, module: nn.Module) -> bool:
+        return isinstance(
+            module,
+            (
+                nn.ReLU,
+                nn.PReLU,
+                nn.GELU,
+                nn.SiLU,
+                PGELU,
+                SwishAdaptive,
+                StaticGoLU,
+                AdaptiveAlphaGoLU,
+            ),
+        )
+
+    def _blank_stats(self) -> dict[str, float]:
+        return {
+            "batches": 0.0,
+            "input_numel": 0.0,
+            "input_sum": 0.0,
+            "input_sumsq": 0.0,
+            "input_min": float("inf"),
+            "input_max": float("-inf"),
+            "input_neg_frac": 0.0,
+            "input_lt_neg2_frac": 0.0,
+            "input_lt_neg4_frac": 0.0,
+            "input_lt_neg8_frac": 0.0,
+            "input_lt_neg88_frac": 0.0,
+            "output_numel": 0.0,
+            "output_sum": 0.0,
+            "output_sumsq": 0.0,
+            "output_min": float("inf"),
+            "output_max": float("-inf"),
+            "output_neg_frac": 0.0,
+            "output_lt_neg2_frac": 0.0,
+            "output_lt_neg4_frac": 0.0,
+            "output_lt_neg8_frac": 0.0,
+            "output_lt_neg88_frac": 0.0,
+            "input_nonfinite": 0.0,
+            "output_nonfinite": 0.0,
+            "alpha_mean": float("nan"),
+            "alpha_min": float("nan"),
+            "alpha_max": float("nan"),
+        }
+
+    def _register_hooks(self) -> None:
+        for name, module in self.model.named_modules():
+            if not name or name == "model":
+                continue
+            if not self._track_module(module):
+                continue
+            self.layer_names.append(name)
+            self.stats[name] = self._blank_stats()
+            self.handles.append(module.register_forward_hook(self._make_hook(name, module)))
+
+    def _make_hook(self, name: str, module: nn.Module):
+        def hook(_module, inputs, output):
+            if not self.active or not inputs:
+                return
+
+            x = inputs[0].detach().float()
+            y = output.detach().float() if torch.is_tensor(output) else output[0].detach().float()
+            record = self.stats[name]
+            record["batches"] += 1.0
+
+            def update(prefix: str, tensor: torch.Tensor) -> None:
+                finite_mask = torch.isfinite(tensor)
+                finite_tensor = tensor[finite_mask]
+                record[f"{prefix}_numel"] += float(tensor.numel())
+                record[f"{prefix}_nonfinite"] += float((~finite_mask).sum().item())
+                if finite_tensor.numel() > 0:
+                    record[f"{prefix}_sum"] += float(finite_tensor.sum().item())
+                    record[f"{prefix}_sumsq"] += float((finite_tensor * finite_tensor).sum().item())
+                    record[f"{prefix}_min"] = min(record[f"{prefix}_min"], float(finite_tensor.min().item()))
+                    record[f"{prefix}_max"] = max(record[f"{prefix}_max"], float(finite_tensor.max().item()))
+                    record[f"{prefix}_neg_frac"] += float((tensor < 0).float().mean().item())
+                    record[f"{prefix}_lt_neg2_frac"] += float((tensor < -2).float().mean().item())
+                    record[f"{prefix}_lt_neg4_frac"] += float((tensor < -4).float().mean().item())
+                    record[f"{prefix}_lt_neg8_frac"] += float((tensor < -8).float().mean().item())
+                    record[f"{prefix}_lt_neg88_frac"] += float((tensor < -88).float().mean().item())
+
+            update("input", x)
+            update("output", y)
+
+            if hasattr(module, "get_alpha_val"):
+                alpha = module.get_alpha_val().detach().float()
+            elif hasattr(module, "alpha"):
+                alpha_val = module.alpha
+                alpha = alpha_val.detach().float() if torch.is_tensor(alpha_val) else torch.tensor(float(alpha_val), dtype=torch.float32)
+            elif hasattr(module, "beta"):
+                beta_val = module.beta
+                alpha = beta_val.detach().float() if torch.is_tensor(beta_val) else torch.tensor(float(beta_val), dtype=torch.float32)
+            else:
+                alpha = None
+
+            if alpha is not None and alpha.numel() > 0:
+                record["alpha_mean"] = float(alpha.mean().item())
+                record["alpha_min"] = float(alpha.min().item())
+                record["alpha_max"] = float(alpha.max().item())
+
+        return hook
+
+    def start_epoch(self) -> None:
+        self.active = True
+        self.stats = {name: self._blank_stats() for name in self.layer_names}
+
+    def stop_epoch(self) -> dict[str, dict[str, float]]:
+        self.active = False
+        return {name: self._finalize(record) for name, record in self.stats.items()}
+
+    def _finalize(self, record: dict[str, float]) -> dict[str, float]:
+        finalized = dict(record)
+        for prefix in ("input", "output"):
+            numel = max(finalized[f"{prefix}_numel"], 1.0)
+            mean = finalized[f"{prefix}_sum"] / numel
+            mean_sq = finalized[f"{prefix}_sumsq"] / numel
+            variance = max(mean_sq - mean * mean, 0.0)
+            finalized[f"{prefix}_mean"] = mean
+            finalized[f"{prefix}_std"] = float(math.sqrt(variance))
+            finalized[f"{prefix}_neg_frac"] = finalized[f"{prefix}_neg_frac"] / max(finalized["batches"], 1.0)
+            finalized[f"{prefix}_lt_neg2_frac"] = finalized[f"{prefix}_lt_neg2_frac"] / max(finalized["batches"], 1.0)
+            finalized[f"{prefix}_lt_neg4_frac"] = finalized[f"{prefix}_lt_neg4_frac"] / max(finalized["batches"], 1.0)
+            finalized[f"{prefix}_lt_neg8_frac"] = finalized[f"{prefix}_lt_neg8_frac"] / max(finalized["batches"], 1.0)
+            finalized[f"{prefix}_lt_neg88_frac"] = finalized[f"{prefix}_lt_neg88_frac"] / max(finalized["batches"], 1.0)
+        return finalized
+
+    def close(self) -> None:
+        for handle in self.handles:
+            handle.remove()
+        self.handles.clear()
+
+    def compact_report(self, epoch_stats: dict[str, dict[str, float]], max_layers: int = 8) -> list[str]:
+        rows = []
+        ranked = sorted(
+            epoch_stats.items(),
+            key=lambda item: (item[1].get("input_lt_neg4_frac", 0.0), item[1].get("input_neg_frac", 0.0)),
+            reverse=True,
+        )
+        for name, record in ranked[:max_layers]:
+            rows.append(
+                (
+                    f"{name}: in_mean={record.get('input_mean', 0.0):.4f} in_std={record.get('input_std', 0.0):.4f} "
+                    f"in_neg={record.get('input_neg_frac', 0.0):.3f} in_lt_-4={record.get('input_lt_neg4_frac', 0.0):.3f} "
+                    f"in_lt_-8={record.get('input_lt_neg8_frac', 0.0):.3f} in_lt_-88={record.get('input_lt_neg88_frac', 0.0):.3f} "
+                    f"out_mean={record.get('output_mean', 0.0):.4f} out_std={record.get('output_std', 0.0):.4f} "
+                    f"alpha={record.get('alpha_mean', float('nan')):.4f}"
+                )
+            )
+        return rows
+
+
 def get_activation(act_type: str) -> nn.Module:
     act_type = str(act_type).lower().strip()
     if act_type == 'relu':
@@ -272,11 +434,13 @@ def train_single_seed_segmentation(act_type: str, seed: int, epochs: int, device
     lr_history = []
     grad_norm_history = []
     batch_grad_norm_history = []
+    activation_stats_history: dict[str, dict[str, dict[str, float]]] = {}
     train_start = time.perf_counter()
     amp_enabled = bool(amp) and torch.cuda.is_available() and device.type == "cuda"
     alpha_clamp_events = 0
     alpha_clamp_checks = 0
     final_epoch_loss = None
+    activation_probe = ActivationStatsProbe(model)
     run_dir = create_run_directory(
         str(PROJECT_ROOT / "outputs" / "runs" / "segmentation"),
         "segmentation",
@@ -321,6 +485,8 @@ def train_single_seed_segmentation(act_type: str, seed: int, epochs: int, device
     for epoch in range(epochs):
         epoch_start = time.perf_counter()
         model.train()
+        if epoch < 2:
+            activation_probe.start_epoch()
         current_lr = float(optimizer.param_groups[0]["lr"])
         epoch_loss_total = 0.0
         epoch_batches = 0
@@ -368,6 +534,13 @@ def train_single_seed_segmentation(act_type: str, seed: int, epochs: int, device
         batch_grad_norm_history.append(epoch_batch_grad_norms)
         alpha_logger.step()
         final_epoch_loss = mean_epoch_loss
+        activation_epoch_stats = activation_probe.stop_epoch() if epoch < 2 else {}
+        if epoch < 2:
+            activation_stats_history[str(epoch + 1)] = activation_epoch_stats
+        if epoch < 2:
+            print(f"[SEGMENTATION][Epoch {epoch + 1}] Activation stats (top layers by negative tail):", flush=True)
+            for line in activation_probe.compact_report(activation_epoch_stats, max_layers=8):
+                print(f"  {line}", flush=True)
         if save_artifacts and progress_path is not None:
             write_json(
                 progress_path,
@@ -389,6 +562,8 @@ def train_single_seed_segmentation(act_type: str, seed: int, epochs: int, device
                     "grad_norm_history": grad_norm_history,
                     "batch_grad_norm_history": batch_grad_norm_history,
                     "grad_norm_epoch": mean_epoch_grad_norm,
+                    "activation_epoch_stats": activation_epoch_stats,
+                    "activation_stats_history": activation_stats_history,
                     "alpha_clamp_events": alpha_clamp_events,
                     "alpha_clamp_checks": alpha_clamp_checks,
                     "alpha_history": alpha_logger.alpha_history,
@@ -431,6 +606,7 @@ def train_single_seed_segmentation(act_type: str, seed: int, epochs: int, device
             "lr_history": lr_history,
             "grad_norm_history": grad_norm_history,
             "batch_grad_norm_history": batch_grad_norm_history,
+            "activation_stats_history": activation_stats_history,
             "alpha_clamp_events": alpha_clamp_events,
             "alpha_clamp_checks": alpha_clamp_checks,
             "alpha_history": alpha_logger.alpha_history,
@@ -456,6 +632,7 @@ def train_single_seed_segmentation(act_type: str, seed: int, epochs: int, device
                 "lr_history": lr_history,
                 "grad_norm_history": grad_norm_history,
                 "batch_grad_norm_history": batch_grad_norm_history,
+                "activation_stats_history": activation_stats_history,
                 "miou": float(miou),
                 "alpha_clamp_events": alpha_clamp_events,
                 "alpha_clamp_checks": alpha_clamp_checks,
@@ -463,6 +640,7 @@ def train_single_seed_segmentation(act_type: str, seed: int, epochs: int, device
                 **overhead,
             },
         )
+    activation_probe.close()
     write_json(
         run_dir / "run_manifest.json",
         build_run_manifest(
