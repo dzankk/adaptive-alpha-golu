@@ -102,6 +102,29 @@ def _load_json_file(path: Path) -> dict:
     return data if isinstance(data, dict) else {}
 
 
+def _normalize_task_names(task_names: list[str] | None) -> list[str]:
+    if not task_names:
+        return []
+    normalized: list[str] = []
+    for task_name in task_names:
+        task_key = str(task_name).lower().strip()
+        if task_key and task_key not in normalized:
+            normalized.append(task_key)
+    return normalized
+
+
+def _purge_tasks_from_results(results: dict, task_names: list[str]) -> dict:
+    if not results:
+        return {}
+    task_set = set(task_names)
+    pruned = {}
+    for task_name, task_payload in results.items():
+        if task_name in task_set:
+            continue
+        pruned[task_name] = task_payload
+    return pruned
+
+
 def _task_run_root(task_name: str) -> Path:
     folder_map = {
         "classification": "classification",
@@ -548,6 +571,7 @@ def handle_run_all(args, summary_only: bool = False):
     seeds = args.seeds if args.seeds != DEFAULT_SEEDS else config.get("seeds", DEFAULT_SEEDS)
     activations = args.activations if args.activations != CANONICAL_ACTIVATIONS else config.get("activations", CANONICAL_ACTIVATIONS)
     task_names = args.tasks if args.tasks else config.get("tasks", list(TASK_MAP.keys()))
+    rerun_tasks = _normalize_task_names(getattr(args, "rerun_tasks", None))
     task_alpha_lrs = config.get("alpha_lr_by_task", {})
     output_root = config.get("output_root", "outputs/runs")
     summary_path = config.get("summary_path", "outputs/benchmark_results.json")
@@ -576,6 +600,23 @@ def handle_run_all(args, summary_only: bool = False):
                 pass
         resume_state = {} if args.fresh else _load_json_file(resume_path)
         existing_summary = {} if args.fresh else _load_json_file(Path(summary_path))
+        if rerun_tasks:
+            existing_summary = _purge_tasks_from_results(existing_summary, rerun_tasks)
+            resume_state["all_task_results"] = _purge_tasks_from_results(
+                resume_state.get("all_task_results", {}) if isinstance(resume_state.get("all_task_results", {}), dict) else {},
+                rerun_tasks,
+            )
+            if not args.fresh:
+                _save_json_file(
+                    resume_path,
+                    {
+                        "tasks": selected_tasks,
+                        "activations": activations,
+                        "seeds": seeds,
+                        "all_task_results": resume_state.get("all_task_results", {}),
+                        "updated_utc": datetime.now(timezone.utc).isoformat(),
+                    },
+                )
         resume_results = resume_state.get("all_task_results", {}) if isinstance(resume_state.get("all_task_results", {}), dict) else {}
         all_task_results = _merge_benchmark_results(existing_summary, resume_results)
     else:
@@ -593,6 +634,8 @@ def handle_run_all(args, summary_only: bool = False):
             existing_entry = task_results.get(act, {}) if isinstance(task_results.get(act, {}), dict) else {}
             completed_scores = existing_entry.get("completed_scores", {}) if isinstance(existing_entry.get("completed_scores", {}), dict) else {}
             completed_scores = _filter_valid_completed_scores(task_name, act, completed_scores)
+            if task_name in rerun_tasks:
+                completed_scores = {}
             accs = [float(completed_scores[str(seed)]) for seed in seeds if str(seed) in completed_scores]
 
             for seed in seeds:
@@ -1051,6 +1094,7 @@ def main():
     run_all_parser.add_argument("--amp", action="store_true", help="Enable BF16 automatic mixed precision on CUDA")
     run_all_parser.add_argument("--fresh", action="store_true", help="Ignore any saved resume state and start this run from scratch")
     run_all_parser.add_argument("--resume", action="store_true", help="Alias for the default resumable mode")
+    run_all_parser.add_argument("--rerun-tasks", type=str, nargs="+", default=None, choices=list(TASK_MAP.keys()), help="Tasks to rerun from scratch while preserving cached results for other tasks")
 
     # Command: smoke_run
     smoke_parser = subparsers.add_parser("smoke_run", help="Run a fast static-vs-Alpha-GoLU smoke benchmark across all tasks")
@@ -1071,6 +1115,7 @@ def main():
     task_order_parser.add_argument("--amp", action="store_true", help="Enable BF16 automatic mixed precision on CUDA")
     task_order_parser.add_argument("--fresh", action="store_true", help="Ignore any saved resume state and start this run from scratch")
     task_order_parser.add_argument("--resume", action="store_true", help="Alias for the default resumable mode")
+    task_order_parser.add_argument("--rerun-tasks", type=str, nargs="+", default=None, choices=list(TASK_MAP.keys()), help="Tasks to rerun from scratch while preserving cached results for other tasks")
 
     # Command: preflight
     preflight_parser = subparsers.add_parser("preflight", help="Run environment and storage checks before a long benchmark run")
