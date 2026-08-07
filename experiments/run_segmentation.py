@@ -104,34 +104,30 @@ def get_optimizer(
 # ==========================================
 # 2. DeepLabV3 Architecture
 # ==========================================
-class ActivationSegmentationHead(nn.Module):
-    def __init__(self, in_channels: int, num_classes: int, act_type: str):
-        super().__init__()
-        self.block = nn.Sequential(
-            nn.Conv2d(in_channels, 256, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(256),
-            get_activation(act_type),
-            nn.Conv2d(256, 256, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(256),
-            get_activation(act_type),
-            nn.Conv2d(256, num_classes, kernel_size=1),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.block(x)
+def _replace_relu_modules(module: nn.Module, act_type: str) -> None:
+    for child_name, child_module in list(module.named_children()):
+        if isinstance(child_module, nn.ReLU):
+            setattr(module, child_name, get_activation(act_type))
+        else:
+            _replace_relu_modules(child_module, act_type)
 
 
 class PretrainedDeepLabV3(nn.Module):
     def __init__(self, act_type: str, num_classes: int = 21):
         super().__init__()
-        pretrained_model = deeplabv3_resnet50(weights=DeepLabV3_ResNet50_Weights.DEFAULT)
-        self.backbone = pretrained_model.backbone
-        self.classifier = ActivationSegmentationHead(2048, num_classes, act_type)
+        self.model = deeplabv3_resnet50(weights=DeepLabV3_ResNet50_Weights.DEFAULT)
+
+        if num_classes != VOC_SEG_CLASSES:
+            self.model.classifier[-1] = nn.Conv2d(256, num_classes, kernel_size=1)
+
+        _replace_relu_modules(self.model.backbone, act_type)
+        _replace_relu_modules(self.model.classifier, act_type)
+        if getattr(self.model, "aux_classifier", None) is not None:
+            _replace_relu_modules(self.model.aux_classifier, act_type)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        features = self.backbone(x)["out"]
-        logits = self.classifier(features)
-        return F.interpolate(logits, size=x.shape[-2:], mode="bilinear", align_corners=False)
+        outputs = self.model(x)
+        return outputs["out"]
 
 
 # ==========================================
@@ -217,7 +213,7 @@ def train_single_seed_segmentation(act_type: str, seed: int, epochs: int, device
         alpha_lr,
         config_path=config_path,
     )
-    optimizer, set_alpha_lr, act_params = get_optimizer(model, lr=1e-3, alpha_lr=alpha_lr, weight_decay=1e-4, warmup_epochs=alpha_warmup_epochs)
+    optimizer, set_alpha_lr, act_params = get_optimizer(model, lr=1e-4, alpha_lr=alpha_lr, weight_decay=1e-4, warmup_epochs=alpha_warmup_epochs)
     criterion = nn.CrossEntropyLoss(ignore_index=255)
     epoch_seconds = []
     train_start = time.perf_counter()
