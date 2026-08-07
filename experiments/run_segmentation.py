@@ -126,7 +126,7 @@ class PretrainedDeepLabV3(nn.Module):
         super().__init__()
         pretrained_model = deeplabv3_resnet50(weights=DeepLabV3_ResNet50_Weights.DEFAULT)
         self.backbone = pretrained_model.backbone
-        self.classifier = ActivationSegmentationHead(self.backbone.out_channels, num_classes, act_type)
+        self.classifier = ActivationSegmentationHead(2048, num_classes, act_type)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         features = self.backbone(x)["out"]
