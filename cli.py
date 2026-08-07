@@ -1068,6 +1068,7 @@ def main():
     run_parser.add_argument("--task", type=str, required=True, choices=list(TASK_MAP.keys()), help="Benchmark task")
     run_parser.add_argument("--activation", type=str, default="alpha_golu", choices=SUPPORTED_ACTIVATIONS, help="Activation function")
     run_parser.add_argument("--seeds", type=int, nargs="+", default=DEFAULT_SEEDS, help="Random seeds for statistical testing")
+    run_parser.add_argument("--config", type=str, default="configs/full_benchmark.json", help="Path to a JSON benchmark config file")
     run_parser.add_argument("--data-root", type=str, default="./data", help="Dataset cache root used for preflight checks")
     run_parser.add_argument("--output-root", type=str, default="outputs/runs", help="Output root used for preflight checks")
     run_parser.add_argument("--min-free-gb", type=float, default=20.0, help="Minimum free disk space required before launching")
