@@ -18,6 +18,7 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader, Dataset, random_split
 from torchvision.datasets import VOCSegmentation
+from torchvision.models import ResNet50_Weights
 from torchvision.models.segmentation import DeepLabV3_ResNet50_Weights, deeplabv3_resnet50
 from torchvision.transforms import functional as TF
 
@@ -112,13 +113,18 @@ def _replace_relu_modules(module: nn.Module, act_type: str) -> None:
             _replace_relu_modules(child_module, act_type)
 
 
-class PretrainedDeepLabV3(nn.Module):
+class ImageNetBackboneDeepLabV3(nn.Module):
     def __init__(self, act_type: str, num_classes: int = 21):
         super().__init__()
-        self.model = deeplabv3_resnet50(weights=DeepLabV3_ResNet50_Weights.DEFAULT)
+        self.model = deeplabv3_resnet50(
+            weights=None,
+            weights_backbone=ResNet50_Weights.IMAGENET1K_V1,
+        )
 
-        if num_classes != VOC_SEG_CLASSES:
-            self.model.classifier[-1] = nn.Conv2d(256, num_classes, kernel_size=1)
+        self.model.classifier[-1] = nn.Conv2d(256, num_classes, kernel_size=1)
+        nn.init.kaiming_normal_(self.model.classifier[-1].weight, mode="fan_out", nonlinearity="relu")
+        if self.model.classifier[-1].bias is not None:
+            nn.init.zeros_(self.model.classifier[-1].bias)
 
         _replace_relu_modules(self.model.backbone, act_type)
         _replace_relu_modules(self.model.classifier, act_type)
@@ -205,7 +211,7 @@ def train_single_seed_segmentation(act_type: str, seed: int, epochs: int, device
     train_loader = DataLoader(train_ds, batch_size=8, shuffle=True, generator=loader_g, **train_loader_kwargs)
     val_loader = DataLoader(val_ds, batch_size=8, shuffle=False, generator=loader_g, **val_loader_kwargs)
 
-    model = PretrainedDeepLabV3(act_type=act_type, num_classes=VOC_SEG_CLASSES).to(device)
+    model = ImageNetBackboneDeepLabV3(act_type=act_type, num_classes=VOC_SEG_CLASSES).to(device)
     overhead_tracker = OverheadTracker(task_name="segmentation", activation_name=act_type, model=model, device=device) if overhead_tracking_enabled() else None
     alpha_logger = AlphaTrajectoryLogger(model)
     alpha_lr, alpha_warmup_epochs, alpha_grad_clip_norm = resolve_task_alpha_hparams(
