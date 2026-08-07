@@ -24,9 +24,12 @@
     "epochs_by_task": {
         "classification": 50,
         "detection": 12,
-        "segmentation": 12,
+        "segmentation": 30,
         "diffusion": 30,
         "robustness": 40
+    },
+    "base_lr_by_task": {
+        "segmentation": 0.02
     },
     "steps_by_task": {
         "language_model": 10000
@@ -34,7 +37,6 @@
     "alpha_lr_by_task": {
         "classification": 0.0005,
         "detection": 0.0001,
-        "segmentation": 0.0002,
         "diffusion": 0.001,
         "language_model": 0.001,
         "robustness": 0.0005

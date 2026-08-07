@@ -226,7 +226,7 @@ def _merge_benchmark_results(base_results: dict, incoming_results: dict) -> dict
     return merged
 
 
-def _invoke_task_runner(runner_fn, act: str, *, seed: int, data_root: str, alpha_lr: float | None, save_artifacts: bool, amp: bool, epochs: int | None = None, max_steps: int | None = None):
+def _invoke_task_runner(runner_fn, act: str, *, seed: int, data_root: str, base_lr: float | None, alpha_lr: float | None, save_artifacts: bool, amp: bool, epochs: int | None = None, max_steps: int | None = None):
     candidate_kwargs = {
         "seed": seed,
         "data_root": data_root,
@@ -236,6 +236,8 @@ def _invoke_task_runner(runner_fn, act: str, *, seed: int, data_root: str, alpha
         "epochs": epochs,
         "max_steps": max_steps,
     }
+    if base_lr is not None:
+        candidate_kwargs["base_lr"] = base_lr
     signature = inspect.signature(runner_fn)
     accepted_kwargs = {
         name: value
@@ -280,6 +282,25 @@ def _resolve_task_epochs(config: dict, task_name: str) -> int | None:
     value = config.get("epochs")
     if isinstance(value, int) and value > 0:
         return value
+    return None
+
+
+def _resolve_task_base_lr(config: dict, task_name: str) -> float | None:
+    base_lr_by_task = config.get("base_lr_by_task", {})
+    if isinstance(base_lr_by_task, dict):
+        value = base_lr_by_task.get(task_name)
+        if isinstance(value, (int, float)) and float(value) > 0.0:
+            return float(value)
+
+    base_lr_map = config.get("base_lr", {})
+    if isinstance(base_lr_map, dict):
+        value = base_lr_map.get(task_name)
+        if isinstance(value, (int, float)) and float(value) > 0.0:
+            return float(value)
+
+    value = config.get("base_lr")
+    if isinstance(value, (int, float)) and float(value) > 0.0:
+        return float(value)
     return None
 
 
@@ -495,6 +516,11 @@ def handle_run(args):
     seeds = args.seeds
     config = load_benchmark_config(args.config) if args.config else {}
     task_alpha_lr = config.get("alpha_lr_by_task", {}).get(task)
+    task_base_lr = _resolve_task_base_lr(config, task)
+    if getattr(args, "lr", None) is not None:
+        task_base_lr = float(args.lr)
+    if task == "segmentation" and task_base_lr is None:
+        task_base_lr = 0.02
     _run_preflight_or_abort(args.data_root, args.output_root, args.min_free_gb)
     resume_path = _resume_state_path(args.output_root, "single_task", {"task": task, "activation": act, "seeds": seeds})
     if args.fresh and resume_path.exists():
@@ -522,7 +548,7 @@ def handle_run(args):
             continue
 
         print(f"\n---> Running Seed: {seed}")
-        metric = TASK_MAP[task](act, seed=seed, data_root=args.data_root, alpha_lr=task_alpha_lr, save_artifacts=args.save_artifacts, amp=args.amp)
+        metric = TASK_MAP[task](act, seed=seed, data_root=args.data_root, base_lr=task_base_lr, alpha_lr=task_alpha_lr, save_artifacts=args.save_artifacts, amp=args.amp)
         results.append(metric)
         print(f"Seed {seed} Output Metric: {metric:.4f}")
         saved_scores[seed_key] = metric
@@ -573,6 +599,7 @@ def handle_run_all(args, summary_only: bool = False):
     task_names = args.tasks if args.tasks else config.get("tasks", list(TASK_MAP.keys()))
     rerun_tasks = _normalize_task_names(getattr(args, "rerun_tasks", None))
     task_alpha_lrs = config.get("alpha_lr_by_task", {})
+    task_base_lrs = config.get("base_lr_by_task", {})
     output_root = config.get("output_root", "outputs/runs")
     summary_path = config.get("summary_path", "outputs/benchmark_results.json")
     data_root = config.get("data_root", args.data_root)
@@ -645,6 +672,11 @@ def handle_run_all(args, summary_only: bool = False):
                     continue
 
                 alpha_lr = task_alpha_lrs.get(task_name)
+                base_lr = task_base_lrs.get(task_name)
+                if getattr(args, "lr", None) is not None:
+                    base_lr = float(args.lr)
+                if task_name == "segmentation" and base_lr is None:
+                    base_lr = 0.02
                 task_epochs = _resolve_task_epochs(config, task_name)
                 task_steps = _resolve_task_steps(config, task_name)
                 acc = _invoke_task_runner(
@@ -652,6 +684,7 @@ def handle_run_all(args, summary_only: bool = False):
                     act,
                     seed=seed,
                     data_root=data_root,
+                    base_lr=base_lr,
                     alpha_lr=alpha_lr,
                     save_artifacts=args.save_artifacts,
                     amp=args.amp,
@@ -1072,6 +1105,7 @@ def main():
     run_parser.add_argument("--data-root", type=str, default="./data", help="Dataset cache root used for preflight checks")
     run_parser.add_argument("--output-root", type=str, default="outputs/runs", help="Output root used for preflight checks")
     run_parser.add_argument("--min-free-gb", type=float, default=20.0, help="Minimum free disk space required before launching")
+    run_parser.add_argument("--lr", type=float, default=None, help="Optional task base learning rate override used by runners that support it")
     run_parser.add_argument("--save-artifacts", action="store_true", help="Save per-seed run JSONs, manifests, and trajectory plots")
     run_parser.add_argument("--amp", action="store_true", help="Enable BF16 automatic mixed precision on CUDA")
     run_parser.add_argument("--fresh", action="store_true", help="Ignore any saved resume state and start this run from scratch")
@@ -1091,6 +1125,7 @@ def main():
     run_all_parser.add_argument("--config", type=str, default=None, help="Path to a JSON benchmark config file")
     run_all_parser.add_argument("--data-root", type=str, default="./data", help="Dataset cache root used when config does not specify one")
     run_all_parser.add_argument("--min-free-gb", type=float, default=20.0, help="Minimum free disk space required before launching")
+    run_all_parser.add_argument("--lr", type=float, default=None, help="Optional task base learning rate override used by runners that support it")
     run_all_parser.add_argument("--save-artifacts", action="store_true", help="Save per-seed run JSONs, manifests, and trajectory plots")
     run_all_parser.add_argument("--amp", action="store_true", help="Enable BF16 automatic mixed precision on CUDA")
     run_all_parser.add_argument("--fresh", action="store_true", help="Ignore any saved resume state and start this run from scratch")
@@ -1112,6 +1147,7 @@ def main():
     task_order_parser.add_argument("--config", type=str, default="configs/full_benchmark.json", help="Path to a JSON benchmark config file")
     task_order_parser.add_argument("--data-root", type=str, default="./data", help="Dataset cache root used when config does not specify one")
     task_order_parser.add_argument("--min-free-gb", type=float, default=20.0, help="Minimum free disk space required before launching")
+    task_order_parser.add_argument("--lr", type=float, default=None, help="Optional task base learning rate override used by runners that support it")
     task_order_parser.add_argument("--save-artifacts", action="store_true", help="Save per-seed run JSONs, manifests, and trajectory plots")
     task_order_parser.add_argument("--amp", action="store_true", help="Enable BF16 automatic mixed precision on CUDA")
     task_order_parser.add_argument("--fresh", action="store_true", help="Ignore any saved resume state and start this run from scratch")
