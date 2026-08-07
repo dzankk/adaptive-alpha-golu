@@ -226,8 +226,10 @@ def train_single_seed_segmentation(act_type: str, seed: int, epochs: int, device
     amp_enabled = bool(amp) and torch.cuda.is_available() and device.type == "cuda"
     alpha_clamp_events = 0
     alpha_clamp_checks = 0
+    final_epoch_loss = None
     run_dir = None
     progress_path = None
+    activation_names = []
     if save_artifacts:
         run_dir = create_run_directory(
             str(PROJECT_ROOT / "outputs" / "runs" / "segmentation"),
@@ -236,6 +238,21 @@ def train_single_seed_segmentation(act_type: str, seed: int, epochs: int, device
             [seed],
         )
         progress_path = run_dir / "progress.json"
+
+        activation_names = []
+        for module_name, module in model.named_modules():
+            if module_name in ("", "model"):
+                continue
+            if isinstance(module, (nn.ReLU, nn.PReLU)) or module.__class__.__name__ in {"PGELU", "SwishAdaptive", "AlphaGoLU", "StaticGoLU"}:
+                activation_names.append(f"{module_name}:{module.__class__.__name__}")
+
+        print(
+            "[SEGMENTATION] Activation audit before training: "
+            + ", ".join(activation_names[:12])
+            + (" ..." if len(activation_names) > 12 else ""),
+            flush=True,
+        )
+
         write_json(
             run_dir / "run_manifest.json",
             build_run_manifest(
@@ -246,6 +263,7 @@ def train_single_seed_segmentation(act_type: str, seed: int, epochs: int, device
                 extra_config={
                     "data_root": data_root,
                     "epochs": epochs,
+                    "activation_modules": activation_names,
                 },
             ),
         )
@@ -281,6 +299,7 @@ def train_single_seed_segmentation(act_type: str, seed: int, epochs: int, device
         epoch_seconds.append(time.perf_counter() - epoch_start)
         alpha_logger.step()
         mean_epoch_loss = epoch_loss_total / max(epoch_batches, 1)
+        final_epoch_loss = mean_epoch_loss
         if save_artifacts and progress_path is not None:
             write_json(
                 progress_path,
@@ -289,14 +308,14 @@ def train_single_seed_segmentation(act_type: str, seed: int, epochs: int, device
                     "task": "segmentation",
                     "data_root": data_root,
                     "activation": act_type,
-                    "alpha_lr": alpha_lr,
+                    "alpha_lr": alpha_lr if act_params else None,
                     "seed": seed,
                     "epochs": epochs,
                     "epoch": epoch + 1,
                     "progress_pct": float(((epoch + 1) / max(epochs, 1)) * 100.0),
                     "epoch_loss": mean_epoch_loss,
                     "epoch_seconds": epoch_seconds,
-                    "alpha_lr_final": current_alpha_lr,
+                    "alpha_lr_final": current_alpha_lr if act_params else None,
                     "alpha_clamp_events": alpha_clamp_events,
                     "alpha_clamp_checks": alpha_clamp_checks,
                     "alpha_history": alpha_logger.alpha_history,
@@ -347,10 +366,12 @@ def train_single_seed_segmentation(act_type: str, seed: int, epochs: int, device
                 "task": "segmentation",
                 "data_root": data_root,
                 "activation": act_type,
-                "alpha_lr": alpha_lr,
+                "alpha_lr": alpha_lr if act_params else None,
                 "seed": seed,
                 "epochs": epochs,
                 "progress_pct": 100.0,
+                "epoch_loss": final_epoch_loss,
+                "epoch_seconds": epoch_seconds,
                 "alpha_lr_final": current_alpha_lr if act_params else None,
                 "miou": float(miou),
                 "alpha_clamp_events": alpha_clamp_events,
