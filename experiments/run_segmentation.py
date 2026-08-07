@@ -143,20 +143,52 @@ VOC_SEG_CLASSES = 21
 class PascalVOCSegmentationDataset(Dataset):
     """Pascal VOC segmentation wrapper returning resized tensors and masks."""
 
-    def __init__(self, root: str = './data', year: str = '2012', image_set: str = 'train', image_size: int = 256, download: bool = True):
+    def __init__(self, root: str = './data', year: str = '2012', image_set: str = 'train', image_size: int = 256, train: bool = True, download: bool = True):
         self.dataset = VOCSegmentation(root=root, year=year, image_set=image_set, download=download)
+        self.train = bool(train)
         self.image_size = image_size
+
+    def _apply_train_transforms(self, image, mask):
+        scale = random.uniform(0.5, 2.0)
+        width, height = image.size
+        new_width = max(1, int(round(width * scale)))
+        new_height = max(1, int(round(height * scale)))
+        image = TF.resize(image, (new_height, new_width), interpolation=TF.InterpolationMode.BILINEAR)
+        mask = TF.resize(mask, (new_height, new_width), interpolation=TF.InterpolationMode.NEAREST)
+
+        if random.random() < 0.5:
+            image = TF.hflip(image)
+            mask = TF.hflip(mask)
+
+        pad_height = max(0, self.image_size - new_height)
+        pad_width = max(0, self.image_size - new_width)
+        if pad_height > 0 or pad_width > 0:
+            image = TF.pad(image, [0, 0, pad_width, pad_height], fill=0)
+            mask = TF.pad(mask, [0, 0, pad_width, pad_height], fill=255)
+
+        image_width, image_height = image.size
+        top = 0 if image_height == self.image_size else random.randint(0, image_height - self.image_size)
+        left = 0 if image_width == self.image_size else random.randint(0, image_width - self.image_size)
+        image = TF.crop(image, top, left, self.image_size, self.image_size)
+        mask = TF.crop(mask, top, left, self.image_size, self.image_size)
+        return image, mask
+
+    def _apply_eval_transforms(self, image, mask):
+        image = TF.resize(image, (self.image_size, self.image_size), interpolation=TF.InterpolationMode.BILINEAR)
+        mask = TF.resize(mask, (self.image_size, self.image_size), interpolation=TF.InterpolationMode.NEAREST)
+        return image, mask
 
     def __len__(self):
         return len(self.dataset)
 
     def __getitem__(self, idx: int):
         image, mask = self.dataset[idx]
-        image = TF.resize(image, (self.image_size, self.image_size))
+        if self.train:
+            image, mask = self._apply_train_transforms(image, mask)
+        else:
+            image, mask = self._apply_eval_transforms(image, mask)
         image = TF.to_tensor(image)
         image = TF.normalize(image, mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225))
-
-        mask = TF.resize(mask, (self.image_size, self.image_size), interpolation=TF.InterpolationMode.NEAREST)
         mask = torch.as_tensor(np.array(mask), dtype=torch.long)
         mask[mask == 255] = 255
         return image, mask
@@ -181,6 +213,23 @@ def compute_mIoU(preds: torch.Tensor, targets: torch.Tensor, num_classes: int = 
     return float(np.mean(iou_values)) if iou_values else 0.0
 
 
+def compute_model_grad_norm(model: nn.Module, norm_type: float = 2.0) -> float:
+    grad_norms = []
+    for parameter in model.parameters():
+        if parameter.grad is None:
+            continue
+        grad = parameter.grad.detach()
+        if not torch.isfinite(grad).all():
+            return float("nan")
+        grad_norms.append(float(torch.linalg.vector_norm(grad.float(), ord=norm_type).item()))
+
+    if not grad_norms:
+        return 0.0
+
+    stacked = torch.tensor(grad_norms, dtype=torch.float32)
+    return float(torch.linalg.vector_norm(stacked, ord=norm_type).item())
+
+
 def set_seed(seed: int):
     random.seed(seed)
     np.random.seed(seed)
@@ -193,16 +242,18 @@ def set_seed(seed: int):
 def train_single_seed_segmentation(act_type: str, seed: int, epochs: int, device: torch.device, data_root: str = './data', base_lr: float = 2e-2, alpha_lr: float | None = None, config_path: str | None = "configs/paper_benchmark.json", save_artifacts: bool = False, amp: bool = False) -> float:
     set_seed(seed)
     
-    full_dataset = PascalVOCSegmentationDataset(root=data_root, year='2012', image_set='train', image_size=256, download=True)
-    val_dataset = PascalVOCSegmentationDataset(root=data_root, year='2012', image_set='val', image_size=256, download=True)
+    full_dataset = PascalVOCSegmentationDataset(root=data_root, year='2012', image_set='train', image_size=256, train=True, download=True)
+    val_dataset = PascalVOCSegmentationDataset(root=data_root, year='2012', image_set='val', image_size=256, train=False, download=True)
     train_ds = full_dataset
     val_ds = val_dataset
 
     loader_g = torch.Generator().manual_seed(seed)
     train_loader_kwargs = default_loader_kwargs()
     val_loader_kwargs = default_loader_kwargs(num_workers=1)
-    train_loader = DataLoader(train_ds, batch_size=8, shuffle=True, generator=loader_g, **train_loader_kwargs)
-    val_loader = DataLoader(val_ds, batch_size=8, shuffle=False, generator=loader_g, **val_loader_kwargs)
+    train_batch_size = 32
+    eval_batch_size = 32
+    train_loader = DataLoader(train_ds, batch_size=train_batch_size, shuffle=True, generator=loader_g, **train_loader_kwargs)
+    val_loader = DataLoader(val_ds, batch_size=eval_batch_size, shuffle=False, generator=loader_g, **val_loader_kwargs)
 
     model = ImageNetBackboneDeepLabV3(act_type=act_type, num_classes=VOC_SEG_CLASSES).to(device)
     overhead_tracker = OverheadTracker(task_name="segmentation", activation_name=act_type, model=model, device=device) if overhead_tracking_enabled() else None
@@ -220,6 +271,7 @@ def train_single_seed_segmentation(act_type: str, seed: int, epochs: int, device
     epoch_losses = []
     lr_history = []
     grad_norm_history = []
+    batch_grad_norm_history = []
     train_start = time.perf_counter()
     amp_enabled = bool(amp) and torch.cuda.is_available() and device.type == "cuda"
     alpha_clamp_events = 0
@@ -258,6 +310,7 @@ def train_single_seed_segmentation(act_type: str, seed: int, epochs: int, device
                 "data_root": data_root,
                 "epochs": epochs,
                 "base_lr": base_lr,
+                "batch_size": train_batch_size,
                 "optimizer": "SGD",
                 "scheduler": "PolynomialLR",
                 "activation_modules": activation_names,
@@ -272,9 +325,10 @@ def train_single_seed_segmentation(act_type: str, seed: int, epochs: int, device
         epoch_loss_total = 0.0
         epoch_batches = 0
         epoch_grad_norm_total = 0.0
+        epoch_batch_grad_norms = []
         for x, y in train_loader:
             x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
             if overhead_tracker is not None:
                 overhead_tracker.start_forward()
             with bf16_autocast(amp_enabled):
@@ -285,13 +339,19 @@ def train_single_seed_segmentation(act_type: str, seed: int, epochs: int, device
             if "aux" in outputs and outputs["aux"] is not None:
                 aux_loss = criterion(outputs["aux"].float(), y)
                 loss = loss + aux_loss_weight * aux_loss
+            if not torch.isfinite(loss):
+                raise RuntimeError(f"Non-finite segmentation loss detected for activation={act_type}, seed={seed}, epoch={epoch + 1}")
             if overhead_tracker is not None:
                 overhead_tracker.start_backward()
             loss.backward()
             if overhead_tracker is not None:
                 overhead_tracker.end_backward()
-            grad_norm = clip_activation_gradients(model, max_norm=alpha_grad_clip_norm)
-            epoch_grad_norm_total += float(grad_norm)
+            grad_norm = compute_model_grad_norm(model)
+            if not math.isfinite(grad_norm):
+                raise RuntimeError(f"Non-finite gradient norm detected for activation={act_type}, seed={seed}, epoch={epoch + 1}")
+            epoch_grad_norm_total += grad_norm
+            epoch_batch_grad_norms.append(grad_norm)
+            clip_activation_gradients(model, max_norm=alpha_grad_clip_norm)
             optimizer.step()
             scheduler.step()
             epoch_loss_total += float(loss.item())
@@ -305,6 +365,7 @@ def train_single_seed_segmentation(act_type: str, seed: int, epochs: int, device
         epoch_losses.append(mean_epoch_loss)
         lr_history.append(float(optimizer.param_groups[0]["lr"]))
         grad_norm_history.append(mean_epoch_grad_norm)
+        batch_grad_norm_history.append(epoch_batch_grad_norms)
         alpha_logger.step()
         final_epoch_loss = mean_epoch_loss
         if save_artifacts and progress_path is not None:
@@ -326,6 +387,7 @@ def train_single_seed_segmentation(act_type: str, seed: int, epochs: int, device
                     "lr_history": lr_history,
                     "lr_current": current_lr,
                     "grad_norm_history": grad_norm_history,
+                    "batch_grad_norm_history": batch_grad_norm_history,
                     "grad_norm_epoch": mean_epoch_grad_norm,
                     "alpha_clamp_events": alpha_clamp_events,
                     "alpha_clamp_checks": alpha_clamp_checks,
@@ -368,6 +430,7 @@ def train_single_seed_segmentation(act_type: str, seed: int, epochs: int, device
             "epoch_loss_history": epoch_losses,
             "lr_history": lr_history,
             "grad_norm_history": grad_norm_history,
+            "batch_grad_norm_history": batch_grad_norm_history,
             "alpha_clamp_events": alpha_clamp_events,
             "alpha_clamp_checks": alpha_clamp_checks,
             "alpha_history": alpha_logger.alpha_history,
@@ -392,6 +455,7 @@ def train_single_seed_segmentation(act_type: str, seed: int, epochs: int, device
                 "epoch_seconds": epoch_seconds,
                 "lr_history": lr_history,
                 "grad_norm_history": grad_norm_history,
+                "batch_grad_norm_history": batch_grad_norm_history,
                 "miou": float(miou),
                 "alpha_clamp_events": alpha_clamp_events,
                 "alpha_clamp_checks": alpha_clamp_checks,
