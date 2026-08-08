@@ -21,7 +21,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torchvision
 import torchvision.transforms as transforms
-from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.optim.lr_scheduler import CosineAnnealingLR, StepLR
 from torch.utils.data import DataLoader, random_split
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -30,7 +30,8 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from models.alpha_golu import AlphaGoLU as AdaptiveAlphaGoLU, StaticGoLU
 from diagnostics.trajectory_logger import AlphaTrajectoryLogger
-from utils.train_tuning import bf16_autocast, build_adamw_with_activation_groups, clip_activation_gradients, clamp_alpha_golu_modules, compute_model_grad_norm, configure_benchmark_runtime, default_loader_kwargs, overhead_tracking_enabled, resolve_task_alpha_hparams
+from utils.experiment_config import load_benchmark_config
+from utils.train_tuning import bf16_autocast, build_adamw_with_activation_groups, clip_activation_gradients, clamp_alpha_golu_modules, compute_model_grad_norm, configure_benchmark_runtime, default_loader_kwargs, overhead_tracking_enabled, resolve_task_alpha_hparams, split_model_parameters
 
 
 # ==========================================
@@ -326,6 +327,48 @@ def summarize_model_overhead(model: nn.Module, train_samples: int, train_seconds
     }
 
 
+def _resolve_task_config_value(config: dict, key: str, task_name: str, default):
+    mapping = config.get(key, {}) if isinstance(config, dict) else {}
+    if isinstance(mapping, dict):
+        value = mapping.get(task_name)
+        if value is not None:
+            return value
+    value = config.get(key) if isinstance(config, dict) else None
+    if value is not None and not isinstance(value, dict):
+        return value
+    return default
+
+
+def _resolve_classification_recipe(*, config_path: str | None, base_lr: float | None) -> dict:
+    config = load_benchmark_config(config_path) if config_path else {}
+    task_name = "classification"
+
+    resolved_base_lr = float(base_lr if base_lr is not None else _resolve_task_config_value(config, "base_lr_by_task", task_name, 0.1))
+    optimizer_name = str(_resolve_task_config_value(config, "optimizer_by_task", task_name, "sgd")).lower().strip()
+    weight_decay = float(_resolve_task_config_value(config, "weight_decay_by_task", task_name, 1e-4))
+    momentum = float(_resolve_task_config_value(config, "momentum_by_task", task_name, 0.9))
+    scheduler_name = str(_resolve_task_config_value(config, "scheduler_by_task", task_name, "step")).lower().strip()
+    step_size = int(_resolve_task_config_value(config, "scheduler_step_size_by_task", task_name, 30))
+    gamma = float(_resolve_task_config_value(config, "scheduler_gamma_by_task", task_name, 0.1))
+    nesterov = bool(_resolve_task_config_value(config, "nesterov_by_task", task_name, False))
+
+    if optimizer_name not in {"sgd", "adamw"}:
+        raise ValueError(f"Unsupported optimizer '{optimizer_name}' for classification")
+    if scheduler_name not in {"none", "step", "cosine"}:
+        raise ValueError(f"Unsupported scheduler '{scheduler_name}' for classification")
+
+    return {
+        "base_lr": resolved_base_lr,
+        "optimizer_name": optimizer_name,
+        "weight_decay": weight_decay,
+        "momentum": momentum,
+        "scheduler_name": scheduler_name,
+        "scheduler_step_size": max(1, step_size),
+        "scheduler_gamma": gamma,
+        "nesterov": nesterov,
+    }
+
+
 # ==========================================
 # 4. Training & Benchmark Execution
 # ==========================================
@@ -336,6 +379,7 @@ def train_single_seed(
     epochs: int = 10,
     device: torch.device = torch.device("cuda"),
     data_root: str = "./data",
+    base_lr: float | None = None,
     alpha_lr: float | None = None,
     val_split: float = 0.1,
     eval_split: str = "test",
@@ -356,16 +400,64 @@ def train_single_seed(
         alpha_lr,
         config_path=config_path,
     )
-    
-    optimizer, set_alpha_lr, act_params = build_adamw_with_activation_groups(
-        model,
-        base_lr=1e-3,
-        base_weight_decay=5e-4,
-        activation_lr=alpha_lr,
-        activation_weight_decay=0.0,
-        warmup_epochs=alpha_warmup_epochs,
-    )
-    scheduler = CosineAnnealingLR(optimizer, T_max=epochs)
+    recipe = _resolve_classification_recipe(config_path=config_path, base_lr=base_lr)
+
+    if recipe["optimizer_name"] == "sgd":
+        base_params, act_params = split_model_parameters(model)
+        target_alpha_lr = float(alpha_lr)
+        parameter_groups = [
+            {
+                "params": base_params,
+                "lr": float(recipe["base_lr"]),
+                "weight_decay": float(recipe["weight_decay"]),
+            }
+        ]
+        if act_params:
+            parameter_groups.append(
+                {
+                    "params": act_params,
+                    "lr": target_alpha_lr,
+                    "weight_decay": 0.0,
+                }
+            )
+
+        optimizer = torch.optim.SGD(
+            parameter_groups,
+            lr=float(recipe["base_lr"]),
+            momentum=float(recipe["momentum"]),
+            nesterov=bool(recipe["nesterov"]),
+        )
+
+        warmup_epochs = max(int(alpha_warmup_epochs), 0)
+
+        def set_alpha_lr(epoch_index: int) -> float:
+            if not act_params:
+                return 0.0
+            current_lr = target_alpha_lr
+            if warmup_epochs > 0:
+                scale = min(1.0, float(epoch_index + 1) / float(warmup_epochs))
+                current_lr = target_alpha_lr * scale
+            optimizer.param_groups[-1]["lr"] = current_lr
+            return float(current_lr)
+    else:
+        optimizer, set_alpha_lr, act_params = build_adamw_with_activation_groups(
+            model,
+            base_lr=float(recipe["base_lr"]),
+            base_weight_decay=float(recipe["weight_decay"]),
+            activation_lr=alpha_lr,
+            activation_weight_decay=0.0,
+            warmup_epochs=alpha_warmup_epochs,
+        )
+
+    scheduler = None
+    if recipe["scheduler_name"] == "step":
+        scheduler = StepLR(
+            optimizer,
+            step_size=int(recipe["scheduler_step_size"]),
+            gamma=float(recipe["scheduler_gamma"]),
+        )
+    elif recipe["scheduler_name"] == "cosine":
+        scheduler = CosineAnnealingLR(optimizer, T_max=max(1, int(epochs)))
     alpha_logger = AlphaTrajectoryLogger(model)
     train_start = time.perf_counter()
     epoch_seconds = []
@@ -399,6 +491,14 @@ def train_single_seed(
                     "epochs": epochs,
                     "val_split": val_split,
                     "eval_split": eval_split,
+                    "base_lr": recipe["base_lr"],
+                    "optimizer": recipe["optimizer_name"],
+                    "momentum": recipe["momentum"],
+                    "weight_decay": recipe["weight_decay"],
+                    "scheduler": recipe["scheduler_name"],
+                    "scheduler_step_size": recipe["scheduler_step_size"],
+                    "scheduler_gamma": recipe["scheduler_gamma"],
+                    "nesterov": recipe["nesterov"],
                     "alpha_lr_scheduler": alpha_lr_scheduler,
                     "alpha_lr": alpha_lr,
                     "seed": seed,
@@ -455,7 +555,8 @@ def train_single_seed(
             clamp_events, clamp_checks = clamp_alpha_golu_modules(model, min_alpha=0.2, max_alpha=3.0)
             alpha_clamp_events += clamp_events
             alpha_clamp_checks += clamp_checks
-        scheduler.step()
+        if scheduler is not None:
+            scheduler.step()
         epoch_seconds.append(time.perf_counter() - epoch_start)
         alpha_logger.step()
         mean_epoch_loss = epoch_loss_total / max(epoch_batches, 1)
@@ -518,6 +619,14 @@ def train_single_seed(
                 "epochs": epochs,
                 "progress_pct": 100.0,
                 "eval_split": eval_split,
+                "base_lr": recipe["base_lr"],
+                "optimizer": recipe["optimizer_name"],
+                "momentum": recipe["momentum"],
+                "weight_decay": recipe["weight_decay"],
+                "scheduler": recipe["scheduler_name"],
+                "scheduler_step_size": recipe["scheduler_step_size"],
+                "scheduler_gamma": recipe["scheduler_gamma"],
+                "nesterov": recipe["nesterov"],
                 "eval_loss": eval_loss,
                 "accuracy": acc,
                 "epoch_loss_history": epoch_losses,
@@ -545,6 +654,14 @@ def train_single_seed(
                 "seed": seed,
                 "epochs": epochs,
                 "eval_split": eval_split,
+                "base_lr": recipe["base_lr"],
+                "optimizer": recipe["optimizer_name"],
+                "momentum": recipe["momentum"],
+                "weight_decay": recipe["weight_decay"],
+                "scheduler": recipe["scheduler_name"],
+                "scheduler_step_size": recipe["scheduler_step_size"],
+                "scheduler_gamma": recipe["scheduler_gamma"],
+                "nesterov": recipe["nesterov"],
                 "eval_loss": eval_loss,
                 "accuracy": acc,
                 "epoch_loss_history": epoch_losses,
@@ -617,9 +734,9 @@ def run_benchmark(dataset_name: str = "cifar10", seeds: list = [42, 123, 999], e
         print(f"\nStatistical Significance (Alpha-GoLU vs Static GoLU p-value): {p_val:.4f}")
 
 
-def train_and_eval(activation: str = 'alpha_golu', seed: int = 42, dataset_name: str = 'cifar10', epochs: int = 10, data_root: str = './data', alpha_lr: float | None = None, val_split: float = 0.1, alpha_lr_scheduler: str = "none", alpha_layout: str = "channel", config_path: str | None = "configs/paper_benchmark.json", save_artifacts: bool = False, amp: bool = False) -> float:
+def train_and_eval(activation: str = 'alpha_golu', seed: int = 42, dataset_name: str = 'cifar10', epochs: int = 10, data_root: str = './data', base_lr: float | None = None, alpha_lr: float | None = None, val_split: float = 0.1, eval_split: str = "test", alpha_lr_scheduler: str = "none", alpha_layout: str = "channel", config_path: str | None = "configs/paper_benchmark.json", save_artifacts: bool = False, amp: bool = False) -> float:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    acc, _ = train_single_seed(act_type=activation, dataset_name=dataset_name, seed=seed, epochs=epochs, device=device, data_root=data_root, alpha_lr=alpha_lr, val_split=val_split, eval_split="test", alpha_lr_scheduler=alpha_lr_scheduler, alpha_layout=alpha_layout, config_path=config_path, save_artifacts=save_artifacts, amp=amp)
+    acc, _ = train_single_seed(act_type=activation, dataset_name=dataset_name, seed=seed, epochs=epochs, device=device, data_root=data_root, base_lr=base_lr, alpha_lr=alpha_lr, val_split=val_split, eval_split=eval_split, alpha_lr_scheduler=alpha_lr_scheduler, alpha_layout=alpha_layout, config_path=config_path, save_artifacts=save_artifacts, amp=amp)
     return float(acc)
 
 
@@ -661,6 +778,8 @@ def run_alpha_lr_ablation(
     data_root: str = "./data",
     val_split: float = 0.1,
     alpha_lrs: list[float] | None = None,
+    alpha_lr_scheduler: str = "none",
+    config_path: str | None = "configs/paper_benchmark.json",
 ):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     seeds = seeds or [42]
@@ -686,8 +805,8 @@ def run_alpha_lr_ablation(
                 alpha_lr=alpha_lr,
                 val_split=val_split,
                 eval_split="val",
-                alpha_lr_scheduler="cosine",
-                config_path="configs/paper_benchmark.json",
+                alpha_lr_scheduler=alpha_lr_scheduler,
+                config_path=config_path,
                 save_artifacts=True,
                 return_metrics=True,
             )
@@ -709,6 +828,7 @@ if __name__ == '__main__':
     parser.add_argument("--data-root", type=str, default="./data", help="Dataset cache root")
     parser.add_argument("--alpha-lr", type=float, default=None, help="Learning rate for activation parameters; defaults to configs/paper_benchmark.json")
     parser.add_argument("--val-split", type=float, default=0.1, help="Fraction of training data reserved for validation")
+    parser.add_argument("--eval-split", type=str, default="test", choices=["test", "val"], help="Evaluation split for single activation runs")
     parser.add_argument("--alpha-lr-scheduler", type=str, default="none", choices=["none", "cosine"], help="Scheduler for activation parameter LR")
     parser.add_argument("--config", type=str, default="configs/paper_benchmark.json", help="Benchmark config file used for task alpha hyperparameters")
     parser.add_argument("--alpha-layout", type=str, default="channel", choices=["layer", "channel"], help="Alpha-GoLU parameter layout")
@@ -722,7 +842,7 @@ if __name__ == '__main__':
     if args.alpha_layout_ablation:
         run_alpha_layout_ablation(dataset_name=args.dataset_name or "cifar10", seeds=args.seeds, epochs=args.epochs, data_root=args.data_root, alpha_lr=args.alpha_lr, val_split=args.val_split, alpha_lr_scheduler=args.alpha_lr_scheduler, config_path=args.config)
     elif args.alpha_lr_ablation:
-        run_alpha_lr_ablation(dataset_name=args.dataset_name or "cifar10", seeds=args.seeds, epochs=args.epochs, data_root=args.data_root, val_split=args.val_split, alpha_lrs=args.alpha_lrs)
+        run_alpha_lr_ablation(dataset_name=args.dataset_name or "cifar10", seeds=args.seeds, epochs=args.epochs, data_root=args.data_root, val_split=args.val_split, alpha_lrs=args.alpha_lrs, alpha_lr_scheduler=args.alpha_lr_scheduler, config_path=args.config)
     elif args.benchmark:
         dataset_names = [args.dataset_name] if args.dataset_name else ["cifar10", "fashion_mnist"]
         for dataset_name in dataset_names:
@@ -740,7 +860,7 @@ if __name__ == '__main__':
                 data_root=args.data_root,
                 alpha_lr=args.alpha_lr,
                 val_split=args.val_split,
-                eval_split="test",
+                eval_split=args.eval_split,
                 alpha_lr_scheduler=args.alpha_lr_scheduler,
                 alpha_layout=args.alpha_layout,
                 config_path=args.config,

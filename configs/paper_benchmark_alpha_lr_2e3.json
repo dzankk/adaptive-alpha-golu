@@ -18,7 +18,7 @@
         "golu_static",
         "alpha_golu"
     ],
-    "seeds": [42, 123, 999, 2024, 2025],
+    "seeds": [42, 123, 999],
     "data_root": "./data",
     "alpha_lr_by_task": {
         "classification": 0.002,

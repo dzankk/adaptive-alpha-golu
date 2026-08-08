@@ -226,7 +226,7 @@ def _merge_benchmark_results(base_results: dict, incoming_results: dict) -> dict
     return merged
 
 
-def _invoke_task_runner(runner_fn, act: str, *, seed: int, data_root: str, base_lr: float | None, alpha_lr: float | None, alpha_lr_multiplier: float | None, freeze_backbone_epochs: int | None, save_artifacts: bool, amp: bool, epochs: int | None = None, max_steps: int | None = None):
+def _invoke_task_runner(runner_fn, act: str, *, seed: int, data_root: str, base_lr: float | None, alpha_lr: float | None, alpha_lr_multiplier: float | None, freeze_backbone_epochs: int | None, save_artifacts: bool, amp: bool, config_path: str | None = None, epochs: int | None = None, max_steps: int | None = None):
     candidate_kwargs = {
         "seed": seed,
         "data_root": data_root,
@@ -235,11 +235,13 @@ def _invoke_task_runner(runner_fn, act: str, *, seed: int, data_root: str, base_
         "freeze_backbone_epochs": freeze_backbone_epochs,
         "save_artifacts": save_artifacts,
         "amp": amp,
+        "config_path": config_path,
         "epochs": epochs,
         "max_steps": max_steps,
     }
     if base_lr is not None:
         candidate_kwargs["base_lr"] = base_lr
+        candidate_kwargs["lr"] = base_lr
     signature = inspect.signature(runner_fn)
     accepted_kwargs = {
         name: value
@@ -567,6 +569,7 @@ def handle_run(args):
             freeze_backbone_epochs=task_freeze_backbone_epochs,
             save_artifacts=save_artifacts,
             amp=args.amp,
+            config_path=args.config,
             epochs=task_epochs,
             max_steps=task_steps,
         )
@@ -712,6 +715,7 @@ def handle_run_all(args, summary_only: bool = False):
                     freeze_backbone_epochs=task_freeze_backbone_epochs,
                     save_artifacts=save_artifacts,
                     amp=args.amp,
+                    config_path=args.config,
                     epochs=task_epochs,
                     max_steps=task_steps,
                 )
@@ -1142,7 +1146,7 @@ def main():
     )
     run_all_parser.add_argument("--tasks", type=str, nargs="+", default=None, choices=list(TASK_MAP.keys()), help="Subset of tasks to run instead of the config task list")
     run_all_parser.add_argument("--seeds", type=int, nargs="+", default=DEFAULT_SEEDS, help="Random seeds for statistical testing")
-    run_all_parser.add_argument("--config", type=str, default=None, help="Path to a JSON benchmark config file")
+    run_all_parser.add_argument("--config", type=str, default="configs/full_benchmark.json", help="Path to a JSON benchmark config file")
     run_all_parser.add_argument("--data-root", type=str, default="./data", help="Dataset cache root used when config does not specify one")
     run_all_parser.add_argument("--min-free-gb", type=float, default=20.0, help="Minimum free disk space required before launching")
     run_all_parser.add_argument("--lr", type=float, default=None, help="Optional task base learning rate override used by runners that support it")

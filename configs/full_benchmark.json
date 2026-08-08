@@ -22,14 +22,36 @@
     "seeds": [42, 123, 999],
     "data_root": "./data",
     "epochs_by_task": {
-        "classification": 50,
+        "classification": 90,
         "detection": 12,
         "segmentation": 30,
         "diffusion": 30,
         "robustness": 40
     },
     "base_lr_by_task": {
+        "classification": 0.1,
         "segmentation": 0.02
+    },
+    "optimizer_by_task": {
+        "classification": "sgd"
+    },
+    "momentum_by_task": {
+        "classification": 0.9
+    },
+    "weight_decay_by_task": {
+        "classification": 0.0001
+    },
+    "scheduler_by_task": {
+        "classification": "step"
+    },
+    "scheduler_step_size_by_task": {
+        "classification": 30
+    },
+    "scheduler_gamma_by_task": {
+        "classification": 0.1
+    },
+    "nesterov_by_task": {
+        "classification": false
     },
     "steps_by_task": {
         "language_model": 10000
