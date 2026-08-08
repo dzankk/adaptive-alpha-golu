@@ -494,18 +494,21 @@ def _run_preflight_or_abort(data_root: str, output_root: str, min_free_gb: float
     report_dir = Path(output_root) / "preflight" / datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     report_path = save_preflight_report(report, report_dir)
 
-    print("\n================ Preflight Check ================")
-    for item in report["checks"]:
-        print(f"[{item['status'].upper():<5}] {item['check']}: {item['details']}")
-    print(f"[IO] Preflight report saved to {report_path}")
-
     if report["errors"]:
+        print("\n================ Preflight Check ================")
+        for item in report["checks"]:
+            print(f"[{item['status'].upper():<5}] {item['check']}: {item['details']}")
+        print(f"[IO] Preflight report saved to {report_path}")
         print("[Error] Preflight failed:")
         for message in report["errors"]:
             print(f"  - {message}")
         sys.exit(1)
 
     if report["warnings"]:
+        print("\n================ Preflight Check ================")
+        for item in report["checks"]:
+            print(f"[{item['status'].upper():<5}] {item['check']}: {item['details']}")
+        print(f"[IO] Preflight report saved to {report_path}")
         print("[Warning] Preflight warnings:")
         for message in report["warnings"]:
             print(f"  - {message}")
@@ -521,6 +524,7 @@ def handle_run(args):
     task_base_lr = _resolve_task_base_lr(config, task)
     task_alpha_lr_multiplier = getattr(args, "alpha_lr_multiplier", None)
     task_freeze_backbone_epochs = getattr(args, "freeze_backbone_epochs", None)
+    save_artifacts = True
     if getattr(args, "lr", None) is not None:
         task_base_lr = float(args.lr)
     if task == "segmentation" and task_base_lr is None:
@@ -547,12 +551,10 @@ def handle_run(args):
         if seed_key in saved_scores:
             metric = float(saved_scores[seed_key])
             results.append(metric)
-            print(f"---> Skipping Seed: {seed} (already completed)")
             print(f"Seed {seed} Output Metric: {metric:.4f}")
             continue
 
-        print(f"\n---> Running Seed: {seed}")
-        metric = TASK_MAP[task](act, seed=seed, data_root=args.data_root, base_lr=task_base_lr, alpha_lr=task_alpha_lr, alpha_lr_multiplier=task_alpha_lr_multiplier, freeze_backbone_epochs=task_freeze_backbone_epochs, save_artifacts=args.save_artifacts, amp=args.amp)
+        metric = TASK_MAP[task](act, seed=seed, data_root=args.data_root, base_lr=task_base_lr, alpha_lr=task_alpha_lr, alpha_lr_multiplier=task_alpha_lr_multiplier, freeze_backbone_epochs=task_freeze_backbone_epochs, save_artifacts=save_artifacts, amp=args.amp)
         results.append(metric)
         print(f"Seed {seed} Output Metric: {metric:.4f}")
         saved_scores[seed_key] = metric
@@ -590,9 +592,7 @@ def handle_run(args):
             "summary": stats,
         },
     )
-    print(f"\n[Summary - {task.upper()} - {act.upper()}]")
-    print(f"Mean: {stats['mean']:.4f} | Std: {stats['std']:.4f} | SEM: {stats['sem']:.4f}")
-    print(f"[IO] Saved run artifacts to {run_dir}")
+    print(f"\n[Summary - {task.upper()} - {act.upper()}] Mean: {stats['mean']:.4f} | Std: {stats['std']:.4f} | SEM: {stats['sem']:.4f}")
 
 
 def handle_run_all(args, summary_only: bool = False):
@@ -606,6 +606,7 @@ def handle_run_all(args, summary_only: bool = False):
     task_base_lrs = config.get("base_lr_by_task", {})
     task_alpha_lr_multiplier = getattr(args, "alpha_lr_multiplier", None)
     task_freeze_backbone_epochs = getattr(args, "freeze_backbone_epochs", None)
+    save_artifacts = True
     output_root = config.get("output_root", "outputs/runs")
     summary_path = config.get("summary_path", "outputs/benchmark_results.json")
     data_root = config.get("data_root", args.data_root)
@@ -694,7 +695,7 @@ def handle_run_all(args, summary_only: bool = False):
                     alpha_lr=alpha_lr,
                     alpha_lr_multiplier=task_alpha_lr_multiplier,
                     freeze_backbone_epochs=task_freeze_backbone_epochs,
-                    save_artifacts=args.save_artifacts,
+                    save_artifacts=save_artifacts,
                     amp=args.amp,
                     epochs=task_epochs,
                     max_steps=task_steps,
@@ -740,8 +741,6 @@ def handle_run_all(args, summary_only: bool = False):
                 task_results["alpha_golu"]["scores"]
             )
             all_task_results[task_name]["p_value_welch_alpha_vs_static"] = p_val
-            if not args.save_artifacts:
-                print(f"\n[Statistical Significance] Welch t-test (Alpha-GoLU vs Static): p = {p_val:.4f}")
 
     json_path = summary_path
     with open(json_path, "w") as f:
@@ -774,11 +773,7 @@ def handle_run_all(args, summary_only: bool = False):
                 resume_path.unlink()
             except OSError:
                 pass
-    if not args.save_artifacts:
-        print(f"\n[IO] Saved benchmark JSON summary to {json_path}")
-        if run_dir is not None:
-            print(f"[IO] Saved full-suite run artifacts to {run_dir}")
-        print("\n================ All Experiments Completed Successfully! ================")
+
 
 
 def handle_smoke_run(args):
@@ -786,7 +781,7 @@ def handle_smoke_run(args):
     args.tasks = list(TASK_MAP.keys())
     args.activations = ["golu_static", "alpha_golu"]
     args.seeds = [42, 123]
-    args.save_artifacts = False
+    args.save_artifacts = True
     args.amp = bool(args.amp)
     handle_run_all(args, summary_only=True)
 

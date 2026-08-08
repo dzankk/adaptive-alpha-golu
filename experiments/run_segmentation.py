@@ -9,6 +9,7 @@ import math
 import time
 import sys
 import random
+import os
 from pathlib import Path
 import numpy as np
 import torch
@@ -31,6 +32,9 @@ from diagnostics.trajectory_logger import AlphaTrajectoryLogger
 from utils.overhead_tracker import OverheadTracker
 from utils.run_artifacts import build_run_manifest, create_run_directory, write_json
 from utils.train_tuning import bf16_autocast, clip_activation_gradients, clamp_alpha_golu_modules, configure_benchmark_runtime, default_loader_kwargs, overhead_tracking_enabled, resolve_task_alpha_hparams, split_model_parameters
+
+
+QUIET_STDOUT = os.getenv("ADAPTIVE_ALPHA_GOLU_QUIET_STDOUT", "1") == "1"
 
 
 # ==========================================
@@ -514,12 +518,11 @@ def train_single_seed_segmentation(act_type: str, seed: int, epochs: int, device
         if isinstance(module, (nn.ReLU, nn.PReLU)) or module.__class__.__name__ in {"PGELU", "SwishAdaptive", "AlphaGoLU", "StaticGoLU"}:
             activation_names.append(f"{module_name}:{module.__class__.__name__}")
 
-    print(
+    debug_log_lines = [
         "[SEGMENTATION] Activation audit before training: "
         + ", ".join(activation_names[:12])
-        + (" ..." if len(activation_names) > 12 else ""),
-        flush=True,
-    )
+        + (" ..." if len(activation_names) > 12 else "")
+    ]
 
     write_json(
         run_dir / "run_manifest.json",
@@ -619,9 +622,9 @@ def train_single_seed_segmentation(act_type: str, seed: int, epochs: int, device
         if epoch < 2:
             activation_stats_history[str(epoch + 1)] = activation_epoch_stats
         if epoch < 2:
-            print(f"[SEGMENTATION][Epoch {epoch + 1}] Activation stats (top layers by negative tail):", flush=True)
+            debug_log_lines.append(f"[SEGMENTATION][Epoch {epoch + 1}] Activation stats (top layers by negative tail):")
             for line in activation_probe.compact_report(activation_epoch_stats, max_layers=8):
-                print(f"  {line}", flush=True)
+                debug_log_lines.append(f"  {line}")
         if save_artifacts and progress_path is not None:
             write_json(
                 progress_path,
@@ -658,7 +661,7 @@ def train_single_seed_segmentation(act_type: str, seed: int, epochs: int, device
                     "alpha_history": alpha_logger.alpha_history,
                 },
             )
-        if not save_artifacts:
+        if not save_artifacts and not QUIET_STDOUT:
             print(f"[SEGMENTATION] Epoch {epoch + 1}/{epochs} - Loss: {mean_epoch_loss:.4f} | grad_norm={mean_epoch_grad_norm:.4f} | backbone_grad={mean_epoch_backbone_grad_norm:.4f} | head_grad={mean_epoch_head_grad_norm:.4f} | act_grad={mean_epoch_activation_grad_norm:.4f} | lr={lr_history[-1]:.6f} | act_lr={activation_lr_history[-1]:.6f}", flush=True)
 
     train_seconds = time.perf_counter() - train_start
@@ -754,6 +757,8 @@ def train_single_seed_segmentation(act_type: str, seed: int, epochs: int, device
             },
         ),
     )
+    if debug_log_lines:
+        (run_dir / "debug_metrics.log").write_text("\n".join(debug_log_lines) + "\n", encoding="utf-8")
 
     return miou
 
