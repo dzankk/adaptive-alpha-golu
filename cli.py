@@ -554,7 +554,22 @@ def handle_run(args):
             print(f"Seed {seed} Output Metric: {metric:.4f}")
             continue
 
-        metric = TASK_MAP[task](act, seed=seed, data_root=args.data_root, base_lr=task_base_lr, alpha_lr=task_alpha_lr, alpha_lr_multiplier=task_alpha_lr_multiplier, freeze_backbone_epochs=task_freeze_backbone_epochs, save_artifacts=save_artifacts, amp=args.amp)
+        task_epochs = _resolve_task_epochs(config, task)
+        task_steps = _resolve_task_steps(config, task)
+        metric = _invoke_task_runner(
+            TASK_MAP[task],
+            act,
+            seed=seed,
+            data_root=args.data_root,
+            base_lr=task_base_lr,
+            alpha_lr=task_alpha_lr,
+            alpha_lr_multiplier=task_alpha_lr_multiplier,
+            freeze_backbone_epochs=task_freeze_backbone_epochs,
+            save_artifacts=save_artifacts,
+            amp=args.amp,
+            epochs=task_epochs,
+            max_steps=task_steps,
+        )
         results.append(metric)
         print(f"Seed {seed} Output Metric: {metric:.4f}")
         saved_scores[seed_key] = metric
