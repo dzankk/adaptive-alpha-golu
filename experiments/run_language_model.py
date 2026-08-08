@@ -32,7 +32,7 @@ from models.alpha_golu import AlphaGoLU as AdaptiveAlphaGoLU, StaticGoLU
 from diagnostics.trajectory_logger import AlphaTrajectoryLogger
 from utils.run_artifacts import build_run_manifest, create_run_directory, write_json
 from utils.overhead_tracker import OverheadTracker
-from utils.train_tuning import bf16_autocast, build_adamw_with_activation_groups, clip_activation_gradients, clamp_alpha_golu_modules, configure_benchmark_runtime, default_loader_kwargs, overhead_tracking_enabled, resolve_task_alpha_hparams
+from utils.train_tuning import bf16_autocast, build_adamw_with_activation_groups, clip_activation_gradients, clamp_alpha_golu_modules, compute_model_grad_norm, configure_benchmark_runtime, default_loader_kwargs, overhead_tracking_enabled, resolve_task_alpha_hparams
 
 
 WIKITEXT2_URLS = {
@@ -331,6 +331,9 @@ def train_single_seed_lm(
     alpha_logger = AlphaTrajectoryLogger(model)
     train_start = time.perf_counter()
     epoch_seconds = []
+    epoch_losses = []
+    lr_history = []
+    grad_norm_history = []
     amp_enabled = bool(amp) and torch.cuda.is_available() and "cuda" in str(device)
     alpha_clamp_events = 0
     alpha_clamp_checks = 0
@@ -373,6 +376,7 @@ def train_single_seed_lm(
         current_alpha_lr = set_alpha_lr(epoch)
         epoch_loss_total = 0.0
         epoch_batches = 0
+        epoch_grad_norm_total = 0.0
         for batch in train_loader:
             if global_step >= planned_steps:
                 break
@@ -392,6 +396,10 @@ def train_single_seed_lm(
             loss.backward()
             if overhead_tracker is not None:
                 overhead_tracker.end_backward()
+            grad_norm = compute_model_grad_norm(model)
+            if not math.isfinite(grad_norm):
+                raise RuntimeError(f"Non-finite gradient norm detected for activation={act_type}, seed={seed}, epoch={epoch + 1}")
+            epoch_grad_norm_total += grad_norm
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             clip_activation_gradients(model, max_norm=alpha_grad_clip_norm)
             optimizer.step()
@@ -430,6 +438,10 @@ def train_single_seed_lm(
         epoch_seconds.append(time.perf_counter() - epoch_start)
         alpha_logger.step()
         mean_epoch_loss = epoch_loss_total / max(epoch_batches, 1)
+        mean_epoch_grad_norm = epoch_grad_norm_total / max(epoch_batches, 1)
+        epoch_losses.append(mean_epoch_loss)
+        lr_history.append(float(optimizer.param_groups[0]["lr"]))
+        grad_norm_history.append(mean_epoch_grad_norm)
         if save_artifacts and progress_path is not None:
             write_json(
                 progress_path,
@@ -447,7 +459,11 @@ def train_single_seed_lm(
                     "progress_pct": float((global_step / max(planned_steps, 1)) * 100.0),
                     "epoch": epoch + 1,
                     "epoch_loss": mean_epoch_loss,
+                    "epoch_loss_history": epoch_losses,
                     "epoch_seconds": epoch_seconds,
+                    "lr_history": lr_history,
+                    "grad_norm_history": grad_norm_history,
+                    "grad_norm_epoch": mean_epoch_grad_norm,
                     "alpha_lr_final": current_alpha_lr,
                     "alpha_clamp_events": alpha_clamp_events,
                     "alpha_clamp_checks": alpha_clamp_checks,
@@ -490,6 +506,9 @@ def train_single_seed_lm(
                 "alpha_lr_final": current_alpha_lr if act_params else None,
                 "perplexity": float(perplexity),
                 "avg_loss": float(avg_loss),
+                "epoch_loss_history": epoch_losses,
+                "lr_history": lr_history,
+                "grad_norm_history": grad_norm_history,
                 "alpha_clamp_events": alpha_clamp_events,
                 "alpha_clamp_checks": alpha_clamp_checks,
                 "alpha_history": alpha_logger.alpha_history,
@@ -513,6 +532,9 @@ def train_single_seed_lm(
                     "progress_pct": 100.0,
                     "perplexity": float(perplexity),
                     "avg_loss": float(avg_loss),
+                    "epoch_loss_history": epoch_losses,
+                    "lr_history": lr_history,
+                    "grad_norm_history": grad_norm_history,
                     "alpha_lr_final": current_alpha_lr if act_params else None,
                     "alpha_clamp_events": alpha_clamp_events,
                     "alpha_clamp_checks": alpha_clamp_checks,
@@ -526,7 +548,7 @@ def train_single_seed_lm(
 
 def run_lm_benchmark(seeds=None, epochs=5, data_root: str = "./data", alpha_lr: float | None = None, config_path: str | None = "configs/paper_benchmark.json", amp: bool = False, max_steps: int | None = None):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    seeds = seeds or [42, 123, 999, 2024, 2025]
+    seeds = seeds or [42, 123, 999]
     print(f"Running WikiText-2 Language Model Benchmark on {device}...")
     activations = ["relu", "gelu", "swish", "adaptive_swish", "prelu", "pgelu", "golu_static", "alpha_golu"]
 
@@ -553,7 +575,7 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="WikiText-2 language modeling benchmark")
     parser.add_argument("--activation", type=str, default="alpha_golu", help="Single activation to evaluate")
-    parser.add_argument("--seeds", type=int, nargs="+", default=[42, 123, 999, 2024, 2025], help="Random seeds")
+    parser.add_argument("--seeds", type=int, nargs="+", default=[42, 123, 999], help="Random seeds")
     parser.add_argument("--epochs", type=int, default=5, help="Training epochs")
     parser.add_argument("--data-root", type=str, default="./data", help="Dataset cache root")
     parser.add_argument("--alpha-lr", type=float, default=None, help="Learning rate for language-model activation parameters; defaults to configs/paper_benchmark.json")

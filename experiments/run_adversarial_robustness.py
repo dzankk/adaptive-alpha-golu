@@ -29,8 +29,7 @@ from diagnostics.trajectory_logger import AlphaTrajectoryLogger
 from models.alpha_golu import AlphaGoLU as AdaptiveAlphaGoLU, StaticGoLU
 from utils.run_artifacts import build_run_manifest, create_run_directory, write_json
 from utils.overhead_tracker import OverheadTracker
-from utils.train_tuning import bf16_autocast, build_adamw_with_activation_groups, clip_activation_gradients, clamp_alpha_golu_modules, configure_benchmark_runtime, default_loader_kwargs, resolve_task_alpha_hparams
-from utils.train_tuning import bf16_autocast, build_adamw_with_activation_groups, clip_activation_gradients, clamp_alpha_golu_modules, configure_benchmark_runtime, default_loader_kwargs, overhead_tracking_enabled, resolve_task_alpha_hparams
+from utils.train_tuning import bf16_autocast, build_adamw_with_activation_groups, clip_activation_gradients, clamp_alpha_golu_modules, compute_model_grad_norm, configure_benchmark_runtime, default_loader_kwargs, overhead_tracking_enabled, resolve_task_alpha_hparams
 
 
 def reset_all_seeds(seed=42):
@@ -310,6 +309,9 @@ def train_single_seed_robustness(
     criterion = nn.CrossEntropyLoss()
     alpha_logger = AlphaTrajectoryLogger(model)
     epoch_seconds = []
+    epoch_losses = []
+    lr_history = []
+    grad_norm_history = []
     train_start = time.perf_counter()
     amp_enabled = bool(amp) and torch.cuda.is_available() and device.type == "cuda"
     alpha_clamp_events = 0
@@ -350,6 +352,7 @@ def train_single_seed_robustness(
         current_alpha_lr = set_alpha_lr(epoch)
         epoch_loss_total = 0.0
         epoch_batches = 0
+        epoch_grad_norm_total = 0.0
         for inputs, targets in train_loader:
             inputs, targets = inputs.to(device, non_blocking=True), targets.to(device, non_blocking=True)
             optimizer.zero_grad()
@@ -365,6 +368,10 @@ def train_single_seed_robustness(
             loss.backward()
             if overhead_tracker is not None:
                 overhead_tracker.end_backward()
+            grad_norm = compute_model_grad_norm(model)
+            if not math.isfinite(grad_norm):
+                raise RuntimeError(f"Non-finite gradient norm detected for activation={act_type}, seed={seed}, epoch={epoch + 1}")
+            epoch_grad_norm_total += grad_norm
             clip_activation_gradients(model, max_norm=alpha_grad_clip_norm)
             optimizer.step()
             epoch_loss_total += float(loss.item())
@@ -375,6 +382,10 @@ def train_single_seed_robustness(
         epoch_seconds.append(time.perf_counter() - epoch_start)
         alpha_logger.step()
         mean_epoch_loss = epoch_loss_total / max(epoch_batches, 1)
+        mean_epoch_grad_norm = epoch_grad_norm_total / max(epoch_batches, 1)
+        epoch_losses.append(mean_epoch_loss)
+        lr_history.append(float(optimizer.param_groups[0]["lr"]))
+        grad_norm_history.append(mean_epoch_grad_norm)
         if save_artifacts and progress_path is not None:
             write_json(
                 progress_path,
@@ -389,7 +400,11 @@ def train_single_seed_robustness(
                     "epoch": epoch + 1,
                     "progress_pct": float(((epoch + 1) / max(epochs, 1)) * 100.0),
                     "epoch_loss": mean_epoch_loss,
+                    "epoch_loss_history": epoch_losses,
                     "epoch_seconds": epoch_seconds,
+                    "lr_history": lr_history,
+                    "grad_norm_history": grad_norm_history,
+                    "grad_norm_epoch": mean_epoch_grad_norm,
                     "alpha_lr_final": current_alpha_lr,
                     "alpha_clamp_events": alpha_clamp_events,
                     "alpha_clamp_checks": alpha_clamp_checks,
@@ -438,6 +453,9 @@ def train_single_seed_robustness(
                 "epochs": epochs,
                 "alpha_lr": alpha_lr if alpha_lr is not None else 1e-3,
                 "alpha_lr_final": current_alpha_lr if act_params else None,
+                "epoch_loss_history": epoch_losses,
+                "lr_history": lr_history,
+                "grad_norm_history": grad_norm_history,
                 "clean_acc": clean_acc,
                 "corruption_acc": corruption_acc,
                 **{f"{name}_acc": value for name, value in corruption_accs.items()},
@@ -460,6 +478,9 @@ def train_single_seed_robustness(
                     "epochs": epochs,
                     "progress_pct": 100.0,
                     "alpha_lr_final": current_alpha_lr if act_params else None,
+                    "epoch_loss_history": epoch_losses,
+                    "lr_history": lr_history,
+                    "grad_norm_history": grad_norm_history,
                     "clean_acc": clean_acc,
                     "corruption_acc": corruption_acc,
                     **{f"{name}_acc": value for name, value in corruption_accs.items()},
@@ -494,7 +515,7 @@ def run_benchmark(seeds=None, epochs: int = 10, data_root: str = './data', amp: 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Running Corruption Robustness Benchmark on {device}")
     activations = ['relu', 'gelu', 'swish', 'prelu', 'pgelu', 'golu_static', 'alpha_golu', 'swish_adaptive']
-    seeds = seeds or [42, 123, 999, 2024, 2025]
+    seeds = seeds or [42, 123, 999]
 
     for act_type in activations:
         print(f"\n--- Activation: {act_type.upper()} ---")
@@ -511,7 +532,7 @@ def run_benchmark(seeds=None, epochs: int = 10, data_root: str = './data', amp: 
             print(f"Seed {seed} -> Clean Acc: {clean_acc:.2f}% | Corruption Acc: {corruption_acc:.2f}%")
 
 
-def train_and_eval(activation: str = 'alpha_golu', seed: int = 42, epochs: int = 10, data_root: str = './data', alpha_lr: float | None = None, save_artifacts: bool = False, amp: bool = False) -> float:
+def train_and_eval(activation: str = 'alpha_golu', seed: int = 42, epochs: int = 10, data_root: str = './data', alpha_lr: float | None = None, config_path: str | None = "configs/paper_benchmark.json", save_artifacts: bool = False, amp: bool = False) -> float:
     """Returns mean corruption accuracy."""
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     _, corruption_acc = train_single_seed_robustness(
@@ -521,7 +542,7 @@ def train_and_eval(activation: str = 'alpha_golu', seed: int = 42, epochs: int =
         device=device,
         data_root=data_root,
         alpha_lr=alpha_lr,
-        config_path="configs/paper_benchmark.json",
+        config_path=config_path,
         save_artifacts=save_artifacts,
         amp=amp,
     )
@@ -533,7 +554,7 @@ if __name__ == '__main__':
 
     parser = argparse.ArgumentParser(description="CIFAR-10 adversarial robustness benchmark")
     parser.add_argument("--activation", type=str, default="alpha_golu", help="Single activation to evaluate")
-    parser.add_argument("--seeds", type=int, nargs="+", default=[42, 123, 999, 2024, 2025], help="Random seeds")
+    parser.add_argument("--seeds", type=int, nargs="+", default=[42, 123, 999], help="Random seeds")
     parser.add_argument("--epochs", type=int, default=10, help="Training epochs")
     parser.add_argument("--data-root", type=str, default="./data", help="Dataset cache root")
     parser.add_argument("--alpha-lr", type=float, default=None, help="Learning rate for activation parameters; defaults to configs/paper_benchmark.json")

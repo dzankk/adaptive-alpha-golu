@@ -27,8 +27,7 @@ from models.alpha_golu import AlphaGoLU as AdaptiveAlphaGoLU, StaticGoLU
 from diagnostics.trajectory_logger import AlphaTrajectoryLogger
 from utils.overhead_tracker import OverheadTracker
 from utils.run_artifacts import build_run_manifest, create_run_directory, write_json
-from utils.train_tuning import bf16_autocast, build_adamw_with_activation_groups, clip_activation_gradients, clamp_alpha_golu_modules, configure_benchmark_runtime, default_loader_kwargs, resolve_task_alpha_hparams
-from utils.train_tuning import bf16_autocast, build_adamw_with_activation_groups, clip_activation_gradients, clamp_alpha_golu_modules, configure_benchmark_runtime, default_loader_kwargs, overhead_tracking_enabled, resolve_task_alpha_hparams
+from utils.train_tuning import bf16_autocast, build_adamw_with_activation_groups, clip_activation_gradients, clamp_alpha_golu_modules, compute_model_grad_norm, configure_benchmark_runtime, default_loader_kwargs, overhead_tracking_enabled, resolve_task_alpha_hparams
 
 
 def reset_seeds(seed=42):
@@ -38,6 +37,12 @@ def reset_seeds(seed=42):
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
     configure_benchmark_runtime()
+
+
+def seed_worker(worker_id: int):
+    worker_seed = torch.initial_seed() % 2**32
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
 
 
 # ==========================================
@@ -142,7 +147,7 @@ def get_optimizer(model: nn.Module, lr: float = 2e-4, alpha_lr: float | None = N
     )
 
 
-def train_single_seed_diffusion(act_type: str, seed: int, epochs: int, device: torch.device, data_root: str = './data', alpha_lr: float | None = None, config_path: str | None = "configs/paper_benchmark.json", amp: bool = False) -> float:
+def train_single_seed_diffusion(act_type: str, seed: int, epochs: int, device: torch.device, data_root: str = './data', alpha_lr: float | None = None, config_path: str | None = "configs/paper_benchmark.json", save_artifacts: bool = False, amp: bool = False) -> float:
     reset_seeds(seed)
 
     transform = transforms.Compose([
@@ -164,7 +169,7 @@ def train_single_seed_diffusion(act_type: str, seed: int, epochs: int, device: t
         full_dataset,
         batch_size=128,
         shuffle=True,
-        worker_init_fn=lambda worker_id: np.random.seed((seed + worker_id) % 2**32),
+        worker_init_fn=seed_worker,
         generator=loader_g,
         **train_loader_kwargs,
     )
@@ -172,7 +177,7 @@ def train_single_seed_diffusion(act_type: str, seed: int, epochs: int, device: t
         test_dataset,
         batch_size=256,
         shuffle=False,
-        worker_init_fn=lambda worker_id: np.random.seed((seed + 999 + worker_id) % 2**32),
+        worker_init_fn=seed_worker,
         generator=eval_g,
         **test_loader_kwargs,
     )
@@ -193,6 +198,9 @@ def train_single_seed_diffusion(act_type: str, seed: int, epochs: int, device: t
     optimizer, set_alpha_lr, act_params = get_optimizer(model, alpha_lr=alpha_lr, warmup_epochs=alpha_warmup_epochs)
     criterion = nn.MSELoss()
     epoch_seconds = []
+    epoch_losses = []
+    lr_history = []
+    grad_norm_history = []
     train_start = time.perf_counter()
     amp_enabled = bool(amp) and torch.cuda.is_available() and device.type == "cuda"
     alpha_clamp_events = 0
@@ -228,6 +236,7 @@ def train_single_seed_diffusion(act_type: str, seed: int, epochs: int, device: t
         current_alpha_lr = set_alpha_lr(epoch)
         epoch_loss_total = 0.0
         epoch_batches = 0
+        epoch_grad_norm_total = 0.0
         for x0, _ in trainloader:
             x0 = x0.to(device, non_blocking=True)
             t = torch.randint(0, timesteps, (x0.size(0),), device=device).long()
@@ -250,6 +259,10 @@ def train_single_seed_diffusion(act_type: str, seed: int, epochs: int, device: t
             loss.backward()
             if overhead_tracker is not None:
                 overhead_tracker.end_backward()
+            grad_norm = compute_model_grad_norm(model)
+            if not math.isfinite(grad_norm):
+                raise RuntimeError(f"Non-finite gradient norm detected for activation={act_type}, seed={seed}, epoch={epoch + 1}")
+            epoch_grad_norm_total += grad_norm
             clip_activation_gradients(model, max_norm=alpha_grad_clip_norm)
             optimizer.step()
             epoch_loss_total += float(loss.item())
@@ -261,6 +274,10 @@ def train_single_seed_diffusion(act_type: str, seed: int, epochs: int, device: t
         alpha_logger.step()
         train_seconds = time.perf_counter() - train_start
         mean_epoch_loss = epoch_loss_total / max(epoch_batches, 1)
+        mean_epoch_grad_norm = epoch_grad_norm_total / max(epoch_batches, 1)
+        epoch_losses.append(mean_epoch_loss)
+        lr_history.append(float(optimizer.param_groups[0]["lr"]))
+        grad_norm_history.append(mean_epoch_grad_norm)
         if save_artifacts and progress_path is not None:
             write_json(
                 progress_path,
@@ -275,7 +292,11 @@ def train_single_seed_diffusion(act_type: str, seed: int, epochs: int, device: t
                     "epoch": epoch + 1,
                     "progress_pct": float(((epoch + 1) / max(epochs, 1)) * 100.0),
                     "epoch_loss": mean_epoch_loss,
+                    "epoch_loss_history": epoch_losses,
                     "epoch_seconds": epoch_seconds,
+                    "lr_history": lr_history,
+                    "grad_norm_history": grad_norm_history,
+                    "grad_norm_epoch": mean_epoch_grad_norm,
                     "alpha_lr_final": current_alpha_lr,
                     "alpha_clamp_events": alpha_clamp_events,
                     "alpha_clamp_checks": alpha_clamp_checks,
@@ -321,6 +342,9 @@ def train_single_seed_diffusion(act_type: str, seed: int, epochs: int, device: t
             "alpha_lr": alpha_lr if alpha_lr is not None else 2e-4,
             "alpha_lr_final": current_alpha_lr if act_params else None,
             "mse": float(loss),
+            "epoch_loss_history": epoch_losses,
+            "lr_history": lr_history,
+            "grad_norm_history": grad_norm_history,
             "alpha_clamp_events": alpha_clamp_events,
             "alpha_clamp_checks": alpha_clamp_checks,
             "alpha_history": alpha_logger.alpha_history,
@@ -341,6 +365,9 @@ def train_single_seed_diffusion(act_type: str, seed: int, epochs: int, device: t
                 "progress_pct": 100.0,
                 "alpha_lr_final": current_alpha_lr if act_params else None,
                 "mse": float(loss),
+                "epoch_loss_history": epoch_losses,
+                "lr_history": lr_history,
+                "grad_norm_history": grad_norm_history,
                 "alpha_clamp_events": alpha_clamp_events,
                 "alpha_clamp_checks": alpha_clamp_checks,
                 "alpha_history": alpha_logger.alpha_history,
@@ -368,7 +395,7 @@ def run_diffusion_benchmark(seeds=None, epochs: int = 10, data_root: str = './da
     print(f"Running CelebA DDPM Diffusion Benchmark on {device}...")
 
     activations = ['relu', 'gelu', 'swish', 'adaptive_swish', 'prelu', 'pgelu', 'golu_static', 'alpha_golu']
-    seeds = seeds or [42, 123, 999, 2024, 2025]
+    seeds = seeds or [42, 123, 999]
     results = {}
 
     print("\n================ CelebA DDPM Denoising Loss (MSE ↓) ================")
@@ -398,7 +425,7 @@ if __name__ == '__main__':
 
     parser = argparse.ArgumentParser(description="CelebA diffusion benchmark")
     parser.add_argument("--activation", type=str, default="alpha_golu", help="Single activation to evaluate")
-    parser.add_argument("--seeds", type=int, nargs="+", default=[42, 123, 999, 2024, 2025], help="Random seeds")
+    parser.add_argument("--seeds", type=int, nargs="+", default=[42, 123, 999], help="Random seeds")
     parser.add_argument("--epochs", type=int, default=10, help="Training epochs")
     parser.add_argument("--data-root", type=str, default="./data", help="Dataset cache root")
     parser.add_argument("--alpha-lr", type=float, default=None, help="Learning rate for activation parameters; defaults to configs/paper_benchmark.json")

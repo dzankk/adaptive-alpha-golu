@@ -55,7 +55,7 @@ class TestActivationFactory(unittest.TestCase):
         """Verify the checked-in paper benchmark config can be loaded."""
         config = load_benchmark_config("configs/paper_benchmark.json")
         self.assertEqual(config["name"], "paper_benchmark_suite")
-        self.assertEqual(config["seeds"], [42, 123, 999, 2024, 2025])
+        self.assertEqual(config["seeds"], [42, 123, 999])
         self.assertIn("classification", config["tasks"])
         self.assertIn("alpha_golu", config["activations"])
 

@@ -37,6 +37,12 @@ from utils.train_tuning import bf16_autocast, clip_activation_gradients, clamp_a
 QUIET_STDOUT = os.getenv("ADAPTIVE_ALPHA_GOLU_QUIET_STDOUT", "1") == "1"
 
 
+def seed_worker(worker_id: int):
+    worker_seed = torch.initial_seed() % 2**32
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
+
+
 # ==========================================
 # 1. Custom Activation Implementations
 # ==========================================
@@ -450,8 +456,8 @@ def train_single_seed_segmentation(act_type: str, seed: int, epochs: int, device
     val_loader_kwargs = default_loader_kwargs(num_workers=1)
     train_batch_size = 32
     eval_batch_size = 32
-    train_loader = DataLoader(train_ds, batch_size=train_batch_size, shuffle=True, generator=loader_g, **train_loader_kwargs)
-    val_loader = DataLoader(val_ds, batch_size=eval_batch_size, shuffle=False, generator=loader_g, **val_loader_kwargs)
+    train_loader = DataLoader(train_ds, batch_size=train_batch_size, shuffle=True, worker_init_fn=seed_worker, generator=loader_g, **train_loader_kwargs)
+    val_loader = DataLoader(val_ds, batch_size=eval_batch_size, shuffle=False, worker_init_fn=seed_worker, generator=loader_g, **val_loader_kwargs)
 
     model = ImageNetBackboneDeepLabV3(act_type=act_type, num_classes=VOC_SEG_CLASSES).to(device)
     overhead_tracker = OverheadTracker(task_name="segmentation", activation_name=act_type, model=model, device=device) if overhead_tracking_enabled() else None
@@ -765,7 +771,7 @@ def train_single_seed_segmentation(act_type: str, seed: int, epochs: int, device
 
 def run_segmentation_benchmark(seeds=None, epochs=30, data_root: str = './data', base_lr: float = 2e-2, alpha_lr: float | None = None, alpha_lr_multiplier: float = 10.0, freeze_backbone_epochs: int = 2, config_path: str | None = "configs/paper_benchmark.json", amp: bool = False):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    seeds = seeds or [42, 123, 999, 2024, 2025]
+    seeds = seeds or [42, 123, 999]
     print(f"Running Segmentation Benchmark on {device} (N={len(seeds)})")
     activations = ['relu', 'gelu', 'swish', 'adaptive_swish', 'prelu', 'pgelu', 'golu_static', 'alpha_golu']
 
@@ -790,7 +796,7 @@ if __name__ == '__main__':
 
     parser = argparse.ArgumentParser(description="Pascal VOC segmentation benchmark")
     parser.add_argument("--activation", type=str, default="alpha_golu", help="Single activation to evaluate")
-    parser.add_argument("--seeds", type=int, nargs="+", default=[42, 123, 999, 2024, 2025], help="Random seeds")
+    parser.add_argument("--seeds", type=int, nargs="+", default=[42, 123, 999], help="Random seeds")
     parser.add_argument("--epochs", type=int, default=30, help="Training epochs")
     parser.add_argument("--lr", type=float, default=0.02, help="Base SGD learning rate (paper default: 0.02; alternative: 0.01)")
     parser.add_argument("--alpha-lr-multiplier", type=float, default=10.0, help="Multiplier applied to base LR for activation parameters when alpha_lr is not set explicitly")

@@ -5,8 +5,8 @@ Unified Command Line Interface for reproducing paper experiments, running
 multitask evaluations, and extracting statistical diagnostics
 
 usage examples:
-    python cli.py run --task classification --activation alpha_golu --seeds 42 123 999 2024 2025
-    python cli.py run_all --seeds 42 123 999 2024 2025
+    python cli.py run --task classification --activation alpha_golu --seeds 42 123 999
+    python cli.py run_all --seeds 42 123 999
     python cli.py generate_table --results_path outputs/benchmark_results.json
 """
 
@@ -62,7 +62,7 @@ SUPPORTED_ACTIVATIONS = CANONICAL_ACTIVATIONS + ["swish_adaptive"]
 
 PARAMETRIC_ACTIVATIONS = ["alpha_golu", "prelu", "pgelu", "adaptive_swish", "swish_adaptive"]
 
-DEFAULT_SEEDS = [42, 123, 999, 2024, 2025]
+DEFAULT_SEEDS = [42, 123, 999]
 
 TASK_METRIC_KEYS = {
     "classification": "accuracy",

@@ -132,6 +132,23 @@ def clip_activation_gradients(model: nn.Module, max_norm: float = 1.0) -> float:
     return float(torch.nn.utils.clip_grad_norm_(activation_params, max_norm=max_norm))
 
 
+def compute_model_grad_norm(model: nn.Module, norm_type: float = 2.0) -> float:
+    grad_norms: list[float] = []
+    for parameter in model.parameters():
+        if parameter.grad is None:
+            continue
+        grad = parameter.grad.detach()
+        if not torch.isfinite(grad).all():
+            return float("nan")
+        grad_norms.append(float(torch.linalg.vector_norm(grad.float(), ord=norm_type).item()))
+
+    if not grad_norms:
+        return 0.0
+
+    stacked = torch.tensor(grad_norms, dtype=torch.float32)
+    return float(torch.linalg.vector_norm(stacked, ord=norm_type).item())
+
+
 def clamp_alpha_golu_modules(model: nn.Module, min_alpha: float = 0.2, max_alpha: float = 3.0) -> tuple[int, int]:
     clamp_events = 0
     clamp_checks = 0
@@ -159,6 +176,22 @@ def bf16_autocast(enabled: bool):
 
 def configure_benchmark_runtime() -> None:
     if not torch.cuda.is_available():
+        return
+
+    deterministic = os.getenv("ADAPTIVE_ALPHA_GOLU_DETERMINISTIC", "0") == "1"
+    if deterministic:
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        if hasattr(torch.backends.cuda, "matmul"):
+            torch.backends.cuda.matmul.allow_tf32 = False
+        try:
+            torch.set_float32_matmul_precision("highest")
+        except Exception:
+            pass
+        try:
+            torch.use_deterministic_algorithms(True, warn_only=True)
+        except Exception:
+            pass
         return
 
     torch.backends.cudnn.deterministic = False

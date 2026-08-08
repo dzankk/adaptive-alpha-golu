@@ -39,8 +39,7 @@ from models.alpha_golu import AlphaGoLU as AdaptiveAlphaGoLU, StaticGoLU
 from diagnostics.trajectory_logger import AlphaTrajectoryLogger
 from utils.run_artifacts import build_run_manifest, create_run_directory, write_json
 from utils.overhead_tracker import OverheadTracker
-from utils.train_tuning import bf16_autocast, build_adamw_with_activation_groups, clip_activation_gradients, clamp_alpha_golu_modules, configure_benchmark_runtime, default_loader_kwargs, resolve_task_alpha_hparams
-from utils.train_tuning import bf16_autocast, build_adamw_with_activation_groups, clip_activation_gradients, clamp_alpha_golu_modules, configure_benchmark_runtime, default_loader_kwargs, overhead_tracking_enabled, resolve_task_alpha_hparams
+from utils.train_tuning import bf16_autocast, build_adamw_with_activation_groups, clip_activation_gradients, clamp_alpha_golu_modules, compute_model_grad_norm, configure_benchmark_runtime, default_loader_kwargs, overhead_tracking_enabled, resolve_task_alpha_hparams
 
 
 VOC_CLASSES = [
@@ -432,6 +431,9 @@ def train_single_seed_detection(
     alpha_logger = AlphaTrajectoryLogger(model)
     train_start = time.perf_counter()
     epoch_seconds = []
+    epoch_losses = []
+    lr_history = []
+    grad_norm_history = []
     amp_enabled = bool(amp) and torch.cuda.is_available() and device.type == "cuda"
     alpha_clamp_events = 0
     alpha_clamp_checks = 0
@@ -476,6 +478,7 @@ def train_single_seed_detection(
         model.train()
         epoch_loss_total = 0.0
         epoch_batches = 0
+        epoch_grad_norm_total = 0.0
         for images, targets in train_loader:
             images = [image.to(device, non_blocking=True) for image in images]
             targets = [
@@ -500,6 +503,10 @@ def train_single_seed_detection(
             loss.backward()
             if overhead_tracker is not None:
                 overhead_tracker.end_backward()
+            grad_norm = compute_model_grad_norm(model)
+            if not np.isfinite(grad_norm):
+                raise RuntimeError(f"Non-finite gradient norm detected for activation={act_type}, seed={seed}, epoch={epoch + 1}")
+            epoch_grad_norm_total += float(grad_norm)
             clip_activation_gradients(model, max_norm=alpha_grad_clip_norm)
             optimizer.step()
             epoch_loss_total += float(loss.item())
@@ -511,6 +518,10 @@ def train_single_seed_detection(
         epoch_seconds.append(time.perf_counter() - epoch_start)
         alpha_logger.step()
         mean_epoch_loss = epoch_loss_total / max(epoch_batches, 1)
+        mean_epoch_grad_norm = epoch_grad_norm_total / max(epoch_batches, 1)
+        epoch_losses.append(mean_epoch_loss)
+        lr_history.append(float(optimizer.param_groups[0]["lr"]))
+        grad_norm_history.append(mean_epoch_grad_norm)
         if save_artifacts and progress_path is not None:
             write_json(
                 progress_path,
@@ -526,7 +537,11 @@ def train_single_seed_detection(
                     "epoch": epoch + 1,
                     "progress_pct": float(((epoch + 1) / max(epochs, 1)) * 100.0),
                     "epoch_loss": mean_epoch_loss,
+                    "epoch_loss_history": epoch_losses,
                     "epoch_seconds": epoch_seconds,
+                    "lr_history": lr_history,
+                    "grad_norm_history": grad_norm_history,
+                    "grad_norm_epoch": mean_epoch_grad_norm,
                     "alpha_lr_final": current_alpha_lr,
                     "alpha_clamp_events": alpha_clamp_events,
                     "alpha_clamp_checks": alpha_clamp_checks,
@@ -559,6 +574,9 @@ def train_single_seed_detection(
                 "max_train_samples": max_train_samples,
                 "max_eval_samples": max_eval_samples,
                 "map50": float(map50),
+                "epoch_loss_history": epoch_losses,
+                "lr_history": lr_history,
+                "grad_norm_history": grad_norm_history,
                 "alpha_clamp_events": alpha_clamp_events,
                 "alpha_clamp_checks": alpha_clamp_checks,
                 "alpha_history": alpha_logger.alpha_history,
@@ -585,6 +603,9 @@ def train_single_seed_detection(
                     "max_train_samples": max_train_samples,
                     "max_eval_samples": max_eval_samples,
                     "map50": float(map50),
+                    "epoch_loss_history": epoch_losses,
+                    "lr_history": lr_history,
+                    "grad_norm_history": grad_norm_history,
                     "alpha_clamp_events": alpha_clamp_events,
                     "alpha_clamp_checks": alpha_clamp_checks,
                     "alpha_history": alpha_logger.alpha_history,
@@ -622,7 +643,7 @@ def run_detection_benchmark(seeds: list[int] | None = None, epochs: int = 8, lr:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Running Pascal VOC 2012 Detection Benchmark on {device}")
     activations = ["relu", "gelu", "swish", "prelu", "pgelu", "golu_static", "alpha_golu", "swish_adaptive"]
-    seeds = seeds or [42, 123, 999, 2024, 2025]
+    seeds = seeds or [42, 123, 999]
 
     for act_type in activations:
         print(f"\n--- Activation: {act_type.upper()} ---")
@@ -677,7 +698,7 @@ def train_and_eval(
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Pascal VOC 2012 detection benchmark")
     parser.add_argument("--activation", type=str, default="alpha_golu", help="Activation to evaluate when not running the full benchmark sweep")
-    parser.add_argument("--seeds", type=int, nargs="+", default=[42], help="Seed list for direct single-activation runs")
+    parser.add_argument("--seeds", type=int, nargs="+", default=[42, 123, 999], help="Seed list for direct single-activation runs")
     parser.add_argument("--epochs", type=int, default=8, help="Training epochs for direct single-activation runs")
     parser.add_argument("--lr", type=float, default=2e-4, help="Learning rate for detection training")
     parser.add_argument("--alpha-lr", type=float, default=None, help="Learning rate for detection activation parameters; defaults to configs/paper_benchmark.json")

@@ -1,4 +1,3 @@
-from utils.train_tuning import bf16_autocast, build_adamw_with_activation_groups, clamp_alpha_golu_modules, clip_activation_gradients, configure_benchmark_runtime, default_loader_kwargs, overhead_tracking_enabled, resolve_task_alpha_hparams
 """
 Benchmark: Consolidated Image Classification & Trajectory Analysis
 ===================================================================
@@ -31,7 +30,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from models.alpha_golu import AlphaGoLU as AdaptiveAlphaGoLU, StaticGoLU
 from diagnostics.trajectory_logger import AlphaTrajectoryLogger
-from utils.train_tuning import bf16_autocast, build_adamw_with_activation_groups, clip_activation_gradients, clamp_alpha_golu_modules, configure_benchmark_runtime, default_loader_kwargs, resolve_task_alpha_hparams
+from utils.train_tuning import bf16_autocast, build_adamw_with_activation_groups, clip_activation_gradients, clamp_alpha_golu_modules, compute_model_grad_norm, configure_benchmark_runtime, default_loader_kwargs, overhead_tracking_enabled, resolve_task_alpha_hparams
 
 
 # ==========================================
@@ -370,6 +369,9 @@ def train_single_seed(
     alpha_logger = AlphaTrajectoryLogger(model)
     train_start = time.perf_counter()
     epoch_seconds = []
+    epoch_losses = []
+    lr_history = []
+    grad_norm_history = []
 
     if torch.cuda.is_available():
         torch.cuda.reset_peak_memory_stats(device)
@@ -426,6 +428,7 @@ def train_single_seed(
         model.train()
         epoch_loss_total = 0.0
         epoch_batches = 0
+        epoch_grad_norm_total = 0.0
         for inputs, labels in trainloader:
             inputs, labels = inputs.to(device, non_blocking=True), labels.to(device, non_blocking=True)
             optimizer.zero_grad()
@@ -441,6 +444,10 @@ def train_single_seed(
             loss.backward()
             if overhead_tracker is not None:
                 overhead_tracker.end_backward()
+            grad_norm = compute_model_grad_norm(model)
+            if not math.isfinite(grad_norm):
+                raise RuntimeError(f"Non-finite gradient norm detected for activation={act_type}, seed={seed}, epoch={epoch + 1}")
+            epoch_grad_norm_total += grad_norm
             clip_activation_gradients(model, max_norm=alpha_grad_clip_norm)
             optimizer.step()
             epoch_loss_total += float(loss.item())
@@ -452,6 +459,10 @@ def train_single_seed(
         epoch_seconds.append(time.perf_counter() - epoch_start)
         alpha_logger.step()
         mean_epoch_loss = epoch_loss_total / max(epoch_batches, 1)
+        mean_epoch_grad_norm = epoch_grad_norm_total / max(epoch_batches, 1)
+        epoch_losses.append(mean_epoch_loss)
+        lr_history.append(float(optimizer.param_groups[0]["lr"]))
+        grad_norm_history.append(mean_epoch_grad_norm)
         if save_artifacts and progress_path is not None:
             write_json(
                 progress_path,
@@ -467,7 +478,11 @@ def train_single_seed(
                     "epoch": epoch + 1,
                     "progress_pct": float(((epoch + 1) / max(epochs, 1)) * 100.0),
                     "epoch_loss": mean_epoch_loss,
+                    "epoch_loss_history": epoch_losses,
                     "epoch_seconds": epoch_seconds,
+                    "lr_history": lr_history,
+                    "grad_norm_history": grad_norm_history,
+                    "grad_norm_epoch": mean_epoch_grad_norm,
                     "alpha_lr_final": current_alpha_lr,
                     "alpha_clamp_events": alpha_clamp_events,
                     "alpha_clamp_checks": alpha_clamp_checks,
@@ -505,10 +520,13 @@ def train_single_seed(
                 "eval_split": eval_split,
                 "eval_loss": eval_loss,
                 "accuracy": acc,
+                "epoch_loss_history": epoch_losses,
                 "alpha_values": alphas,
                 "alpha_history": alpha_logger.alpha_history,
                 "train_seconds": train_seconds,
                 "epoch_seconds": epoch_seconds,
+                "lr_history": lr_history,
+                "grad_norm_history": grad_norm_history,
                 "alpha_lr_final": current_alpha_lr,
                 "alpha_clamp_events": alpha_clamp_events,
                 "alpha_clamp_checks": alpha_clamp_checks,
@@ -529,10 +547,13 @@ def train_single_seed(
                 "eval_split": eval_split,
                 "eval_loss": eval_loss,
                 "accuracy": acc,
+                "epoch_loss_history": epoch_losses,
                 "alpha_values": alphas,
                 "alpha_history": alpha_logger.alpha_history,
                 "train_seconds": train_seconds,
                 "epoch_seconds": epoch_seconds,
+                "lr_history": lr_history,
+                "grad_norm_history": grad_norm_history,
                 "alpha_lr_final": current_alpha_lr,
                 "alpha_clamp_events": alpha_clamp_events,
                 "alpha_clamp_checks": alpha_clamp_checks,
@@ -553,7 +574,7 @@ def train_single_seed(
     return acc, alphas
 
 
-def run_benchmark(dataset_name: str = "cifar10", seeds: list = [42, 123, 999, 2024, 2025], epochs: int = 10, data_root: str = "./data", alpha_lr: float | None = None, val_split: float = 0.1, alpha_lr_scheduler: str = "none", alpha_layout: str = "channel", config_path: str | None = "configs/paper_benchmark.json", amp: bool = False):
+def run_benchmark(dataset_name: str = "cifar10", seeds: list = [42, 123, 999], epochs: int = 10, data_root: str = "./data", alpha_lr: float | None = None, val_split: float = 0.1, alpha_lr_scheduler: str = "none", alpha_layout: str = "channel", config_path: str | None = "configs/paper_benchmark.json", amp: bool = False):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     activations = ['relu', 'gelu', 'swish', 'adaptive_swish', 'prelu', 'pgelu', 'golu_static', 'alpha_golu']
     results = {act: [] for act in activations}
@@ -604,7 +625,7 @@ def train_and_eval(activation: str = 'alpha_golu', seed: int = 42, dataset_name:
 
 def run_alpha_layout_ablation(dataset_name: str = "cifar10", seeds: list[int] | None = None, epochs: int = 10, data_root: str = "./data", alpha_lr: float | None = None, val_split: float = 0.1, alpha_lr_scheduler: str = "none", config_path: str | None = "configs/paper_benchmark.json"):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    seeds = seeds or [42, 123, 999, 2024, 2025]
+    seeds = seeds or [42, 123, 999]
     layouts = ["layer", "channel"]
 
     print(f"\n================ Alpha Layout Ablation on {dataset_name.upper()} ================")
@@ -682,7 +703,7 @@ if __name__ == '__main__':
 
     parser = argparse.ArgumentParser(description="Unified ResNet-18 benchmark")
     parser.add_argument("--dataset-name", type=str, default=None, choices=["cifar10", "fashion_mnist"], help="Dataset to evaluate")
-    parser.add_argument("--seeds", type=int, nargs="+", default=[42, 123, 999, 2024, 2025], help="Random seeds")
+    parser.add_argument("--seeds", type=int, nargs="+", default=[42, 123, 999], help="Random seeds")
     parser.add_argument("--epochs", type=int, default=10, help="Training epochs")
     parser.add_argument("--activation", type=str, default="alpha_golu", help="Single activation to evaluate")
     parser.add_argument("--data-root", type=str, default="./data", help="Dataset cache root")
