@@ -244,7 +244,7 @@ def _invoke_task_runner(runner_fn, act: str, *, seed: int, data_root: str, base_
     accepted_kwargs = {
         name: value
         for name, value in candidate_kwargs.items()
-        if name in signature.parameters
+        if name in signature.parameters and value is not None
     }
     return runner_fn(act, **accepted_kwargs)
 
