@@ -192,7 +192,8 @@ def train_single_seed_diffusion(act_type: str, seed: int, epochs: int, device: t
     test_dataset = torchvision.datasets.CIFAR10(root=data_root, train=False, download=True, transform=transform)
 
     loader_g = torch.Generator().manual_seed(seed)
-    eval_g = torch.Generator().manual_seed(seed + 999)
+    eval_loader_g = torch.Generator().manual_seed(seed + 999)
+    eval_sample_g = torch.Generator(device=device.type).manual_seed(seed + 999)
 
     train_loader_kwargs = default_loader_kwargs()
     test_loader_kwargs = default_loader_kwargs(num_workers=1)
@@ -209,7 +210,7 @@ def train_single_seed_diffusion(act_type: str, seed: int, epochs: int, device: t
         batch_size=256,
         shuffle=False,
         worker_init_fn=seed_worker,
-        generator=eval_g,
+        generator=eval_loader_g,
         **test_loader_kwargs,
     )
 
@@ -394,8 +395,8 @@ def train_single_seed_diffusion(act_type: str, seed: int, epochs: int, device: t
         with bf16_autocast(amp_enabled):
             for x0, _ in testloader:
                 x0 = x0.to(device, non_blocking=True)
-                t = torch.randint(0, timesteps, (x0.size(0),), device=device, generator=eval_g).long()
-                noise = torch.randn(x0.shape, device=device, generator=eval_g)
+                t = torch.randint(0, timesteps, (x0.size(0),), device=device, generator=eval_sample_g).long()
+                noise = torch.randn(x0.shape, device=device, generator=eval_sample_g)
 
                 a_hat_t = alpha_hat[t][:, None, None, None]
                 xt = torch.sqrt(a_hat_t) * x0 + torch.sqrt(1 - a_hat_t) * noise
