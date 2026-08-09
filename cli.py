@@ -162,7 +162,7 @@ def _task_run_root(task_name: str) -> Path:
         "segmentation": "segmentation",
         "diffusion": "diffusion",
         "language_model": "language_model",
-        "robustness": "adversarial_robustness",
+        "robustness": "corruption_robustness",
     }
     task_folder = folder_map.get(task_name, task_name)
     return Path(__file__).resolve().parent / "outputs" / "runs" / task_folder
@@ -445,7 +445,7 @@ def handle_generate_overhead_table(args):
         "segmentation": "Segmentation",
         "diffusion": "Diffusion",
         "language_model": "Language Modeling",
-        "robustness": "Robustness",
+        "robustness": "Corruption Robustness",
     }
 
     activations = [act for act in CANONICAL_ACTIVATIONS if act in grouped]

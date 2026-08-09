@@ -219,13 +219,14 @@ def normalize_images(images: torch.Tensor) -> torch.Tensor:
     return (images - mean) / std
 
 
-def apply_gaussian_noise(images: torch.Tensor, sigma: float = 0.1) -> torch.Tensor:
-    return torch.clamp(images + torch.randn_like(images) * sigma, 0.0, 1.0)
+def apply_gaussian_noise(images: torch.Tensor, sigma: float = 0.1, rng: torch.Generator | None = None) -> torch.Tensor:
+    noise = torch.randn(images.shape, device=images.device, dtype=images.dtype, generator=rng)
+    return torch.clamp(images + noise * sigma, 0.0, 1.0)
 
 
-def apply_shot_noise(images: torch.Tensor, severity: float = 0.03) -> torch.Tensor:
+def apply_shot_noise(images: torch.Tensor, severity: float = 0.03, rng: torch.Generator | None = None) -> torch.Tensor:
     scale = max(1.0, 1.0 / max(severity, 1e-6))
-    noisy = torch.poisson(images.clamp(0.0, 1.0) * scale) / scale
+    noisy = torch.poisson(images.clamp(0.0, 1.0) * scale, generator=rng) / scale
     return torch.clamp(noisy, 0.0, 1.0)
 
 
@@ -234,12 +235,12 @@ def apply_blur(images: torch.Tensor, kernel_size: int = 5, sigma: float = 1.0) -
     return torch.stack(blurred, dim=0)
 
 
-def corrupt_batch(images: torch.Tensor, corruption_name: str) -> torch.Tensor:
+def corrupt_batch(images: torch.Tensor, corruption_name: str, rng: torch.Generator | None = None) -> torch.Tensor:
     pixel_images = denormalize_images(images)
     if corruption_name == "gaussian_noise":
-        corrupted = apply_gaussian_noise(pixel_images, sigma=CORRUPTION_SUITE[corruption_name]["sigma"])
+        corrupted = apply_gaussian_noise(pixel_images, sigma=CORRUPTION_SUITE[corruption_name]["sigma"], rng=rng)
     elif corruption_name == "shot_noise":
-        corrupted = apply_shot_noise(pixel_images, severity=CORRUPTION_SUITE[corruption_name]["severity"])
+        corrupted = apply_shot_noise(pixel_images, severity=CORRUPTION_SUITE[corruption_name]["severity"], rng=rng)
     elif corruption_name == "blur":
         params = CORRUPTION_SUITE[corruption_name]
         corrupted = apply_blur(pixel_images, kernel_size=params["kernel_size"], sigma=params["sigma"])
@@ -320,7 +321,7 @@ def train_single_seed_robustness(
     progress_path = None
     if save_artifacts:
         run_dir = create_run_directory(
-            str(PROJECT_ROOT / "outputs" / "runs" / "adversarial_robustness"),
+            str(PROJECT_ROOT / "outputs" / "runs" / "corruption_robustness"),
             "robustness",
             act_type,
             [seed],
@@ -419,6 +420,7 @@ def train_single_seed_robustness(
     model.eval()
     clean_correct, total = 0, 0
     corruption_correct = {name: 0 for name in CORRUPTION_SUITE}
+    corruption_rng = torch.Generator(device=device.type).manual_seed(seed)
 
     for images, labels in test_loader:
         images, labels = images.to(device, non_blocking=True), labels.to(device, non_blocking=True)
@@ -428,7 +430,7 @@ def train_single_seed_robustness(
                 clean_correct += (model(images).argmax(1) == labels).sum().item()
 
         for corruption_name in CORRUPTION_SUITE:
-            corrupted_images = corrupt_batch(images, corruption_name)
+            corrupted_images = corrupt_batch(images, corruption_name, rng=corruption_rng)
             with torch.no_grad():
                 with bf16_autocast(amp_enabled):
                     corruption_correct[corruption_name] += (model(corrupted_images).argmax(1) == labels).sum().item()
@@ -502,10 +504,10 @@ def train_single_seed_robustness(
                     "activation": act_type,
                     "data_root": data_root,
                     "seed": seed,
-                    "attack": {
-                        "eps": 8 / 255,
-                        "alpha": 2 / 255,
-                        "iters": 10,
+                    "evaluation": {
+                        "suite": "corruption",
+                        "corruptions": CORRUPTION_SUITE,
+                        "seeded_corruption_rng": True,
                     },
                 },
             ),
@@ -552,7 +554,7 @@ def train_and_eval(activation: str = 'alpha_golu', seed: int = 42, epochs: int =
 if __name__ == '__main__':
     import argparse
 
-    parser = argparse.ArgumentParser(description="CIFAR-10 adversarial robustness benchmark")
+    parser = argparse.ArgumentParser(description="CIFAR-10 corruption robustness benchmark")
     parser.add_argument("--activation", type=str, default="alpha_golu", help="Single activation to evaluate")
     parser.add_argument("--seeds", type=int, nargs="+", default=[42, 123, 999], help="Random seeds")
     parser.add_argument("--epochs", type=int, default=10, help="Training epochs")

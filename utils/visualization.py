@@ -20,7 +20,7 @@ TASK_LABELS = {
     "segmentation": "Segmentation",
     "diffusion": "Diffusion",
     "language_model": "Language Modeling",
-    "robustness": "Robustness",
+    "robustness": "Corruption Robustness",
 }
 
 LOWER_IS_BETTER = {"diffusion", "language_model"}
