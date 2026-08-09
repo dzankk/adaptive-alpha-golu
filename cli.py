@@ -94,6 +94,36 @@ def _resume_state_path(output_root: str, scope: str, payload: dict) -> Path:
     return Path(output_root) / ".resume" / scope / f"{_stable_signature(payload)}.json"
 
 
+def _canonicalize_full_suite_tasks(task_names: list[str], config_task_names: list[str] | None = None) -> list[str]:
+    normalized_tasks = _normalize_task_names(task_names)
+    if not normalized_tasks:
+        return []
+
+    config_order = _normalize_task_names(config_task_names)
+    ordered_tasks: list[str] = []
+    task_set = set(normalized_tasks)
+
+    for task_name in config_order:
+        if task_name in task_set and task_name not in ordered_tasks:
+            ordered_tasks.append(task_name)
+
+    for task_name in sorted(task_set):
+        if task_name not in ordered_tasks:
+            ordered_tasks.append(task_name)
+
+    return ordered_tasks
+
+
+def _full_suite_resume_payload(selected_tasks: list[str], activations: list[str], seeds: list[int], config_path: str | None, amp: bool, config_task_names: list[str] | None = None) -> dict:
+    return {
+        "tasks": _canonicalize_full_suite_tasks(selected_tasks, config_task_names),
+        "activations": activations,
+        "seeds": seeds,
+        "config": config_path,
+        "amp": bool(amp),
+    }
+
+
 def _load_json_file(path: Path) -> dict:
     if not path.exists():
         return {}
@@ -618,7 +648,8 @@ def handle_run_all(args, summary_only: bool = False):
     config = load_benchmark_config(args.config) if args.config else {}
     seeds = args.seeds if args.seeds != DEFAULT_SEEDS else config.get("seeds", DEFAULT_SEEDS)
     activations = args.activations if args.activations != CANONICAL_ACTIVATIONS else config.get("activations", CANONICAL_ACTIVATIONS)
-    task_names = args.tasks if args.tasks else config.get("tasks", list(TASK_MAP.keys()))
+    config_task_names = config.get("tasks", list(TASK_MAP.keys()))
+    task_names = args.tasks if args.tasks else config_task_names
     rerun_tasks = _normalize_task_names(getattr(args, "rerun_tasks", None))
     task_alpha_lrs = config.get("alpha_lr_by_task", {})
     task_base_lrs = config.get("base_lr_by_task", {})
@@ -643,7 +674,7 @@ def handle_run_all(args, summary_only: bool = False):
         resume_path = _resume_state_path(
             output_root,
             "full_suite",
-            {"tasks": selected_tasks, "activations": activations, "seeds": seeds, "config": args.config, "amp": bool(args.amp)},
+            _full_suite_resume_payload(selected_tasks, activations, seeds, args.config, bool(args.amp), config_task_names),
         )
         if args.fresh and resume_path.exists():
             try:
