@@ -1,5 +1,5 @@
 """
-Benchmark: DDPM Denoising on CelebA
+Benchmark: DDPM Denoising on CIFAR-10
 Evaluates spatial noise prediction MSE on real image manifolds.
 Tests static vs. adaptive activation dynamics across multi-step diffusion steps.
 Fully audited for parameter constraints, proper iteration counts, and deterministic evaluation.
@@ -184,14 +184,12 @@ def train_single_seed_diffusion(act_type: str, seed: int, epochs: int, device: t
     reset_seeds(seed)
 
     transform = transforms.Compose([
-        transforms.Resize((64, 64)),
-        transforms.CenterCrop(64),
         transforms.ToTensor(),
         transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
     ])
 
-    full_dataset = torchvision.datasets.CelebA(root=data_root, split='train', target_type='attr', download=True, transform=transform)
-    test_dataset = torchvision.datasets.CelebA(root=data_root, split='valid', target_type='attr', download=True, transform=transform)
+    full_dataset = torchvision.datasets.CIFAR10(root=data_root, train=True, download=True, transform=transform)
+    test_dataset = torchvision.datasets.CIFAR10(root=data_root, train=False, download=True, transform=transform)
 
     loader_g = torch.Generator().manual_seed(seed)
     eval_g = torch.Generator().manual_seed(seed + 999)
@@ -287,6 +285,7 @@ def train_single_seed_diffusion(act_type: str, seed: int, epochs: int, device: t
                 seeds=[seed],
                 activations=[act_type],
                 extra_config={
+                    "dataset_name": "cifar10",
                     "data_root": data_root,
                     "epochs": epochs,
                     "base_lr": resolved_base_lr,
@@ -357,6 +356,7 @@ def train_single_seed_diffusion(act_type: str, seed: int, epochs: int, device: t
                 {
                     "status": "running",
                     "task": "diffusion",
+                    "dataset_name": "cifar10",
                     "data_root": data_root,
                     "activation": act_type,
                     "alpha_lr": alpha_lr if alpha_lr is not None else 2e-4,
@@ -414,6 +414,7 @@ def train_single_seed_diffusion(act_type: str, seed: int, epochs: int, device: t
         run_dir / "results.json",
         {
             "task": "diffusion",
+            "dataset_name": "cifar10",
             "activation": act_type,
             "data_root": data_root,
             "seed": seed,
@@ -441,6 +442,7 @@ def train_single_seed_diffusion(act_type: str, seed: int, epochs: int, device: t
             {
                 "status": "completed",
                 "task": "diffusion",
+                "dataset_name": "cifar10",
                 "data_root": data_root,
                 "activation": act_type,
                 "alpha_lr": alpha_lr if alpha_lr is not None else 2e-4,
@@ -472,6 +474,7 @@ def train_single_seed_diffusion(act_type: str, seed: int, epochs: int, device: t
             seeds=[seed],
             activations=[act_type],
             extra_config={
+                "dataset_name": "cifar10",
                 "data_root": data_root,
                 "epochs": epochs,
                 "base_lr": resolved_base_lr,
@@ -486,13 +489,13 @@ def train_single_seed_diffusion(act_type: str, seed: int, epochs: int, device: t
 
 def run_diffusion_benchmark(seeds=None, epochs: int = 10, data_root: str = './data', alpha_lr: float | None = None, config_path: str | None = "configs/paper_benchmark.json", amp: bool = False):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Running CelebA DDPM Diffusion Benchmark on {device}...")
+    print(f"Running CIFAR-10 DDPM Diffusion Benchmark on {device}...")
 
     activations = ['relu', 'gelu', 'swish', 'adaptive_swish', 'prelu', 'pgelu', 'golu_static', 'alpha_golu']
     seeds = seeds or [42, 123, 999]
     results = {}
 
-    print("\n================ CelebA DDPM Denoising Loss (MSE ↓) ================")
+    print("\n================ CIFAR-10 DDPM Denoising Loss (MSE ↓) ================")
     for act in activations:
         seed_losses = []
         for s in seeds:
@@ -502,7 +505,7 @@ def run_diffusion_benchmark(seeds=None, epochs: int = 10, data_root: str = './da
 
         results[act] = (np.mean(seed_losses), np.std(seed_losses))
 
-    print("\n================ CELEBA DIFFUSION SUMMARY ================")
+    print("\n================ CIFAR-10 DIFFUSION SUMMARY ================")
     for act, (m_loss, s_loss) in results.items():
         print(f"  {act.upper():<14}: Loss = {m_loss:.6f} ± {s_loss:.6f}")
 
@@ -517,7 +520,7 @@ def train_and_eval(activation: str = 'alpha_golu', seed: int = 42, epochs: int =
 if __name__ == '__main__':
     import argparse
 
-    parser = argparse.ArgumentParser(description="CelebA diffusion benchmark")
+    parser = argparse.ArgumentParser(description="CIFAR-10 diffusion benchmark")
     parser.add_argument("--activation", type=str, default="alpha_golu", help="Single activation to evaluate")
     parser.add_argument("--seeds", type=int, nargs="+", default=[42, 123, 999], help="Random seeds")
     parser.add_argument("--epochs", type=int, default=10, help="Training epochs")
@@ -532,7 +535,7 @@ if __name__ == '__main__':
         run_diffusion_benchmark(seeds=args.seeds, epochs=args.epochs, data_root=args.data_root, alpha_lr=args.alpha_lr, config_path=args.config, amp=args.amp)
     else:
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        print(f"Running CelebA DDPM Diffusion Benchmark on {device}...")
+        print(f"Running CIFAR-10 DDPM Diffusion Benchmark on {device}...")
         for seed in args.seeds:
             loss = train_and_eval(activation=args.activation, seed=seed, epochs=args.epochs, data_root=args.data_root, alpha_lr=args.alpha_lr, config_path=args.config, amp=args.amp)
             print(f"Activation: {args.activation.ljust(15)} | Seed {seed} | Denoising MSE: {loss:.6f}")

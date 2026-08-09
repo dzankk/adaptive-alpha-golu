@@ -21,6 +21,9 @@
     ],
     "seeds": [42, 123, 999],
     "data_root": "./data",
+    "dataset_by_task": {
+        "diffusion": "cifar10"
+    },
     "epochs_by_task": {
         "classification": 90,
         "detection": 12,
