@@ -190,7 +190,6 @@ class PascalVOCDataset(Dataset):
 
         image = TF.resize(image, (self.image_size, self.image_size))
         image = TF.to_tensor(image)
-        image = TF.normalize(image, mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225))
 
         scale_x = self.image_size / width
         scale_y = self.image_size / height
@@ -233,7 +232,7 @@ class ActivationBoxHead(nn.Module):
         return x
 
 
-def build_detection_model(act_type: str, num_classes: int = 21) -> FasterRCNN:
+def build_detection_model(act_type: str, num_classes: int = 21, image_size: int = 320) -> FasterRCNN:
     backbone = resnet_fpn_backbone(backbone_name="resnet50", weights=ResNet50_Weights.DEFAULT, trainable_layers=3)
     anchor_generator = AnchorGenerator(
         sizes=((32,), (64,), (128,), (256,), (512,)),
@@ -244,6 +243,8 @@ def build_detection_model(act_type: str, num_classes: int = 21) -> FasterRCNN:
         num_classes=num_classes,
         rpn_anchor_generator=anchor_generator,
         box_roi_pool=None,
+        min_size=image_size,
+        max_size=image_size,
     )
 
     representation_size = 1024
@@ -412,7 +413,7 @@ def train_single_seed_detection(
         **eval_loader_kwargs,
     )
 
-    model = build_detection_model(act_type=act_type, num_classes=len(VOC_CLASSES) + 1).to(device)
+    model = build_detection_model(act_type=act_type, num_classes=len(VOC_CLASSES) + 1, image_size=image_size).to(device)
     overhead_tracker = OverheadTracker(task_name="detection", activation_name=act_type, model=model, device=device) if overhead_tracking_enabled() else None
     alpha_lr, alpha_warmup_epochs, alpha_grad_clip_norm = resolve_task_alpha_hparams(
         "detection",
@@ -465,6 +466,9 @@ def train_single_seed_detection(
                     "lr": lr,
                     "alpha_lr": alpha_lr if alpha_lr is not None else lr,
                     "image_size": image_size,
+                    "detector_min_size": image_size,
+                    "detector_max_size": image_size,
+                    "grad_clip_norm_model": 10.0,
                     "train_split_ratio": train_split_ratio,
                     "max_train_samples": max_train_samples,
                     "max_eval_samples": max_eval_samples,
@@ -507,6 +511,7 @@ def train_single_seed_detection(
             if not np.isfinite(grad_norm):
                 raise RuntimeError(f"Non-finite gradient norm detected for activation={act_type}, seed={seed}, epoch={epoch + 1}")
             epoch_grad_norm_total += float(grad_norm)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)
             clip_activation_gradients(model, max_norm=alpha_grad_clip_norm)
             optimizer.step()
             epoch_loss_total += float(loss.item())
@@ -570,6 +575,9 @@ def train_single_seed_detection(
                 "alpha_lr": alpha_lr if alpha_lr is not None else lr,
                 "alpha_lr_final": current_alpha_lr if act_params else None,
                 "image_size": image_size,
+                "detector_min_size": image_size,
+                "detector_max_size": image_size,
+                "grad_clip_norm_model": 10.0,
                 "train_split_ratio": train_split_ratio,
                 "max_train_samples": max_train_samples,
                 "max_eval_samples": max_eval_samples,
@@ -599,6 +607,9 @@ def train_single_seed_detection(
                     "lr": lr,
                     "alpha_lr_final": current_alpha_lr if act_params else None,
                     "image_size": image_size,
+                    "detector_min_size": image_size,
+                    "detector_max_size": image_size,
+                    "grad_clip_norm_model": 10.0,
                     "train_split_ratio": train_split_ratio,
                     "max_train_samples": max_train_samples,
                     "max_eval_samples": max_eval_samples,
@@ -630,6 +641,9 @@ def train_single_seed_detection(
                     "lr": lr,
                     "alpha_lr": alpha_lr if alpha_lr is not None else lr,
                     "image_size": image_size,
+                    "detector_min_size": image_size,
+                    "detector_max_size": image_size,
+                    "grad_clip_norm_model": 10.0,
                     "train_split_ratio": train_split_ratio,
                     "max_train_samples": max_train_samples,
                     "max_eval_samples": max_eval_samples,
