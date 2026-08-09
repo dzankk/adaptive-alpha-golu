@@ -25,6 +25,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from models.alpha_golu import AlphaGoLU as AdaptiveAlphaGoLU, StaticGoLU
 from diagnostics.trajectory_logger import AlphaTrajectoryLogger
+from utils.experiment_config import load_benchmark_config
 from utils.overhead_tracker import OverheadTracker
 from utils.run_artifacts import build_run_manifest, create_run_directory, write_json
 from utils.train_tuning import bf16_autocast, build_adamw_with_activation_groups, clip_activation_gradients, clamp_alpha_golu_modules, compute_model_grad_norm, configure_benchmark_runtime, default_loader_kwargs, overhead_tracking_enabled, resolve_task_alpha_hparams
@@ -147,7 +148,39 @@ def get_optimizer(model: nn.Module, lr: float = 2e-4, alpha_lr: float | None = N
     )
 
 
-def train_single_seed_diffusion(act_type: str, seed: int, epochs: int, device: torch.device, data_root: str = './data', alpha_lr: float | None = None, config_path: str | None = "configs/paper_benchmark.json", save_artifacts: bool = False, amp: bool = False) -> float:
+def _resolve_task_config_value(config: dict, key: str, task_name: str, default):
+    mapping = config.get(key, {}) if isinstance(config, dict) else {}
+    if isinstance(mapping, dict):
+        value = mapping.get(task_name)
+        if value is not None:
+            return value
+    value = config.get(key) if isinstance(config, dict) else None
+    if value is not None and not isinstance(value, dict):
+        return value
+    return default
+
+
+def _resolve_diffusion_schedule_hparams(*, config_path: str | None, base_lr: float | None) -> dict:
+    config = load_benchmark_config(config_path) if config_path else {}
+    task_name = "diffusion"
+
+    resolved_base_lr = float(base_lr if base_lr is not None else _resolve_task_config_value(config, "base_lr_by_task", task_name, 2e-4))
+    scheduler_name = str(_resolve_task_config_value(config, "scheduler_by_task", task_name, "cosine_warmup")).lower().strip()
+    warmup_steps = int(_resolve_task_config_value(config, "scheduler_warmup_steps_by_task", task_name, 1000))
+    min_lr = float(_resolve_task_config_value(config, "scheduler_min_lr_by_task", task_name, 0.0))
+
+    if scheduler_name not in {"none", "cosine", "cosine_warmup"}:
+        raise ValueError(f"Unsupported scheduler '{scheduler_name}' for diffusion")
+
+    return {
+        "base_lr": resolved_base_lr,
+        "scheduler_name": scheduler_name,
+        "warmup_steps": max(0, warmup_steps),
+        "min_lr": max(0.0, min_lr),
+    }
+
+
+def train_single_seed_diffusion(act_type: str, seed: int, epochs: int, device: torch.device, data_root: str = './data', base_lr: float | None = None, alpha_lr: float | None = None, config_path: str | None = "configs/paper_benchmark.json", save_artifacts: bool = False, amp: bool = False) -> float:
     reset_seeds(seed)
 
     transform = transforms.Compose([
@@ -195,7 +228,38 @@ def train_single_seed_diffusion(act_type: str, seed: int, epochs: int, device: t
         alpha_lr,
         config_path=config_path,
     )
-    optimizer, set_alpha_lr, act_params = get_optimizer(model, alpha_lr=alpha_lr, warmup_epochs=alpha_warmup_epochs)
+    schedule_hparams = _resolve_diffusion_schedule_hparams(config_path=config_path, base_lr=base_lr)
+    resolved_base_lr = float(schedule_hparams["base_lr"])
+    scheduler_name = str(schedule_hparams["scheduler_name"])
+    scheduler_warmup_steps = int(schedule_hparams["warmup_steps"])
+    scheduler_min_lr = float(schedule_hparams["min_lr"])
+
+    optimizer, set_alpha_lr, act_params = get_optimizer(model, lr=resolved_base_lr, alpha_lr=alpha_lr, warmup_epochs=alpha_warmup_epochs)
+
+    total_train_steps = max(int(epochs) * max(len(trainloader), 1), 1)
+    warmup_steps = min(max(scheduler_warmup_steps, 0), total_train_steps - 1) if total_train_steps > 1 else 0
+    min_lr_ratio = min(1.0, scheduler_min_lr / max(resolved_base_lr, 1e-12))
+
+    def set_base_lr_for_step(step_index: int) -> float:
+        if scheduler_name == "none":
+            current_lr = resolved_base_lr
+        else:
+            clamped_step = min(max(step_index, 0), total_train_steps - 1)
+            if scheduler_name == "cosine_warmup" and warmup_steps > 0 and clamped_step < warmup_steps:
+                warmup_scale = float(clamped_step + 1) / float(warmup_steps)
+                current_lr = resolved_base_lr * warmup_scale
+            else:
+                progress_denom = max(total_train_steps - warmup_steps, 1)
+                progress = float(clamped_step - warmup_steps) / float(progress_denom)
+                progress = min(max(progress, 0.0), 1.0)
+                cosine_scale = min_lr_ratio + 0.5 * (1.0 - min_lr_ratio) * (1.0 + math.cos(math.pi * progress))
+                current_lr = resolved_base_lr * cosine_scale
+        optimizer.param_groups[0]["lr"] = float(current_lr)
+        return float(current_lr)
+
+    global_step = 0
+    current_base_lr = set_base_lr_for_step(0)
+
     criterion = nn.MSELoss()
     epoch_seconds = []
     epoch_losses = []
@@ -225,6 +289,10 @@ def train_single_seed_diffusion(act_type: str, seed: int, epochs: int, device: t
                 extra_config={
                     "data_root": data_root,
                     "epochs": epochs,
+                    "base_lr": resolved_base_lr,
+                    "scheduler": scheduler_name,
+                    "scheduler_warmup_steps": scheduler_warmup_steps,
+                    "scheduler_min_lr": scheduler_min_lr,
                 },
             ),
         )
@@ -265,6 +333,11 @@ def train_single_seed_diffusion(act_type: str, seed: int, epochs: int, device: t
             epoch_grad_norm_total += grad_norm
             clip_activation_gradients(model, max_norm=alpha_grad_clip_norm)
             optimizer.step()
+            global_step += 1
+            if global_step < total_train_steps:
+                current_base_lr = set_base_lr_for_step(global_step)
+            else:
+                current_base_lr = float(optimizer.param_groups[0]["lr"])
             epoch_loss_total += float(loss.item())
             epoch_batches += 1
             clamp_events, clamp_checks = clamp_alpha_golu_modules(model, min_alpha=0.2, max_alpha=3.0)
@@ -276,7 +349,7 @@ def train_single_seed_diffusion(act_type: str, seed: int, epochs: int, device: t
         mean_epoch_loss = epoch_loss_total / max(epoch_batches, 1)
         mean_epoch_grad_norm = epoch_grad_norm_total / max(epoch_batches, 1)
         epoch_losses.append(mean_epoch_loss)
-        lr_history.append(float(optimizer.param_groups[0]["lr"]))
+        lr_history.append(float(current_base_lr))
         grad_norm_history.append(mean_epoch_grad_norm)
         if save_artifacts and progress_path is not None:
             write_json(
@@ -287,8 +360,14 @@ def train_single_seed_diffusion(act_type: str, seed: int, epochs: int, device: t
                     "data_root": data_root,
                     "activation": act_type,
                     "alpha_lr": alpha_lr if alpha_lr is not None else 2e-4,
+                    "base_lr": resolved_base_lr,
+                    "scheduler": scheduler_name,
+                    "scheduler_warmup_steps": scheduler_warmup_steps,
+                    "scheduler_min_lr": scheduler_min_lr,
                     "seed": seed,
                     "epochs": epochs,
+                    "global_step": global_step,
+                    "total_train_steps": total_train_steps,
                     "epoch": epoch + 1,
                     "progress_pct": float(((epoch + 1) / max(epochs, 1)) * 100.0),
                     "epoch_loss": mean_epoch_loss,
@@ -340,6 +419,11 @@ def train_single_seed_diffusion(act_type: str, seed: int, epochs: int, device: t
             "seed": seed,
             "epochs": epochs,
             "alpha_lr": alpha_lr if alpha_lr is not None else 2e-4,
+            "base_lr": resolved_base_lr,
+            "scheduler": scheduler_name,
+            "scheduler_warmup_steps": scheduler_warmup_steps,
+            "scheduler_min_lr": scheduler_min_lr,
+            "total_train_steps": total_train_steps,
             "alpha_lr_final": current_alpha_lr if act_params else None,
             "mse": float(loss),
             "epoch_loss_history": epoch_losses,
@@ -360,8 +444,14 @@ def train_single_seed_diffusion(act_type: str, seed: int, epochs: int, device: t
                 "data_root": data_root,
                 "activation": act_type,
                 "alpha_lr": alpha_lr if alpha_lr is not None else 2e-4,
+                "base_lr": resolved_base_lr,
+                "scheduler": scheduler_name,
+                "scheduler_warmup_steps": scheduler_warmup_steps,
+                "scheduler_min_lr": scheduler_min_lr,
                 "seed": seed,
                 "epochs": epochs,
+                "global_step": global_step,
+                "total_train_steps": total_train_steps,
                 "progress_pct": 100.0,
                 "alpha_lr_final": current_alpha_lr if act_params else None,
                 "mse": float(loss),
@@ -384,6 +474,10 @@ def train_single_seed_diffusion(act_type: str, seed: int, epochs: int, device: t
             extra_config={
                 "data_root": data_root,
                 "epochs": epochs,
+                "base_lr": resolved_base_lr,
+                "scheduler": scheduler_name,
+                "scheduler_warmup_steps": scheduler_warmup_steps,
+                "scheduler_min_lr": scheduler_min_lr,
             },
         ),
     )
@@ -413,10 +507,10 @@ def run_diffusion_benchmark(seeds=None, epochs: int = 10, data_root: str = './da
         print(f"  {act.upper():<14}: Loss = {m_loss:.6f} ± {s_loss:.6f}")
 
 
-def train_and_eval(activation: str = 'alpha_golu', seed: int = 42, epochs: int = 10, data_root: str = './data', alpha_lr: float | None = None, config_path: str | None = "configs/paper_benchmark.json", save_artifacts: bool = False, amp: bool = False) -> float:
+def train_and_eval(activation: str = 'alpha_golu', seed: int = 42, epochs: int = 10, data_root: str = './data', base_lr: float | None = None, alpha_lr: float | None = None, config_path: str | None = "configs/paper_benchmark.json", save_artifacts: bool = False, amp: bool = False) -> float:
     """Returns Denoising Test MSE Loss."""
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    loss = train_single_seed_diffusion(act_type=activation, seed=seed, epochs=epochs, device=device, data_root=data_root, alpha_lr=alpha_lr, config_path=config_path, save_artifacts=save_artifacts, amp=amp)
+    loss = train_single_seed_diffusion(act_type=activation, seed=seed, epochs=epochs, device=device, data_root=data_root, base_lr=base_lr, alpha_lr=alpha_lr, config_path=config_path, save_artifacts=save_artifacts, amp=amp)
     return float(loss)
 
 

@@ -30,7 +30,8 @@
     },
     "base_lr_by_task": {
         "classification": 0.1,
-        "segmentation": 0.02
+        "segmentation": 0.02,
+        "diffusion": 0.0003
     },
     "optimizer_by_task": {
         "classification": "sgd"
@@ -42,13 +43,20 @@
         "classification": 0.0001
     },
     "scheduler_by_task": {
-        "classification": "step"
+        "classification": "step",
+        "diffusion": "cosine_warmup"
     },
     "scheduler_step_size_by_task": {
         "classification": 30
     },
     "scheduler_gamma_by_task": {
         "classification": 0.1
+    },
+    "scheduler_warmup_steps_by_task": {
+        "diffusion": 1000
+    },
+    "scheduler_min_lr_by_task": {
+        "diffusion": 0.0
     },
     "nesterov_by_task": {
         "classification": false
