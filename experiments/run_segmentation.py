@@ -338,6 +338,17 @@ class ImageNetBackboneDeepLabV3(nn.Module):
             parameter.requires_grad_(trainable)
 
 
+def _set_backbone_batchnorm_eval(model: nn.Module) -> None:
+    backbone = getattr(model, "model", None)
+    backbone = getattr(backbone, "backbone", None)
+    if backbone is None:
+        return
+
+    for module in backbone.modules():
+        if isinstance(module, nn.modules.batchnorm._BatchNorm):
+            module.eval()
+
+
 # ==========================================
 # 3. Real Dataset & Metrics
 # ==========================================
@@ -558,6 +569,8 @@ def train_single_seed_segmentation(act_type: str, seed: int, epochs: int, device
         for parameter in backbone_base_params:
             parameter.requires_grad_(not freeze_backbone)
         model.train()
+        if freeze_backbone:
+            _set_backbone_batchnorm_eval(model)
         if epoch < 2:
             activation_probe.start_epoch()
         current_lr = float(optimizer.param_groups[0]["lr"])
