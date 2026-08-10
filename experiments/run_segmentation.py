@@ -34,6 +34,12 @@ from utils.run_artifacts import build_run_manifest, create_run_directory, write_
 from utils.train_tuning import bf16_autocast, clip_activation_gradients, clamp_alpha_golu_modules, configure_benchmark_runtime, default_loader_kwargs, overhead_tracking_enabled, resolve_task_alpha_hparams, split_model_parameters
 
 
+try:
+    torch.multiprocessing.set_sharing_strategy("file_system")
+except (RuntimeError, ValueError):
+    pass
+
+
 QUIET_STDOUT = os.getenv("ADAPTIVE_ALPHA_GOLU_QUIET_STDOUT", "1") == "1"
 
 
@@ -464,7 +470,10 @@ def train_single_seed_segmentation(act_type: str, seed: int, epochs: int, device
 
     loader_g = torch.Generator().manual_seed(seed)
     train_loader_kwargs = default_loader_kwargs()
-    val_loader_kwargs = default_loader_kwargs(num_workers=1)
+    if int(train_loader_kwargs.get("num_workers", 0)) > 0:
+        train_loader_kwargs["persistent_workers"] = True
+    val_loader_kwargs = default_loader_kwargs(num_workers=0)
+    val_loader_kwargs["pin_memory"] = True
     train_batch_size = 32
     eval_batch_size = 32
     train_loader = DataLoader(train_ds, batch_size=train_batch_size, shuffle=True, worker_init_fn=seed_worker, generator=loader_g, **train_loader_kwargs)
