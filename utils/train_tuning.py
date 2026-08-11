@@ -132,6 +132,13 @@ def clip_activation_gradients(model: nn.Module, max_norm: float = 1.0) -> float:
     return float(torch.nn.utils.clip_grad_norm_(activation_params, max_norm=max_norm))
 
 
+def set_activation_parameters_trainable(model: nn.Module, trainable: bool) -> int:
+    activation_params = collect_activation_parameters(model)
+    for parameter in activation_params:
+        parameter.requires_grad_(trainable)
+    return len(activation_params)
+
+
 def compute_model_grad_norm(model: nn.Module, norm_type: float = 2.0) -> float:
     grad_norms: list[float] = []
     for parameter in model.parameters():

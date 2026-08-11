@@ -31,7 +31,7 @@ from models.alpha_golu import AlphaGoLU as AdaptiveAlphaGoLU, StaticGoLU
 from diagnostics.trajectory_logger import AlphaTrajectoryLogger
 from utils.overhead_tracker import OverheadTracker
 from utils.run_artifacts import build_run_manifest, create_run_directory, write_json
-from utils.train_tuning import bf16_autocast, clip_activation_gradients, clamp_alpha_golu_modules, configure_benchmark_runtime, default_loader_kwargs, overhead_tracking_enabled, resolve_task_alpha_hparams, split_model_parameters
+from utils.train_tuning import bf16_autocast, clip_activation_gradients, clamp_alpha_golu_modules, configure_benchmark_runtime, default_loader_kwargs, overhead_tracking_enabled, resolve_task_alpha_hparams, set_activation_parameters_trainable, split_model_parameters
 
 
 try:
@@ -537,6 +537,9 @@ def train_single_seed_segmentation(act_type: str, seed: int, epochs: int, device
         alpha_lr,
         config_path=config_path,
     )
+    if str(act_type).lower().strip() == "alpha_golu":
+        # More conservative alpha clipping to reduce early activation shock.
+        alpha_grad_clip_norm = min(float(alpha_grad_clip_norm), 0.5)
     activation_params = split_model_parameters(model)[1]
     activation_param_ids = {id(parameter) for parameter in activation_params}
     backbone_base_params: list[torch.nn.Parameter] = []
@@ -554,6 +557,7 @@ def train_single_seed_segmentation(act_type: str, seed: int, epochs: int, device
         [
             {"params": backbone_base_params, "lr": float(base_lr), "weight_decay": 1e-4},
             {"params": head_base_params, "lr": float(base_lr), "weight_decay": 1e-4},
+            # Keep activation params exempt from weight decay.
             {"params": activation_params, "lr": activation_lr_value, "weight_decay": 0.0},
         ],
         lr=float(base_lr),
@@ -629,8 +633,13 @@ def train_single_seed_segmentation(act_type: str, seed: int, epochs: int, device
     for epoch in range(epochs):
         epoch_start = time.perf_counter()
         freeze_backbone = epoch < max(int(freeze_backbone_epochs), 0)
+        freeze_alpha_warmup = freeze_backbone and str(act_type).lower().strip() == "alpha_golu"
         for parameter in backbone_base_params:
             parameter.requires_grad_(not freeze_backbone)
+        if freeze_alpha_warmup:
+            set_activation_parameters_trainable(model, False)
+        else:
+            set_activation_parameters_trainable(model, True)
         model.train()
         backbone_bn_eval_applied = False
         if freeze_backbone:
@@ -742,6 +751,7 @@ def train_single_seed_segmentation(act_type: str, seed: int, epochs: int, device
                     "activation_epoch_stats": activation_epoch_stats,
                     "activation_stats_history": activation_stats_history,
                     "freeze_backbone": bool(freeze_backbone),
+                    "freeze_alpha_warmup": bool(freeze_alpha_warmup),
                     "backbone_batchnorm_eval_applied": bool(backbone_bn_eval_applied),
                     "backbone_batchnorm_layers": int(backbone_bn_layers),
                     "alpha_clamp_events": alpha_clamp_events,
@@ -823,6 +833,8 @@ def train_single_seed_segmentation(act_type: str, seed: int, epochs: int, device
             "backbone_batchnorm_layers": int(backbone_bn_layers),
             "backbone_bn_eval_epoch_flags": backbone_bn_eval_epoch_flags,
             "freeze_backbone_epochs": int(max(int(freeze_backbone_epochs), 0)),
+            "alpha_grad_clip_norm": float(alpha_grad_clip_norm),
+            "activation_weight_decay": 0.0,
             "epoch_loss_history": epoch_losses,
             "lr_history": lr_history,
             "activation_lr_history": activation_lr_history,
@@ -871,6 +883,8 @@ def train_single_seed_segmentation(act_type: str, seed: int, epochs: int, device
                 "backbone_batchnorm_layers": int(backbone_bn_layers),
                 "backbone_bn_eval_epoch_flags": backbone_bn_eval_epoch_flags,
                 "freeze_backbone_epochs": int(max(int(freeze_backbone_epochs), 0)),
+                "alpha_grad_clip_norm": float(alpha_grad_clip_norm),
+                "activation_weight_decay": 0.0,
                 "alpha_clamp_events": alpha_clamp_events,
                 "alpha_clamp_checks": alpha_clamp_checks,
                 "alpha_history": alpha_logger.alpha_history,
