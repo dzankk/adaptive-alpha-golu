@@ -359,6 +359,29 @@ def _set_backbone_batchnorm_eval(model: nn.Module) -> None:
 # 3. Real Dataset & Metrics
 # ==========================================
 VOC_SEG_CLASSES = 21
+VOC_CLASS_NAMES = [
+    "background",
+    "aeroplane",
+    "bicycle",
+    "bird",
+    "boat",
+    "bottle",
+    "bus",
+    "car",
+    "cat",
+    "chair",
+    "cow",
+    "diningtable",
+    "dog",
+    "horse",
+    "motorbike",
+    "person",
+    "pottedplant",
+    "sheep",
+    "sofa",
+    "train",
+    "tvmonitor",
+]
 
 
 class PascalVOCSegmentationDataset(Dataset):
@@ -432,6 +455,33 @@ def compute_mIoU(preds: torch.Tensor, targets: torch.Tensor, num_classes: int = 
             iou_values.append((intersection + 1e-6) / (union + 1e-6))
 
     return float(np.mean(iou_values)) if iou_values else 0.0
+
+
+def accumulate_iou_stats(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    intersections: np.ndarray,
+    unions: np.ndarray,
+    pred_counts: np.ndarray,
+    target_counts: np.ndarray,
+    num_classes: int = 21,
+    ignore_index: int = 255,
+) -> None:
+    preds = logits.argmax(dim=1)
+    valid_mask = targets != ignore_index
+
+    for class_index in range(num_classes):
+        pred_class = (preds == class_index) & valid_mask
+        target_class = (targets == class_index) & valid_mask
+        intersection = (pred_class & target_class).sum().item()
+        union = (pred_class | target_class).sum().item()
+        pred_total = pred_class.sum().item()
+        target_total = target_class.sum().item()
+
+        intersections[class_index] += float(intersection)
+        unions[class_index] += float(union)
+        pred_counts[class_index] += float(pred_total)
+        target_counts[class_index] += float(target_total)
 
 
 def compute_model_grad_norm(model: nn.Module, norm_type: float = 2.0) -> float:
@@ -522,6 +572,10 @@ def train_single_seed_segmentation(act_type: str, seed: int, epochs: int, device
     head_grad_norm_history = []
     activation_grad_norm_history = []
     batch_grad_norm_history = []
+    backbone_bn_eval_epoch_flags: list[bool] = []
+    backbone_bn_layers = sum(
+        1 for module in model.model.backbone.modules() if isinstance(module, nn.modules.batchnorm._BatchNorm)
+    )
     activation_stats_history: dict[str, dict[str, dict[str, float]]] = {}
     train_start = time.perf_counter()
     amp_enabled = bool(amp) and torch.cuda.is_available() and device.type == "cuda"
@@ -578,8 +632,11 @@ def train_single_seed_segmentation(act_type: str, seed: int, epochs: int, device
         for parameter in backbone_base_params:
             parameter.requires_grad_(not freeze_backbone)
         model.train()
+        backbone_bn_eval_applied = False
         if freeze_backbone:
             _set_backbone_batchnorm_eval(model)
+            backbone_bn_eval_applied = True
+        backbone_bn_eval_epoch_flags.append(backbone_bn_eval_applied)
         if epoch < 2:
             activation_probe.start_epoch()
         current_lr = float(optimizer.param_groups[0]["lr"])
@@ -684,6 +741,9 @@ def train_single_seed_segmentation(act_type: str, seed: int, epochs: int, device
                     "activation_grad_norm_epoch": mean_epoch_activation_grad_norm,
                     "activation_epoch_stats": activation_epoch_stats,
                     "activation_stats_history": activation_stats_history,
+                    "freeze_backbone": bool(freeze_backbone),
+                    "backbone_batchnorm_eval_applied": bool(backbone_bn_eval_applied),
+                    "backbone_batchnorm_layers": int(backbone_bn_layers),
                     "alpha_clamp_events": alpha_clamp_events,
                     "alpha_clamp_checks": alpha_clamp_checks,
                     "alpha_history": alpha_logger.alpha_history,
@@ -696,18 +756,51 @@ def train_single_seed_segmentation(act_type: str, seed: int, epochs: int, device
     overhead = overhead_tracker.save() if overhead_tracker is not None else {}
 
     model.eval()
-    total_iou = 0.0
-    total_samples = 0
+    class_intersections = np.zeros(VOC_SEG_CLASSES, dtype=np.float64)
+    class_unions = np.zeros(VOC_SEG_CLASSES, dtype=np.float64)
+    pred_pixel_counts = np.zeros(VOC_SEG_CLASSES, dtype=np.float64)
+    target_pixel_counts = np.zeros(VOC_SEG_CLASSES, dtype=np.float64)
     with torch.no_grad():
         with bf16_autocast(amp_enabled):
             for x, y in val_loader:
                 x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
                 out = model(x)
-                batch_size = x.size(0)
-                total_iou += compute_mIoU(out.float(), y, num_classes=VOC_SEG_CLASSES) * batch_size
-                total_samples += batch_size
+                accumulate_iou_stats(
+                    out.float(),
+                    y,
+                    class_intersections,
+                    class_unions,
+                    pred_pixel_counts,
+                    target_pixel_counts,
+                    num_classes=VOC_SEG_CLASSES,
+                )
 
-    miou = total_iou / total_samples if total_samples > 0 else 0.0
+    per_class_iou: dict[str, float | None] = {}
+    iou_values: list[float] = []
+    for class_index, class_name in enumerate(VOC_CLASS_NAMES):
+        union = float(class_unions[class_index])
+        if union <= 0.0:
+            per_class_iou[class_name] = None
+            continue
+        value = float((class_intersections[class_index] + 1e-6) / (union + 1e-6))
+        per_class_iou[class_name] = value
+        iou_values.append(value)
+
+    total_pred_pixels = float(pred_pixel_counts.sum())
+    total_target_pixels = float(target_pixel_counts.sum())
+    pred_class_pixel_fraction = {
+        class_name: float(pred_pixel_counts[idx] / total_pred_pixels) if total_pred_pixels > 0.0 else 0.0
+        for idx, class_name in enumerate(VOC_CLASS_NAMES)
+    }
+    target_class_pixel_fraction = {
+        class_name: float(target_pixel_counts[idx] / total_target_pixels) if total_target_pixels > 0.0 else 0.0
+        for idx, class_name in enumerate(VOC_CLASS_NAMES)
+    }
+
+    dominant_pred_class = VOC_CLASS_NAMES[int(np.argmax(pred_pixel_counts))] if total_pred_pixels > 0.0 else "unknown"
+    dominant_pred_fraction = float(np.max(pred_pixel_counts) / total_pred_pixels) if total_pred_pixels > 0.0 else 0.0
+
+    miou = float(np.mean(iou_values)) if iou_values else 0.0
 
     write_json(
         run_dir / "results.json",
@@ -722,6 +815,14 @@ def train_single_seed_segmentation(act_type: str, seed: int, epochs: int, device
             "optimizer": "SGD",
             "scheduler": "PolynomialLR",
             "miou": float(miou),
+            "per_class_iou": per_class_iou,
+            "pred_class_pixel_fraction": pred_class_pixel_fraction,
+            "target_class_pixel_fraction": target_class_pixel_fraction,
+            "dominant_pred_class": dominant_pred_class,
+            "dominant_pred_fraction": dominant_pred_fraction,
+            "backbone_batchnorm_layers": int(backbone_bn_layers),
+            "backbone_bn_eval_epoch_flags": backbone_bn_eval_epoch_flags,
+            "freeze_backbone_epochs": int(max(int(freeze_backbone_epochs), 0)),
             "epoch_loss_history": epoch_losses,
             "lr_history": lr_history,
             "activation_lr_history": activation_lr_history,
@@ -762,6 +863,14 @@ def train_single_seed_segmentation(act_type: str, seed: int, epochs: int, device
                 "batch_grad_norm_history": batch_grad_norm_history,
                 "activation_stats_history": activation_stats_history,
                 "miou": float(miou),
+                "per_class_iou": per_class_iou,
+                "pred_class_pixel_fraction": pred_class_pixel_fraction,
+                "target_class_pixel_fraction": target_class_pixel_fraction,
+                "dominant_pred_class": dominant_pred_class,
+                "dominant_pred_fraction": dominant_pred_fraction,
+                "backbone_batchnorm_layers": int(backbone_bn_layers),
+                "backbone_bn_eval_epoch_flags": backbone_bn_eval_epoch_flags,
+                "freeze_backbone_epochs": int(max(int(freeze_backbone_epochs), 0)),
                 "alpha_clamp_events": alpha_clamp_events,
                 "alpha_clamp_checks": alpha_clamp_checks,
                 "alpha_history": alpha_logger.alpha_history,
