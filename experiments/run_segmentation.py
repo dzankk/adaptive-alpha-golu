@@ -316,7 +316,6 @@ class ImageNetBackboneDeepLabV3(nn.Module):
         if self.model.classifier[-1].bias is not None:
             nn.init.zeros_(self.model.classifier[-1].bias)
 
-        _replace_relu_modules(self.model.backbone, act_type)
         _replace_relu_modules(self.model.classifier, act_type)
         if getattr(self.model, "aux_classifier", None) is not None:
             _replace_relu_modules(self.model.aux_classifier, act_type)
