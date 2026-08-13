@@ -9,6 +9,7 @@ from copy import deepcopy
 import torch
 import torch.nn as nn
 from models.baselines import get_activation_layer
+from experiments.run_segmentation import _resolve_segmentation_alpha_lr
 from utils.experiment_config import load_benchmark_config
 from utils.stats import calculate_p_value
 from utils.run_artifacts import build_run_manifest, create_run_directory, write_json
@@ -58,6 +59,24 @@ class TestActivationFactory(unittest.TestCase):
         self.assertEqual(config["seeds"], [42, 123, 999])
         self.assertIn("classification", config["tasks"])
         self.assertIn("alpha_golu", config["activations"])
+
+    def test_segmentation_alpha_lr_resolves_from_config(self):
+        """Segmentation should honor the task alpha_lr config unless the caller overrides it explicitly."""
+        resolved_default = _resolve_segmentation_alpha_lr(
+            None,
+            base_lr=0.02,
+            alpha_lr_multiplier=10.0,
+            config_path="configs/paper_benchmark.json",
+        )
+        self.assertAlmostEqual(resolved_default, 2e-4)
+
+        resolved_override = _resolve_segmentation_alpha_lr(
+            1e-3,
+            base_lr=0.02,
+            alpha_lr_multiplier=10.0,
+            config_path="configs/paper_benchmark.json",
+        )
+        self.assertAlmostEqual(resolved_override, 1e-3)
 
 
 if __name__ == "__main__":

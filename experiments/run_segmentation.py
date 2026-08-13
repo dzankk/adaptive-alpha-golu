@@ -509,6 +509,23 @@ def set_seed(seed: int):
     configure_benchmark_runtime()
 
 
+def _resolve_segmentation_alpha_lr(
+    alpha_lr: float | None,
+    *,
+    base_lr: float,
+    alpha_lr_multiplier: float,
+    config_path: str | None,
+) -> float:
+    default_alpha_lr = float(base_lr * float(alpha_lr_multiplier))
+    resolved_alpha_lr, _, _ = resolve_task_alpha_hparams(
+        "segmentation",
+        alpha_lr,
+        config_path=config_path,
+        default_alpha_lr=default_alpha_lr,
+    )
+    return float(resolved_alpha_lr)
+
+
 def train_single_seed_segmentation(act_type: str, seed: int, epochs: int, device: torch.device, data_root: str = './data', base_lr: float = 2e-2, alpha_lr: float | None = None, alpha_lr_multiplier: float = 10.0, freeze_backbone_epochs: int = 2, config_path: str | None = "configs/paper_benchmark.json", save_artifacts: bool = False, amp: bool = False) -> float:
     set_seed(seed)
     
@@ -551,7 +568,12 @@ def train_single_seed_segmentation(act_type: str, seed: int, epochs: int, device
         else:
             head_base_params.append(parameter)
 
-    activation_lr_value = float(alpha_lr if alpha_lr is not None else base_lr * float(alpha_lr_multiplier))
+    activation_lr_value = _resolve_segmentation_alpha_lr(
+        alpha_lr,
+        base_lr=base_lr,
+        alpha_lr_multiplier=alpha_lr_multiplier,
+        config_path=config_path,
+    )
     optimizer = torch.optim.SGD(
         [
             {"params": backbone_base_params, "lr": float(base_lr), "weight_decay": 1e-4},
@@ -619,6 +641,7 @@ def train_single_seed_segmentation(act_type: str, seed: int, epochs: int, device
                 "epochs": epochs,
                 "base_lr": base_lr,
                 "activation_lr": activation_lr_value,
+                "alpha_lr": activation_lr_value,
                 "alpha_lr_multiplier": alpha_lr_multiplier,
                 "freeze_backbone_epochs": freeze_backbone_epochs,
                 "batch_size": train_batch_size,
@@ -820,7 +843,7 @@ def train_single_seed_segmentation(act_type: str, seed: int, epochs: int, device
             "seed": seed,
             "epochs": epochs,
             "base_lr": base_lr,
-                "alpha_lr": alpha_lr,
+            "alpha_lr": activation_lr_value,
             "optimizer": "SGD",
             "scheduler": "PolynomialLR",
             "miou": float(miou),
@@ -858,7 +881,7 @@ def train_single_seed_segmentation(act_type: str, seed: int, epochs: int, device
                 "data_root": data_root,
                 "activation": act_type,
                 "base_lr": base_lr,
-                "alpha_lr": alpha_lr,
+                "alpha_lr": activation_lr_value,
                 "seed": seed,
                 "epochs": epochs,
                 "progress_pct": 100.0,
