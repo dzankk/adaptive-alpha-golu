@@ -36,19 +36,20 @@ def _is_activation_module(module: nn.Module) -> bool:
     return any(keyword in module_name for keyword in ("alphagolu", "golu", "pgelu", "swishadaptive", "adaptive_swish"))
 
 
-def collect_activation_parameters(model: nn.Module) -> list[nn.Parameter]:
-    activation_params: list[nn.Parameter] = []
+def _iter_activation_module_parameters(model: nn.Module):
+    """Yields activation-module parameters by module identity, independent of their current requires_grad state."""
     seen: set[int] = set()
-
     for module in model.modules():
         if not _is_activation_module(module):
             continue
         for parameter in module.parameters(recurse=False):
-            if parameter.requires_grad and id(parameter) not in seen:
-                activation_params.append(parameter)
+            if id(parameter) not in seen:
                 seen.add(id(parameter))
+                yield parameter
 
-    return activation_params
+
+def collect_activation_parameters(model: nn.Module) -> list[nn.Parameter]:
+    return [parameter for parameter in _iter_activation_module_parameters(model) if parameter.requires_grad]
 
 
 def split_model_parameters(model: nn.Module) -> tuple[list[nn.Parameter], list[nn.Parameter]]:
@@ -133,10 +134,14 @@ def clip_activation_gradients(model: nn.Module, max_norm: float = 1.0) -> float:
 
 
 def set_activation_parameters_trainable(model: nn.Module, trainable: bool) -> int:
-    activation_params = collect_activation_parameters(model)
-    for parameter in activation_params:
+    # Must scan by module identity (not collect_activation_parameters), since that filters on
+    # requires_grad -- the very flag being toggled here. Filtering first would make re-enabling
+    # a previously frozen parameter a permanent no-op.
+    count = 0
+    for parameter in _iter_activation_module_parameters(model):
         parameter.requires_grad_(trainable)
-    return len(activation_params)
+        count += 1
+    return count
 
 
 def compute_model_grad_norm(model: nn.Module, norm_type: float = 2.0) -> float:

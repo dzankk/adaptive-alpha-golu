@@ -668,7 +668,11 @@ def train_single_seed_segmentation(act_type: str, seed: int, epochs: int, device
             _set_backbone_batchnorm_eval(model)
             backbone_bn_eval_applied = True
         backbone_bn_eval_epoch_flags.append(backbone_bn_eval_applied)
-        if epoch < 2:
+        # Probe pre-warmup epochs and the first post-warmup epochs so alpha movement after
+        # the freeze window is actually observable in the debug log/activation_stats_history.
+        warmup_epochs = max(int(freeze_backbone_epochs), 0)
+        probe_epoch = epoch < 2 or (warmup_epochs <= epoch < warmup_epochs + 2)
+        if probe_epoch:
             activation_probe.start_epoch()
         current_lr = float(optimizer.param_groups[0]["lr"])
         current_activation_lr = float(optimizer.param_groups[-1]["lr"])
@@ -734,10 +738,9 @@ def train_single_seed_segmentation(act_type: str, seed: int, epochs: int, device
         batch_grad_norm_history.append(epoch_batch_grad_norms)
         alpha_logger.step()
         final_epoch_loss = mean_epoch_loss
-        activation_epoch_stats = activation_probe.stop_epoch() if epoch < 2 else {}
-        if epoch < 2:
+        activation_epoch_stats = activation_probe.stop_epoch() if probe_epoch else {}
+        if probe_epoch:
             activation_stats_history[str(epoch + 1)] = activation_epoch_stats
-        if epoch < 2:
             debug_log_lines.append(f"[SEGMENTATION][Epoch {epoch + 1}] Activation stats (top layers by negative tail):")
             for line in activation_probe.compact_report(activation_epoch_stats, max_layers=8):
                 debug_log_lines.append(f"  {line}")

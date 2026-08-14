@@ -8,11 +8,13 @@ from pathlib import Path
 from copy import deepcopy
 import torch
 import torch.nn as nn
+from models.alpha_golu import AlphaGoLU
 from models.baselines import get_activation_layer
 from experiments.run_segmentation import _resolve_segmentation_alpha_lr
 from utils.experiment_config import load_benchmark_config
 from utils.stats import calculate_p_value
 from utils.run_artifacts import build_run_manifest, create_run_directory, write_json
+from utils.train_tuning import set_activation_parameters_trainable
 
 
 class TestActivationFactory(unittest.TestCase):
@@ -77,6 +79,28 @@ class TestActivationFactory(unittest.TestCase):
             config_path="configs/paper_benchmark.json",
         )
         self.assertAlmostEqual(resolved_override, 1e-3)
+
+    def test_activation_params_can_be_unfrozen_after_freeze(self):
+        """Regression test: a freeze->unfreeze cycle must actually re-enable requires_grad.
+
+        Previously, set_activation_parameters_trainable(model, True) silently did nothing once
+        params had already been frozen, because it filtered on the very requires_grad flag it
+        was supposed to set. This caused AlphaGoLU's alpha to stay permanently frozen after any
+        warmup period, making it mathematically identical to StaticGoLU.
+        """
+        model = nn.Sequential(AlphaGoLU(init_alpha=1.0))
+
+        set_activation_parameters_trainable(model, False)
+        self.assertFalse(model[0].raw_alpha.requires_grad)
+
+        enabled_count = set_activation_parameters_trainable(model, True)
+        self.assertEqual(enabled_count, 1)
+        self.assertTrue(model[0].raw_alpha.requires_grad)
+
+        x = torch.randn(4, 8, requires_grad=False)
+        model[0](x).sum().backward()
+        self.assertIsNotNone(model[0].raw_alpha.grad)
+        self.assertNotEqual(float(model[0].raw_alpha.grad.abs().sum()), 0.0)
 
 
 if __name__ == "__main__":
