@@ -618,6 +618,7 @@ def train_single_seed_segmentation(act_type: str, seed: int, epochs: int, device
             if checkpoint.get("scheduler_state") is not None:
                 scheduler.load_state_dict(checkpoint["scheduler_state"])
             checkpoint_extra = checkpoint.get("extra", {})
+            epoch_seconds = list(checkpoint_extra.get("epoch_seconds", []))
             epoch_losses = list(checkpoint_extra.get("epoch_losses", []))
             lr_history = list(checkpoint_extra.get("lr_history", []))
             activation_lr_history = list(checkpoint_extra.get("activation_lr_history", []))
@@ -819,6 +820,7 @@ def train_single_seed_segmentation(act_type: str, seed: int, epochs: int, device
                 optimizer=optimizer,
                 scheduler=scheduler,
                 extra={
+                    "epoch_seconds": epoch_seconds,
                     "epoch_losses": epoch_losses,
                     "lr_history": lr_history,
                     "activation_lr_history": activation_lr_history,

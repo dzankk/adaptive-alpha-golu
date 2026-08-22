@@ -439,6 +439,9 @@ def train_single_seed_detection(
     amp_enabled = bool(amp) and torch.cuda.is_available() and device.type == "cuda"
     alpha_clamp_events = 0
     alpha_clamp_checks = 0
+    # Defined up front (not just inside the epoch loop) so resuming an already-fully-trained
+    # checkpoint -- where range(start_epoch, epochs) is empty -- doesn't hit a NameError below.
+    current_alpha_lr = float(optimizer.param_groups[-1]["lr"]) if act_params else 0.0
     run_dir = None
     progress_path = None
     seed_dir = None
@@ -453,12 +456,14 @@ def train_single_seed_detection(
                 if checkpoint.get("scheduler_state") is not None:
                     scheduler.load_state_dict(checkpoint["scheduler_state"])
                 checkpoint_extra = checkpoint.get("extra", {})
+                epoch_seconds = list(checkpoint_extra.get("epoch_seconds", []))
                 epoch_losses = list(checkpoint_extra.get("epoch_losses", []))
                 lr_history = list(checkpoint_extra.get("lr_history", []))
                 grad_norm_history = list(checkpoint_extra.get("grad_norm_history", []))
                 alpha_clamp_events = int(checkpoint_extra.get("alpha_clamp_events", 0))
                 alpha_clamp_checks = int(checkpoint_extra.get("alpha_clamp_checks", 0))
                 alpha_logger.alpha_history = checkpoint_extra.get("alpha_history", alpha_logger.alpha_history)
+                current_alpha_lr = float(checkpoint_extra.get("alpha_lr_final", current_alpha_lr))
                 start_epoch = int(checkpoint["epoch"])
                 print(f"[DETECTION] Resuming activation={act_type} seed={seed} from epoch {start_epoch + 1}/{epochs}", flush=True)
         else:
@@ -583,12 +588,14 @@ def train_single_seed_detection(
                 optimizer=optimizer,
                 scheduler=scheduler,
                 extra={
+                    "epoch_seconds": epoch_seconds,
                     "epoch_losses": epoch_losses,
                     "lr_history": lr_history,
                     "grad_norm_history": grad_norm_history,
                     "alpha_clamp_events": alpha_clamp_events,
                     "alpha_clamp_checks": alpha_clamp_checks,
                     "alpha_history": alpha_logger.alpha_history,
+                    "alpha_lr_final": current_alpha_lr,
                 },
             )
         if not save_artifacts:
