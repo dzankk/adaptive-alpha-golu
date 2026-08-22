@@ -37,9 +37,9 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from models.alpha_golu import AlphaGoLU as AdaptiveAlphaGoLU, StaticGoLU
 from diagnostics.trajectory_logger import AlphaTrajectoryLogger
-from utils.run_artifacts import build_run_manifest, create_run_directory, write_json
+from utils.run_artifacts import build_run_manifest, create_run_directory, stable_seed_directory, write_json
 from utils.overhead_tracker import OverheadTracker
-from utils.train_tuning import bf16_autocast, build_adamw_with_activation_groups, clip_activation_gradients, clamp_alpha_golu_modules, compute_model_grad_norm, configure_benchmark_runtime, default_loader_kwargs, overhead_tracking_enabled, resolve_task_alpha_hparams
+from utils.train_tuning import bf16_autocast, build_adamw_with_activation_groups, clear_training_checkpoints, clip_activation_gradients, clamp_alpha_golu_modules, compute_model_grad_norm, configure_benchmark_runtime, default_loader_kwargs, load_training_checkpoint, overhead_tracking_enabled, resolve_task_alpha_hparams, save_training_checkpoint
 
 
 VOC_CLASSES = [
@@ -367,6 +367,7 @@ def train_single_seed_detection(
     max_eval_samples: int | None = None,
     save_artifacts: bool = False,
     amp: bool = False,
+    resume: bool = True,
 ) -> float:
     set_seed(seed)
 
@@ -440,7 +441,28 @@ def train_single_seed_detection(
     alpha_clamp_checks = 0
     run_dir = None
     progress_path = None
+    seed_dir = None
+    start_epoch = 0
     if save_artifacts:
+        seed_dir = stable_seed_directory(str(PROJECT_ROOT / "outputs" / "runs"), "detection", act_type, seed)
+        if resume:
+            checkpoint = load_training_checkpoint(seed_dir, map_location=device)
+            if checkpoint is not None:
+                model.load_state_dict(checkpoint["model_state"])
+                optimizer.load_state_dict(checkpoint["optimizer_state"])
+                if checkpoint.get("scheduler_state") is not None:
+                    scheduler.load_state_dict(checkpoint["scheduler_state"])
+                checkpoint_extra = checkpoint.get("extra", {})
+                epoch_losses = list(checkpoint_extra.get("epoch_losses", []))
+                lr_history = list(checkpoint_extra.get("lr_history", []))
+                grad_norm_history = list(checkpoint_extra.get("grad_norm_history", []))
+                alpha_clamp_events = int(checkpoint_extra.get("alpha_clamp_events", 0))
+                alpha_clamp_checks = int(checkpoint_extra.get("alpha_clamp_checks", 0))
+                alpha_logger.alpha_history = checkpoint_extra.get("alpha_history", alpha_logger.alpha_history)
+                start_epoch = int(checkpoint["epoch"])
+                print(f"[DETECTION] Resuming activation={act_type} seed={seed} from epoch {start_epoch + 1}/{epochs}", flush=True)
+        else:
+            clear_training_checkpoints(seed_dir)
         run_dir = create_run_directory(
             str(PROJECT_ROOT / "outputs" / "runs" / "detection"),
             "detection",
@@ -476,7 +498,7 @@ def train_single_seed_detection(
             ),
         )
 
-    for epoch in range(epochs):
+    for epoch in range(start_epoch, epochs):
         epoch_start = time.perf_counter()
         current_alpha_lr = set_alpha_lr(epoch)
         model.train()
@@ -548,6 +570,22 @@ def train_single_seed_detection(
                     "grad_norm_history": grad_norm_history,
                     "grad_norm_epoch": mean_epoch_grad_norm,
                     "alpha_lr_final": current_alpha_lr,
+                    "alpha_clamp_events": alpha_clamp_events,
+                    "alpha_clamp_checks": alpha_clamp_checks,
+                    "alpha_history": alpha_logger.alpha_history,
+                },
+            )
+        if save_artifacts and seed_dir is not None:
+            save_training_checkpoint(
+                seed_dir,
+                epoch + 1,
+                model=model,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                extra={
+                    "epoch_losses": epoch_losses,
+                    "lr_history": lr_history,
+                    "grad_norm_history": grad_norm_history,
                     "alpha_clamp_events": alpha_clamp_events,
                     "alpha_clamp_checks": alpha_clamp_checks,
                     "alpha_history": alpha_logger.alpha_history,
@@ -650,10 +688,12 @@ def train_single_seed_detection(
                 },
             ),
         )
+        if seed_dir is not None:
+            clear_training_checkpoints(seed_dir)
     return float(map50)
 
 
-def run_detection_benchmark(seeds: list[int] | None = None, epochs: int = 8, lr: float = 2e-4, alpha_lr: float | None = None, data_root: str = "./data", config_path: str | None = "configs/paper_benchmark.json", amp: bool = False):
+def run_detection_benchmark(seeds: list[int] | None = None, epochs: int = 8, lr: float = 2e-4, alpha_lr: float | None = None, data_root: str = "./data", config_path: str | None = "configs/paper_benchmark.json", amp: bool = False, resume: bool = True):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Running Pascal VOC 2012 Detection Benchmark on {device}")
     activations = ["relu", "gelu", "swish", "prelu", "pgelu", "golu_static", "alpha_golu", "swish_adaptive"]
@@ -673,6 +713,7 @@ def run_detection_benchmark(seeds: list[int] | None = None, epochs: int = 8, lr:
                 config_path=config_path,
                 save_artifacts=True,
                 amp=amp,
+                resume=resume,
             )
             print(f"Seed {seed} -> VOC mAP@0.5: {map50:.4f}")
 
@@ -689,6 +730,7 @@ def train_and_eval(
     config_path: str | None = "configs/paper_benchmark.json",
     save_artifacts: bool = False,
     amp: bool = False,
+    resume: bool = True,
 ) -> float:
     """Returns VOC mAP@0.5 on a held-out Pascal VOC validation split."""
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -705,6 +747,7 @@ def train_and_eval(
         max_eval_samples=max_eval_samples,
         save_artifacts=save_artifacts,
         amp=amp,
+        resume=resume,
     )
     return float(map50)
 
@@ -722,10 +765,11 @@ if __name__ == "__main__":
     parser.add_argument("--config", type=str, default="configs/paper_benchmark.json", help="Benchmark config file used for task alpha hyperparameters")
     parser.add_argument("--benchmark", action="store_true", help="Run the full activation sweep benchmark")
     parser.add_argument("--amp", action="store_true", help="Enable BF16 automatic mixed precision on CUDA")
+    parser.add_argument("--fresh", action="store_true", help="Ignore any saved epoch checkpoint and restart this seed from epoch 0")
     args = parser.parse_args()
 
     if args.benchmark:
-        run_detection_benchmark(seeds=args.seeds, epochs=args.epochs, lr=args.lr, alpha_lr=args.alpha_lr, data_root=args.data_root, config_path=args.config, amp=args.amp)
+        run_detection_benchmark(seeds=args.seeds, epochs=args.epochs, lr=args.lr, alpha_lr=args.alpha_lr, data_root=args.data_root, config_path=args.config, amp=args.amp, resume=not args.fresh)
     else:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"Running Pascal VOC 2012 Detection Benchmark on {device}")
@@ -742,5 +786,6 @@ if __name__ == "__main__":
                 config_path=args.config,
                 save_artifacts=True,
                 amp=args.amp,
+                resume=not args.fresh,
             )
             print(f"Activation: {args.activation.ljust(15)} | Seed {seed} | VOC mAP@0.5: {map50:.4f}")

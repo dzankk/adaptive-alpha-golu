@@ -13,8 +13,8 @@ from models.baselines import get_activation_layer
 from experiments.run_segmentation import _resolve_segmentation_alpha_lr
 from utils.experiment_config import load_benchmark_config
 from utils.stats import calculate_p_value
-from utils.run_artifacts import build_run_manifest, create_run_directory, write_json
-from utils.train_tuning import set_activation_parameters_trainable
+from utils.run_artifacts import build_run_manifest, create_run_directory, stable_seed_directory, write_json
+from utils.train_tuning import find_latest_checkpoint, load_training_checkpoint, save_training_checkpoint, set_activation_parameters_trainable, clear_training_checkpoints
 
 
 class TestActivationFactory(unittest.TestCase):
@@ -101,6 +101,52 @@ class TestActivationFactory(unittest.TestCase):
         model[0](x).sum().backward()
         self.assertIsNotNone(model[0].raw_alpha.grad)
         self.assertNotEqual(float(model[0].raw_alpha.grad.abs().sum()), 0.0)
+
+    def test_checkpoint_round_trip_resumes_from_next_epoch(self):
+        """An epoch-3 checkpoint should restore model/optimizer state and report epoch 3 for resume."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            seed_dir = stable_seed_directory(tmp_dir, "detection", "alpha_golu", 42)
+
+            model = nn.Linear(4, 2)
+            optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+            scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=1)
+
+            model(torch.randn(3, 4)).sum().backward()
+            optimizer.step()
+            scheduler.step()
+            save_training_checkpoint(
+                seed_dir, 3, model=model, optimizer=optimizer, scheduler=scheduler,
+                extra={"epoch_losses": [1.0, 0.8, 0.6]},
+            )
+            self.assertEqual(find_latest_checkpoint(seed_dir).name, "checkpoint_epoch_3.pth")
+
+            # A later epoch's checkpoint must replace, not accumulate alongside, the earlier one.
+            model(torch.randn(3, 4)).sum().backward()
+            optimizer.step()
+            scheduler.step()
+            save_training_checkpoint(
+                seed_dir, 4, model=model, optimizer=optimizer, scheduler=scheduler,
+                extra={"epoch_losses": [1.0, 0.8, 0.6, 0.5]},
+            )
+            remaining = sorted(seed_dir.glob("checkpoint_epoch_*.pth"))
+            self.assertEqual(len(remaining), 1)
+            self.assertEqual(remaining[0].name, "checkpoint_epoch_4.pth")
+
+            fresh_model = nn.Linear(4, 2)
+            fresh_optimizer = torch.optim.SGD(fresh_model.parameters(), lr=0.1)
+            fresh_scheduler = torch.optim.lr_scheduler.StepLR(fresh_optimizer, step_size=1)
+            checkpoint = load_training_checkpoint(seed_dir)
+            fresh_model.load_state_dict(checkpoint["model_state"])
+            fresh_optimizer.load_state_dict(checkpoint["optimizer_state"])
+            fresh_scheduler.load_state_dict(checkpoint["scheduler_state"])
+
+            self.assertEqual(checkpoint["epoch"], 4)
+            self.assertEqual(checkpoint["extra"]["epoch_losses"], [1.0, 0.8, 0.6, 0.5])
+            self.assertTrue(torch.equal(fresh_model.weight, model.weight))
+
+            clear_training_checkpoints(seed_dir)
+            self.assertIsNone(find_latest_checkpoint(seed_dir))
+            self.assertFalse(seed_dir.exists())
 
 
 if __name__ == "__main__":

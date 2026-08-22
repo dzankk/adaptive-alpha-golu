@@ -176,6 +176,63 @@ def clamp_alpha_golu_modules(model: nn.Module, min_alpha: float = 0.2, max_alpha
             clamp_events += 1
     return clamp_events, clamp_checks
 
+
+def _checkpoint_path(seed_dir: Path, epoch: int) -> Path:
+    return Path(seed_dir) / f"checkpoint_epoch_{epoch}.pth"
+
+
+def find_latest_checkpoint(seed_dir: Path) -> Path | None:
+    seed_dir = Path(seed_dir)
+    checkpoints = sorted(seed_dir.glob("checkpoint_epoch_*.pth"), key=lambda p: int(p.stem.rsplit("_", 1)[-1]))
+    return checkpoints[-1] if checkpoints else None
+
+
+def save_training_checkpoint(
+    seed_dir: Path,
+    epoch: int,
+    *,
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    scheduler=None,
+    extra: dict | None = None,
+) -> Path:
+    """Writes checkpoint_epoch_<epoch>.pth and removes the previous epoch's file (single rolling checkpoint)."""
+    seed_dir = Path(seed_dir)
+    seed_dir.mkdir(parents=True, exist_ok=True)
+    stale_checkpoint = find_latest_checkpoint(seed_dir)
+    new_path = _checkpoint_path(seed_dir, epoch)
+    torch.save(
+        {
+            "epoch": epoch,
+            "model_state": model.state_dict(),
+            "optimizer_state": optimizer.state_dict(),
+            "scheduler_state": scheduler.state_dict() if scheduler is not None else None,
+            "extra": extra or {},
+        },
+        new_path,
+    )
+    if stale_checkpoint is not None and stale_checkpoint != new_path:
+        stale_checkpoint.unlink(missing_ok=True)
+    return new_path
+
+
+def load_training_checkpoint(seed_dir: Path, *, map_location=None) -> dict | None:
+    checkpoint_path = find_latest_checkpoint(seed_dir)
+    if checkpoint_path is None:
+        return None
+    return torch.load(checkpoint_path, map_location=map_location, weights_only=False)
+
+
+def clear_training_checkpoints(seed_dir: Path) -> None:
+    seed_dir = Path(seed_dir)
+    for checkpoint_path in seed_dir.glob("checkpoint_epoch_*.pth"):
+        checkpoint_path.unlink(missing_ok=True)
+    try:
+        seed_dir.rmdir()
+    except OSError:
+        pass
+
+
 def overhead_tracking_enabled() -> bool:
     return os.getenv("ADAPTIVE_ALPHA_GOLU_TRACK_OVERHEAD", "0") == "1"
 

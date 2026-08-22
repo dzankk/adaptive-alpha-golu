@@ -63,6 +63,13 @@ def create_run_directory(base_dir: str, task: str, activation: Optional[str], se
     return run_dir
 
 
+def stable_seed_directory(base_dir: str, task: str, activation: str, seed: int) -> Path:
+    """Non-timestamped per-seed directory, so a resumed process can find a prior checkpoint."""
+    seed_dir = Path(base_dir) / task / f"{activation}_{seed}"
+    seed_dir.mkdir(parents=True, exist_ok=True)
+    return seed_dir
+
+
 def write_json(path: Path, payload: Dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as handle:

@@ -256,7 +256,7 @@ def _merge_benchmark_results(base_results: dict, incoming_results: dict) -> dict
     return merged
 
 
-def _invoke_task_runner(runner_fn, act: str, *, seed: int, data_root: str, base_lr: float | None, alpha_lr: float | None, alpha_lr_multiplier: float | None, freeze_backbone_epochs: int | None, save_artifacts: bool, amp: bool, config_path: str | None = None, epochs: int | None = None, max_steps: int | None = None):
+def _invoke_task_runner(runner_fn, act: str, *, seed: int, data_root: str, base_lr: float | None, alpha_lr: float | None, alpha_lr_multiplier: float | None, freeze_backbone_epochs: int | None, save_artifacts: bool, amp: bool, config_path: str | None = None, epochs: int | None = None, max_steps: int | None = None, resume: bool | None = None):
     candidate_kwargs = {
         "seed": seed,
         "data_root": data_root,
@@ -268,6 +268,7 @@ def _invoke_task_runner(runner_fn, act: str, *, seed: int, data_root: str, base_
         "config_path": config_path,
         "epochs": epochs,
         "max_steps": max_steps,
+        "resume": resume,
     }
     if base_lr is not None:
         candidate_kwargs["base_lr"] = base_lr
@@ -598,6 +599,7 @@ def handle_run(args):
             alpha_lr_multiplier=task_alpha_lr_multiplier,
             freeze_backbone_epochs=task_freeze_backbone_epochs,
             save_artifacts=save_artifacts,
+            resume=not args.fresh,
             amp=args.amp,
             config_path=args.config,
             epochs=task_epochs,
@@ -745,6 +747,7 @@ def handle_run_all(args, summary_only: bool = False):
                     alpha_lr_multiplier=task_alpha_lr_multiplier,
                     freeze_backbone_epochs=task_freeze_backbone_epochs,
                     save_artifacts=save_artifacts,
+                    resume=not args.fresh,
                     amp=args.amp,
                     config_path=args.config,
                     epochs=task_epochs,

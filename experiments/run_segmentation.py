@@ -30,8 +30,8 @@ if str(PROJECT_ROOT) not in sys.path:
 from models.alpha_golu import AlphaGoLU as AdaptiveAlphaGoLU, StaticGoLU
 from diagnostics.trajectory_logger import AlphaTrajectoryLogger
 from utils.overhead_tracker import OverheadTracker
-from utils.run_artifacts import build_run_manifest, create_run_directory, write_json
-from utils.train_tuning import bf16_autocast, clip_activation_gradients, clamp_alpha_golu_modules, configure_benchmark_runtime, default_loader_kwargs, overhead_tracking_enabled, resolve_task_alpha_hparams, set_activation_parameters_trainable, split_model_parameters
+from utils.run_artifacts import build_run_manifest, create_run_directory, stable_seed_directory, write_json
+from utils.train_tuning import bf16_autocast, clear_training_checkpoints, clip_activation_gradients, clamp_alpha_golu_modules, configure_benchmark_runtime, default_loader_kwargs, load_training_checkpoint, overhead_tracking_enabled, resolve_task_alpha_hparams, save_training_checkpoint, set_activation_parameters_trainable, split_model_parameters
 
 
 try:
@@ -526,7 +526,7 @@ def _resolve_segmentation_alpha_lr(
     return float(resolved_alpha_lr)
 
 
-def train_single_seed_segmentation(act_type: str, seed: int, epochs: int, device: torch.device, data_root: str = './data', base_lr: float = 2e-2, alpha_lr: float | None = None, alpha_lr_multiplier: float = 10.0, freeze_backbone_epochs: int = 2, config_path: str | None = "configs/paper_benchmark.json", save_artifacts: bool = False, amp: bool = False) -> float:
+def train_single_seed_segmentation(act_type: str, seed: int, epochs: int, device: torch.device, data_root: str = './data', base_lr: float = 2e-2, alpha_lr: float | None = None, alpha_lr_multiplier: float = 10.0, freeze_backbone_epochs: int = 2, config_path: str | None = "configs/paper_benchmark.json", save_artifacts: bool = False, amp: bool = False, resume: bool = True) -> float:
     set_seed(seed)
     
     full_dataset = PascalVOCSegmentationDataset(root=data_root, year='2012', image_set='train', image_size=256, train=True, download=True)
@@ -608,6 +608,33 @@ def train_single_seed_segmentation(act_type: str, seed: int, epochs: int, device
     alpha_clamp_checks = 0
     final_epoch_loss = None
     activation_probe = ActivationStatsProbe(model)
+    seed_dir = stable_seed_directory(str(PROJECT_ROOT / "outputs" / "runs"), "segmentation", act_type, seed)
+    start_epoch = 0
+    if resume:
+        checkpoint = load_training_checkpoint(seed_dir, map_location=device)
+        if checkpoint is not None:
+            model.load_state_dict(checkpoint["model_state"])
+            optimizer.load_state_dict(checkpoint["optimizer_state"])
+            if checkpoint.get("scheduler_state") is not None:
+                scheduler.load_state_dict(checkpoint["scheduler_state"])
+            checkpoint_extra = checkpoint.get("extra", {})
+            epoch_losses = list(checkpoint_extra.get("epoch_losses", []))
+            lr_history = list(checkpoint_extra.get("lr_history", []))
+            activation_lr_history = list(checkpoint_extra.get("activation_lr_history", []))
+            grad_norm_history = list(checkpoint_extra.get("grad_norm_history", []))
+            backbone_grad_norm_history = list(checkpoint_extra.get("backbone_grad_norm_history", []))
+            head_grad_norm_history = list(checkpoint_extra.get("head_grad_norm_history", []))
+            activation_grad_norm_history = list(checkpoint_extra.get("activation_grad_norm_history", []))
+            batch_grad_norm_history = list(checkpoint_extra.get("batch_grad_norm_history", []))
+            backbone_bn_eval_epoch_flags = list(checkpoint_extra.get("backbone_bn_eval_epoch_flags", []))
+            activation_stats_history = checkpoint_extra.get("activation_stats_history", activation_stats_history)
+            alpha_clamp_events = int(checkpoint_extra.get("alpha_clamp_events", 0))
+            alpha_clamp_checks = int(checkpoint_extra.get("alpha_clamp_checks", 0))
+            alpha_logger.alpha_history = checkpoint_extra.get("alpha_history", alpha_logger.alpha_history)
+            start_epoch = int(checkpoint["epoch"])
+            print(f"[SEGMENTATION] Resuming activation={act_type} seed={seed} from epoch {start_epoch + 1}/{epochs}", flush=True)
+    else:
+        clear_training_checkpoints(seed_dir)
     run_dir = create_run_directory(
         str(PROJECT_ROOT / "outputs" / "runs" / "segmentation"),
         "segmentation",
@@ -652,7 +679,7 @@ def train_single_seed_segmentation(act_type: str, seed: int, epochs: int, device
         ),
     )
 
-    for epoch in range(epochs):
+    for epoch in range(start_epoch, epochs):
         epoch_start = time.perf_counter()
         freeze_backbone = epoch < max(int(freeze_backbone_epochs), 0)
         freeze_alpha_warmup = freeze_backbone and str(act_type).lower().strip() == "alpha_golu"
@@ -779,6 +806,29 @@ def train_single_seed_segmentation(act_type: str, seed: int, epochs: int, device
                     "freeze_alpha_warmup": bool(freeze_alpha_warmup),
                     "backbone_batchnorm_eval_applied": bool(backbone_bn_eval_applied),
                     "backbone_batchnorm_layers": int(backbone_bn_layers),
+                    "alpha_clamp_events": alpha_clamp_events,
+                    "alpha_clamp_checks": alpha_clamp_checks,
+                    "alpha_history": alpha_logger.alpha_history,
+                },
+            )
+        if save_artifacts:
+            save_training_checkpoint(
+                seed_dir,
+                epoch + 1,
+                model=model,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                extra={
+                    "epoch_losses": epoch_losses,
+                    "lr_history": lr_history,
+                    "activation_lr_history": activation_lr_history,
+                    "grad_norm_history": grad_norm_history,
+                    "backbone_grad_norm_history": backbone_grad_norm_history,
+                    "head_grad_norm_history": head_grad_norm_history,
+                    "activation_grad_norm_history": activation_grad_norm_history,
+                    "batch_grad_norm_history": batch_grad_norm_history,
+                    "backbone_bn_eval_epoch_flags": backbone_bn_eval_epoch_flags,
+                    "activation_stats_history": activation_stats_history,
                     "alpha_clamp_events": alpha_clamp_events,
                     "alpha_clamp_checks": alpha_clamp_checks,
                     "alpha_history": alpha_logger.alpha_history,
@@ -935,11 +985,12 @@ def train_single_seed_segmentation(act_type: str, seed: int, epochs: int, device
     )
     if debug_log_lines:
         (run_dir / "debug_metrics.log").write_text("\n".join(debug_log_lines) + "\n", encoding="utf-8")
+    clear_training_checkpoints(seed_dir)
 
     return miou
 
 
-def run_segmentation_benchmark(seeds=None, epochs=30, data_root: str = './data', base_lr: float = 2e-2, alpha_lr: float | None = None, alpha_lr_multiplier: float = 10.0, freeze_backbone_epochs: int = 2, config_path: str | None = "configs/paper_benchmark.json", amp: bool = False):
+def run_segmentation_benchmark(seeds=None, epochs=30, data_root: str = './data', base_lr: float = 2e-2, alpha_lr: float | None = None, alpha_lr_multiplier: float = 10.0, freeze_backbone_epochs: int = 2, config_path: str | None = "configs/paper_benchmark.json", amp: bool = False, resume: bool = True):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     seeds = seeds or [42, 123, 999]
     print(f"Running Segmentation Benchmark on {device} (N={len(seeds)})")
@@ -948,16 +999,16 @@ def run_segmentation_benchmark(seeds=None, epochs=30, data_root: str = './data',
     for act_type in activations:
         scores = []
         for s in seeds:
-            miou = train_single_seed_segmentation(act_type=act_type, seed=s, epochs=epochs, device=device, data_root=data_root, base_lr=base_lr, alpha_lr=alpha_lr, alpha_lr_multiplier=alpha_lr_multiplier, freeze_backbone_epochs=freeze_backbone_epochs, config_path=config_path, save_artifacts=True, amp=amp)
+            miou = train_single_seed_segmentation(act_type=act_type, seed=s, epochs=epochs, device=device, data_root=data_root, base_lr=base_lr, alpha_lr=alpha_lr, alpha_lr_multiplier=alpha_lr_multiplier, freeze_backbone_epochs=freeze_backbone_epochs, config_path=config_path, save_artifacts=True, amp=amp, resume=resume)
             scores.append(miou)
             print(f"Activation: {act_type.ljust(15)} | Seed {s} | Validation mIoU: {miou:.4f}")
         print(f"--> {act_type.upper()} Mean mIoU: {np.mean(scores):.4f} ± {np.std(scores):.4f}\n")
 
 
-def train_and_eval(activation: str = 'alpha_golu', seed: int = 42, epochs: int = 30, data_root: str = './data', base_lr: float = 2e-2, alpha_lr: float | None = None, alpha_lr_multiplier: float = 10.0, freeze_backbone_epochs: int = 2, config_path: str | None = "configs/paper_benchmark.json", save_artifacts: bool = False, amp: bool = False) -> float:
+def train_and_eval(activation: str = 'alpha_golu', seed: int = 42, epochs: int = 30, data_root: str = './data', base_lr: float = 2e-2, alpha_lr: float | None = None, alpha_lr_multiplier: float = 10.0, freeze_backbone_epochs: int = 2, config_path: str | None = "configs/paper_benchmark.json", save_artifacts: bool = False, amp: bool = False, resume: bool = True) -> float:
     """Returns Mean Intersection over Union (mIoU)."""
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    miou = train_single_seed_segmentation(act_type=activation, seed=seed, epochs=epochs, device=device, data_root=data_root, base_lr=base_lr, alpha_lr=alpha_lr, alpha_lr_multiplier=alpha_lr_multiplier, freeze_backbone_epochs=freeze_backbone_epochs, config_path=config_path, save_artifacts=save_artifacts, amp=amp)
+    miou = train_single_seed_segmentation(act_type=activation, seed=seed, epochs=epochs, device=device, data_root=data_root, base_lr=base_lr, alpha_lr=alpha_lr, alpha_lr_multiplier=alpha_lr_multiplier, freeze_backbone_epochs=freeze_backbone_epochs, config_path=config_path, save_artifacts=save_artifacts, amp=amp, resume=resume)
     return float(miou)
 
 
@@ -976,13 +1027,14 @@ if __name__ == '__main__':
     parser.add_argument("--config", type=str, default="configs/paper_benchmark.json", help="Benchmark config file used for task alpha hyperparameters")
     parser.add_argument("--benchmark", action="store_true", help="Run the full activation sweep")
     parser.add_argument("--amp", action="store_true", help="Enable BF16 automatic mixed precision on CUDA")
+    parser.add_argument("--fresh", action="store_true", help="Ignore any saved epoch checkpoint and restart this seed from epoch 0")
     args = parser.parse_args()
 
     if args.benchmark:
-        run_segmentation_benchmark(seeds=args.seeds, epochs=args.epochs, data_root=args.data_root, base_lr=args.lr, alpha_lr=args.alpha_lr, alpha_lr_multiplier=args.alpha_lr_multiplier, freeze_backbone_epochs=args.freeze_backbone_epochs, config_path=args.config, amp=args.amp)
+        run_segmentation_benchmark(seeds=args.seeds, epochs=args.epochs, data_root=args.data_root, base_lr=args.lr, alpha_lr=args.alpha_lr, alpha_lr_multiplier=args.alpha_lr_multiplier, freeze_backbone_epochs=args.freeze_backbone_epochs, config_path=args.config, amp=args.amp, resume=not args.fresh)
     else:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"Running Segmentation Benchmark on {device} (N={len(args.seeds)})")
         for seed in args.seeds:
-            miou = train_and_eval(activation=args.activation, seed=seed, epochs=args.epochs, data_root=args.data_root, base_lr=args.lr, alpha_lr=args.alpha_lr, alpha_lr_multiplier=args.alpha_lr_multiplier, freeze_backbone_epochs=args.freeze_backbone_epochs, config_path=args.config, amp=args.amp)
+            miou = train_and_eval(activation=args.activation, seed=seed, epochs=args.epochs, data_root=args.data_root, base_lr=args.lr, alpha_lr=args.alpha_lr, alpha_lr_multiplier=args.alpha_lr_multiplier, freeze_backbone_epochs=args.freeze_backbone_epochs, config_path=args.config, amp=args.amp, resume=not args.fresh)
             print(f"Activation: {args.activation.ljust(15)} | Seed {seed} | Validation mIoU: {miou:.4f}")
