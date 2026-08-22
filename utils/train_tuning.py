@@ -196,11 +196,16 @@ def save_training_checkpoint(
     scheduler=None,
     extra: dict | None = None,
 ) -> Path:
-    """Writes checkpoint_epoch_<epoch>.pth and removes the previous epoch's file (single rolling checkpoint)."""
+    """Writes checkpoint_epoch_<epoch>.pth and removes the previous epoch's file (single rolling checkpoint).
+
+    Written via a temp-file-plus-rename so a kill (e.g. pkill/SIGTERM) mid-write can never leave a
+    truncated checkpoint at the final path; os.replace is atomic on the same filesystem.
+    """
     seed_dir = Path(seed_dir)
     seed_dir.mkdir(parents=True, exist_ok=True)
     stale_checkpoint = find_latest_checkpoint(seed_dir)
     new_path = _checkpoint_path(seed_dir, epoch)
+    tmp_path = new_path.with_suffix(new_path.suffix + ".tmp")
     torch.save(
         {
             "epoch": epoch,
@@ -209,8 +214,9 @@ def save_training_checkpoint(
             "scheduler_state": scheduler.state_dict() if scheduler is not None else None,
             "extra": extra or {},
         },
-        new_path,
+        tmp_path,
     )
+    tmp_path.replace(new_path)
     if stale_checkpoint is not None and stale_checkpoint != new_path:
         stale_checkpoint.unlink(missing_ok=True)
     return new_path
@@ -220,13 +226,21 @@ def load_training_checkpoint(seed_dir: Path, *, map_location=None) -> dict | Non
     checkpoint_path = find_latest_checkpoint(seed_dir)
     if checkpoint_path is None:
         return None
-    return torch.load(checkpoint_path, map_location=map_location, weights_only=False)
+    try:
+        return torch.load(checkpoint_path, map_location=map_location, weights_only=False)
+    except Exception as exc:
+        # A hard kill mid-write can leave a truncated file; don't let that crash a resume attempt.
+        print(f"[checkpoint] Ignoring unreadable checkpoint {checkpoint_path} ({exc}); starting this seed from epoch 0.")
+        checkpoint_path.unlink(missing_ok=True)
+        return None
 
 
 def clear_training_checkpoints(seed_dir: Path) -> None:
     seed_dir = Path(seed_dir)
     for checkpoint_path in seed_dir.glob("checkpoint_epoch_*.pth"):
         checkpoint_path.unlink(missing_ok=True)
+    for tmp_path in seed_dir.glob("checkpoint_epoch_*.pth.tmp"):
+        tmp_path.unlink(missing_ok=True)
     try:
         seed_dir.rmdir()
     except OSError:
