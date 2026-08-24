@@ -35,6 +35,7 @@ from utils.run_artifacts import build_run_manifest, create_run_directory, write_
 from utils.preflight import run_preflight_checks, save_preflight_report
 from utils.data_prep import prepare_all_datasets
 from utils.stats import compute_summary_statistics, calculate_p_value
+from utils.scaled_benchmark_logger import write_significance_report
 from utils.visualization import plot_paper_alpha_trajectories, plot_paper_benchmark_summary, plot_paper_overhead_summary, plot_parametric_comparison
 
 TASK_MAP = {
@@ -854,6 +855,28 @@ def handle_task_order(args):
     handle_run_all(args)
 
 
+def handle_extra_seeds(args):
+    """Runs additional seeds for a small activation subset (default golu_static + alpha_golu)
+    on specific tasks only, without forcing a full sweep across every activation."""
+    args.activations = args.activations if args.activations else ["golu_static", "alpha_golu"]
+    handle_run_all(args)
+
+
+def handle_significance_report(args):
+    """Generates the paired-seed significance + timing/throughput report and appends it to
+    outputs/reports/significance_and_scale_analysis.log."""
+    activations = list(dict.fromkeys([*args.activations, args.baseline, args.proposed]))
+    log_path = write_significance_report(
+        args.tasks,
+        activations,
+        baseline_activation=args.baseline,
+        proposed_activation=args.proposed,
+        output_root=args.output_root,
+        log_path=args.log_path,
+    )
+    print(f"[IO] Significance and scale-up analysis appended to {log_path}")
+
+
 def handle_generate_table(args):
     """Generates a publication-ready LaTeX benchmark table from JSON results with bold/underline highlighting."""
     json_path = args.results_path
@@ -1216,6 +1239,31 @@ def main():
     task_order_parser.add_argument("--resume", action="store_true", help="Alias for the default resumable mode")
     task_order_parser.add_argument("--rerun-tasks", type=str, nargs="+", default=None, choices=list(TASK_MAP.keys()), help="Tasks to rerun from scratch while preserving cached results for other tasks")
 
+    # Command: extra_seeds
+    extra_seeds_parser = subparsers.add_parser("extra_seeds", help="Run targeted additional seeds for a small activation subset (default: golu_static + alpha_golu) on specific tasks, without a full activation sweep")
+    extra_seeds_parser.add_argument("--tasks", type=str, nargs="+", required=True, choices=list(TASK_MAP.keys()), help="Tasks to run the extra seeds for (e.g. language_model detection)")
+    extra_seeds_parser.add_argument("--activations", type=str, nargs="+", default=None, choices=SUPPORTED_ACTIVATIONS, help="Activations to evaluate (default: golu_static and alpha_golu only)")
+    extra_seeds_parser.add_argument("--seeds", type=int, nargs="+", required=True, help="Additional seeds to run (e.g. 2024 2025)")
+    extra_seeds_parser.add_argument("--config", type=str, default="configs/full_benchmark.json", help="Path to a JSON benchmark config file")
+    extra_seeds_parser.add_argument("--data-root", type=str, default="./data", help="Dataset cache root used when config does not specify one")
+    extra_seeds_parser.add_argument("--min-free-gb", type=float, default=20.0, help="Minimum free disk space required before launching")
+    extra_seeds_parser.add_argument("--lr", type=float, default=None, help="Optional task base learning rate override used by runners that support it")
+    extra_seeds_parser.add_argument("--alpha-lr-multiplier", type=float, default=10.0, help="Activation learning-rate multiplier when a task uses separate activation params")
+    extra_seeds_parser.add_argument("--freeze-backbone-epochs", type=int, default=2, help="Number of initial epochs to freeze the segmentation backbone base weights")
+    extra_seeds_parser.add_argument("--save-artifacts", action=argparse.BooleanOptionalAction, default=True, help="Save per-seed run JSONs, manifests, and trajectory plots (default: on, use --no-save-artifacts to disable)")
+    extra_seeds_parser.add_argument("--amp", action="store_true", help="Enable BF16 automatic mixed precision on CUDA")
+    extra_seeds_parser.add_argument("--fresh", action="store_true", help="Ignore any saved resume state and start this run from scratch")
+    extra_seeds_parser.add_argument("--rerun-tasks", type=str, nargs="+", default=None, choices=list(TASK_MAP.keys()), help="Tasks to rerun from scratch while preserving cached results for other tasks")
+
+    # Command: significance_report
+    significance_report_parser = subparsers.add_parser("significance_report", help="Compute paired-seed significance (p-value, Cohen's d) and timing/throughput comparisons from saved run artifacts")
+    significance_report_parser.add_argument("--tasks", type=str, nargs="+", required=True, choices=list(TASK_MAP.keys()), help="Tasks to analyze")
+    significance_report_parser.add_argument("--activations", type=str, nargs="+", default=["golu_static", "alpha_golu"], help="Activations to include in the timing table")
+    significance_report_parser.add_argument("--baseline", type=str, default="golu_static", help="Baseline activation for comparison")
+    significance_report_parser.add_argument("--proposed", type=str, default="alpha_golu", help="Proposed activation for comparison")
+    significance_report_parser.add_argument("--output-root", type=str, default="outputs/runs", help="Root directory containing outputs/runs/<task>/** run artifacts")
+    significance_report_parser.add_argument("--log-path", type=str, default="outputs/reports/significance_and_scale_analysis.log", help="Destination log file")
+
     # Command: preflight
     preflight_parser = subparsers.add_parser("preflight", help="Run environment and storage checks before a long benchmark run")
     preflight_parser.add_argument("--data-root", type=str, default="./data", help="Dataset cache root to check")
@@ -1267,6 +1315,10 @@ def main():
         handle_smoke_run(args)
     elif args.command == "task_order":
         handle_task_order(args)
+    elif args.command == "extra_seeds":
+        handle_extra_seeds(args)
+    elif args.command == "significance_report":
+        handle_significance_report(args)
     elif args.command == "generate_table":
         handle_generate_table(args)
     elif args.command == "generate_overhead_table":

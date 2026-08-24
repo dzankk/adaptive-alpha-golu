@@ -4,6 +4,7 @@ Unit tests for activation layer instantiation across all comparative baselines.
 
 import unittest
 import tempfile
+import math
 from pathlib import Path
 from copy import deepcopy
 import torch
@@ -12,7 +13,14 @@ from models.alpha_golu import AlphaGoLU
 from models.baselines import get_activation_layer
 from experiments.run_segmentation import _resolve_segmentation_alpha_lr
 from utils.experiment_config import load_benchmark_config
-from utils.stats import calculate_p_value
+from utils.stats import (
+    calculate_cohens_d,
+    calculate_p_value,
+    calculate_paired_cohens_d,
+    format_timing_table,
+    summarize_timing_by_activation,
+)
+from utils.scaled_benchmark_logger import build_significance_report, load_results_by_activation
 from utils.run_artifacts import build_run_manifest, create_run_directory, stable_seed_directory, write_json
 from utils.train_tuning import find_latest_checkpoint, load_training_checkpoint, save_training_checkpoint, set_activation_parameters_trainable, clear_training_checkpoints
 
@@ -147,6 +155,96 @@ class TestActivationFactory(unittest.TestCase):
             clear_training_checkpoints(seed_dir)
             self.assertIsNone(find_latest_checkpoint(seed_dir))
             self.assertFalse(seed_dir.exists())
+
+    def test_paired_p_value_uses_ttest_rel_for_matching_seed_lists(self):
+        """Same-length score lists (matching seeds) should use the paired test by default."""
+        # Same absolute noise every seed -> zero variance in the *difference*, so the paired
+        # test detects a perfectly consistent improvement that Welch's test (unpaired) would not.
+        baseline = [90.0, 80.0, 70.0]
+        proposed = [90.5, 80.5, 70.5]
+
+        p_paired = calculate_p_value(baseline, proposed, paired=True)
+        p_welch = calculate_p_value(baseline, proposed, paired=False)
+
+        self.assertLess(p_paired, 0.01)
+        self.assertGreater(p_welch, p_paired)
+
+    def test_paired_p_value_falls_back_to_welch_on_length_mismatch(self):
+        """Unequal-length lists can't be paired by seed, so this must fall back to Welch's test."""
+        baseline = [90.0, 80.0, 70.0]
+        proposed = [91.0, 81.0]
+
+        p_paired_requested = calculate_p_value(baseline, proposed, paired=True)
+        p_welch_explicit = calculate_p_value(baseline, proposed, paired=False)
+        self.assertAlmostEqual(p_paired_requested, p_welch_explicit)
+
+    def test_cohens_d_effect_sizes(self):
+        """Cohen's d (independent) and d_z (paired) should agree in sign for a consistent shift."""
+        baseline = [90.0, 80.0, 70.0]
+        proposed = [91.0, 81.0, 71.0]
+
+        d = calculate_cohens_d(baseline, proposed)
+        d_paired = calculate_paired_cohens_d(baseline, proposed)
+        self.assertGreater(d, 0.0)
+        self.assertTrue(math.isnan(d_paired))  # zero-variance differences -> undefined d_z
+
+    def test_timing_table_reports_ratios_relative_to_baseline(self):
+        """summarize_timing_by_activation should report activation timings relative to golu_static."""
+        results_by_activation = {
+            "golu_static": [{"epoch_seconds": [10.0, 10.0], "train_seconds": 20.0}],
+            "alpha_golu": [{"epoch_seconds": [12.0, 12.0], "train_seconds": 24.0}],
+        }
+        timing = summarize_timing_by_activation(results_by_activation, baseline_activation="golu_static")
+
+        self.assertAlmostEqual(timing["golu_static"]["mean_epoch_seconds"], 10.0)
+        self.assertAlmostEqual(timing["alpha_golu"]["mean_epoch_seconds"], 12.0)
+        self.assertAlmostEqual(timing["alpha_golu"]["epoch_seconds_vs_baseline"], 1.2)
+        self.assertAlmostEqual(timing["golu_static"]["epoch_seconds_vs_baseline"], 1.0)
+
+        table = format_timing_table(timing, baseline_activation="golu_static")
+        self.assertIn("alpha_golu", table)
+        self.assertIn("golu_static", table)
+
+    def test_scaled_benchmark_logger_reads_run_artifacts_and_computes_significance(self):
+        """build_significance_report should load results.json files by activation and compute stats."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            run_root = Path(tmp_dir) / "language_model"
+            for activation, scores in (("golu_static", [100.0, 102.0, 101.0]), ("alpha_golu", [98.0, 99.0, 97.0])):
+                for seed, score in zip([42, 123, 999], scores):
+                    run_dir = run_root / f"20260101T000000Z_language_model_{activation}_seeds-{seed}"
+                    run_dir.mkdir(parents=True, exist_ok=True)
+                    write_json(
+                        run_dir / "results.json",
+                        {
+                            "activation": activation,
+                            "perplexity": score,
+                            "epoch_seconds": [5.0, 5.0],
+                            "train_seconds": 10.0,
+                        },
+                    )
+
+            loaded = load_results_by_activation("language_model", ["golu_static", "alpha_golu"], output_root=tmp_dir)
+            self.assertEqual(len(loaded["golu_static"]), 3)
+            self.assertEqual(len(loaded["alpha_golu"]), 3)
+
+            report = build_significance_report(
+                ["language_model"], ["golu_static", "alpha_golu"], output_root=tmp_dir
+            )
+            task_report = report["tasks"]["language_model"]
+            self.assertEqual(task_report["baseline_scores"], [100.0, 102.0, 101.0])
+            self.assertEqual(task_report["proposed_scores"], [98.0, 99.0, 97.0])
+            self.assertIsNotNone(task_report["p_value_paired"])
+            self.assertIsNotNone(task_report["cohens_d"])
+            self.assertEqual(task_report["timing"]["golu_static"]["mean_train_seconds"], 10.0)
+
+    def test_phase2_scale_up_config_loads(self):
+        """The Phase 2 scaffold config should be valid and loadable like other benchmark configs."""
+        config = load_benchmark_config("configs/phase2_complex_scale.json")
+        self.assertEqual(config["name"], "phase2_complex_scale")
+        self.assertIn("classification", config["tasks"])
+        self.assertIn("classification_scale_up", config)
+        self.assertIn("language_model_scale_up", config)
+        self.assertIn("diffusion_scale_up", config)
 
 
 if __name__ == "__main__":

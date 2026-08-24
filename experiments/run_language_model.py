@@ -474,6 +474,7 @@ def train_single_seed_lm(
             print(f"[LANGUAGE_MODEL] Epoch {epoch + 1} complete - Mean Loss: {mean_epoch_loss:.4f} | steps={global_step}/{planned_steps}", flush=True)
         epoch += 1
 
+    train_seconds = time.perf_counter() - train_start
     model.eval()
     total_loss = 0.0
     total_tokens = 0
@@ -506,6 +507,8 @@ def train_single_seed_lm(
                 "alpha_lr_final": current_alpha_lr if act_params else None,
                 "perplexity": float(perplexity),
                 "avg_loss": float(avg_loss),
+                "train_seconds": train_seconds,
+                "epoch_seconds": epoch_seconds,
                 "epoch_loss_history": epoch_losses,
                 "lr_history": lr_history,
                 "grad_norm_history": grad_norm_history,
@@ -532,6 +535,8 @@ def train_single_seed_lm(
                     "progress_pct": 100.0,
                     "perplexity": float(perplexity),
                     "avg_loss": float(avg_loss),
+                    "train_seconds": train_seconds,
+                    "epoch_seconds": epoch_seconds,
                     "epoch_loss_history": epoch_losses,
                     "lr_history": lr_history,
                     "grad_norm_history": grad_norm_history,

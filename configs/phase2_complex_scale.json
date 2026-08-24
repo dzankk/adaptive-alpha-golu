@@ -1,0 +1,70 @@
+{
+    "name": "phase2_complex_scale",
+    "tier": "phase2_complex_scale",
+    "description": "SCAFFOLD for a future higher-complexity scale-up phase. The dataset/model knobs below (cifar100, transformer_context_window, transformer_num_layers, diffusion_image_size, diffusion_base_channels) are not yet consumed by the experiment runners -- see 'implementation_status'. This file only captures the intended Phase 2 settings so the wiring can be added incrementally without re-deriving the target config from scratch.",
+    "tasks": [
+        "classification",
+        "language_model",
+        "diffusion"
+    ],
+    "activations": [
+        "golu_static",
+        "alpha_golu",
+        "relu",
+        "gelu",
+        "swish",
+        "prelu",
+        "pgelu",
+        "adaptive_swish"
+    ],
+    "seeds": [42, 123, 999],
+    "data_root": "./data",
+    "dataset_by_task": {
+        "classification": "cifar100",
+        "diffusion": "cifar10"
+    },
+    "epochs_by_task": {
+        "classification": 120,
+        "language_model": 20,
+        "diffusion": 60
+    },
+    "base_lr_by_task": {
+        "classification": 0.1,
+        "diffusion": 0.0003
+    },
+    "alpha_lr_by_task": {
+        "classification": 0.0005,
+        "language_model": 0.001,
+        "diffusion": 0.001
+    },
+    "alpha_lr_warmup_epochs": {
+        "classification": 1,
+        "language_model": 1,
+        "diffusion": 1
+    },
+    "alpha_grad_clip_norm": {
+        "classification": 1.0,
+        "language_model": 1.0,
+        "diffusion": 1.0
+    },
+    "classification_scale_up": {
+        "dataset_name": "cifar100",
+        "num_classes": 100,
+        "notes": "Requires extending get_dataloaders() in experiments/run_classification.py to add a cifar100 branch (torchvision.datasets.CIFAR100) and passing num_classes=100 into ResNet18(); an ImageNet-1k subset is a heavier alternative if CIFAR-100 saturates too quickly."
+    },
+    "language_model_scale_up": {
+        "block_size": 512,
+        "d_model": 256,
+        "n_layers": 6,
+        "n_heads": 8,
+        "notes": "block_size (context window) is already an existing parameter of train_single_seed_lm; d_model/n_layers/n_heads are currently hardcoded MiniGPT class defaults (128/2/4) and are not yet threaded through as function/config parameters."
+    },
+    "diffusion_scale_up": {
+        "image_size": 64,
+        "base_channels": 128,
+        "notes": "DiffusionUNet currently hardcodes a 64-channel width and consumes CIFAR-10 at its native 32x32 resolution; both the resolution and base_channels would need to become constructor parameters wired through train_single_seed_diffusion before this config takes effect."
+    },
+    "implementation_status": "scaffold-only: no experiment runner currently reads classification_scale_up/language_model_scale_up/diffusion_scale_up. Wire them up incrementally, task by task, before pointing --config at this file for a real run.",
+    "output_root": "outputs/runs",
+    "summary_path": "outputs/benchmark_results_phase2.json"
+}
