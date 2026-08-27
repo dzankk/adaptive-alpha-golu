@@ -246,6 +246,51 @@ class TestActivationFactory(unittest.TestCase):
         self.assertIn("language_model_scale_up", config)
         self.assertIn("diffusion_scale_up", config)
 
+    def test_scale_runners_use_isolated_output_root(self):
+        """Phase 2 scale-up runners must write under outputs/runs_scale, never outputs/runs."""
+        import experiments.run_classification_scale as classification_scale
+        import experiments.run_language_model_scale as language_model_scale
+        import experiments.run_diffusion_scale as diffusion_scale
+
+        for module in (classification_scale, language_model_scale, diffusion_scale):
+            parts = module.OUTPUT_ROOT.parts
+            self.assertIn("runs_scale", parts)
+            self.assertNotIn("runs", [p for p in parts if p != "runs_scale"])
+
+    def test_classification_scale_recipe_reads_config(self):
+        from experiments.run_classification_scale import _resolve_scale_recipe
+
+        recipe = _resolve_scale_recipe("configs/phase2_complex_scale.json", base_lr=None)
+        self.assertEqual(recipe["num_classes"], 100)
+
+    def test_language_model_scale_recipe_reads_config(self):
+        from experiments.run_language_model_scale import _resolve_scale_recipe
+
+        recipe = _resolve_scale_recipe("configs/phase2_complex_scale.json")
+        self.assertEqual(recipe["d_model"], 256)
+        self.assertEqual(recipe["n_layers"], 6)
+        self.assertEqual(recipe["block_size"], 512)
+
+    def test_diffusion_scale_unet_forward_shape(self):
+        from experiments.run_diffusion_scale import ScaledDiffusionUNet, _resolve_scale_recipe
+
+        recipe = _resolve_scale_recipe("configs/phase2_complex_scale.json")
+        self.assertEqual(recipe["image_size"], 64)
+        self.assertEqual(recipe["base_channels"], 128)
+
+        model = ScaledDiffusionUNet(act_type="alpha_golu", base_channels=16)
+        x = torch.randn(2, 3, 64, 64)
+        t = torch.randint(0, 1000, (2,))
+        out = model(x, t)
+        self.assertEqual(out.shape, x.shape)
+
+    def test_cli_scale_resolves_epochs_from_config_or_default(self):
+        import cli_scale
+
+        config = load_benchmark_config("configs/phase2_complex_scale.json")
+        self.assertEqual(cli_scale._resolve_epochs(config, "classification"), 120)
+        self.assertEqual(cli_scale._resolve_epochs({}, "diffusion"), 60)
+
 
 if __name__ == "__main__":
     unittest.main()
