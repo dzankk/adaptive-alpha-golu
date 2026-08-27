@@ -59,9 +59,11 @@ def _resolve_scale_recipe(config_path: str | None) -> dict:
         "n_layers": int(scale_cfg.get("n_layers", 6)),
         "n_heads": int(scale_cfg.get("n_heads", 8)),
         # Deliberately distinct from Phase 1's shared alpha_lr_by_task.language_model (0.001, == base_lr):
-        # at 6 layers/d_model=256 that ratio measurably destabilized alpha (see run notes).
-        "alpha_lr": float(scale_cfg.get("alpha_lr", 1e-4)),
-        "alpha_lr_warmup_epochs": int(scale_cfg.get("alpha_lr_warmup_epochs", 2)),
+        # at 6 layers/d_model=256 that ratio measurably destabilized alpha. 1e-4 (10x separation)
+        # recovered most of the gap but still trailed golu_static; 2e-5 (50x separation) with a
+        # longer warmup is the current iteration (see configs/phase2_complex_scale.json notes).
+        "alpha_lr": float(scale_cfg.get("alpha_lr", 2e-5)),
+        "alpha_lr_warmup_epochs": int(scale_cfg.get("alpha_lr_warmup_epochs", 4)),
         "alpha_grad_clip_norm": float(scale_cfg.get("alpha_grad_clip_norm", 0.5)),
         "alpha_min": float(scale_cfg.get("alpha_min", 0.1)),
         "alpha_max": float(scale_cfg.get("alpha_max", 5.0)),

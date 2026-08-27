@@ -57,12 +57,12 @@
         "d_model": 256,
         "n_layers": 6,
         "n_heads": 8,
-        "alpha_lr": 0.0001,
-        "alpha_lr_warmup_epochs": 2,
+        "alpha_lr": 0.00002,
+        "alpha_lr_warmup_epochs": 4,
         "alpha_grad_clip_norm": 0.5,
         "alpha_min": 0.1,
         "alpha_max": 5.0,
-        "notes": "block_size (context window) is already an existing parameter of train_single_seed_lm; d_model/n_layers/n_heads are currently hardcoded MiniGPT class defaults (128/2/4) and are not yet threaded through as function/config parameters. alpha_lr/alpha_lr_warmup_epochs/alpha_grad_clip_norm/alpha_min/alpha_max intentionally override the shared Phase 1 alpha_lr_by_task.language_model=0.001 (equal to base_lr=1e-3), which was found to destabilize alpha at 6 layers/d_model=256 -- see run_language_model_scale.py's _resolve_scale_recipe()."
+        "notes": "block_size (context window) is already an existing parameter of train_single_seed_lm; d_model/n_layers/n_heads are currently hardcoded MiniGPT class defaults (128/2/4) and are not yet threaded through as function/config parameters. alpha_lr/alpha_lr_warmup_epochs/alpha_grad_clip_norm/alpha_min/alpha_max intentionally override the shared Phase 1 alpha_lr_by_task.language_model=0.001 (equal to base_lr=1e-3), which destabilized alpha at 6 layers/d_model=256. alpha_lr=1e-4 (10x separation from base_lr) recovered 15.47 PPL on seed 42 but still trailed golu_static; alpha_lr=2e-5 (50x separation) plus a longer 4-epoch warmup is the current iteration -- see run_language_model_scale.py's _resolve_scale_recipe()."
     },
     "diffusion_scale_up": {
         "image_size": 64,

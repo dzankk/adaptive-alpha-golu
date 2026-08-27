@@ -273,8 +273,8 @@ class TestActivationFactory(unittest.TestCase):
         # Regression guard: the scaled LM must NOT inherit Phase 1's shared alpha_lr_by_task
         # ["language_model"]=0.001 (== base_lr), which destabilized alpha at this depth/width.
         self.assertLess(recipe["alpha_lr"], 0.001)
-        self.assertEqual(recipe["alpha_lr"], 1e-4)
-        self.assertEqual(recipe["alpha_lr_warmup_epochs"], 2)
+        self.assertEqual(recipe["alpha_lr"], 2e-5)
+        self.assertEqual(recipe["alpha_lr_warmup_epochs"], 4)
         self.assertEqual(recipe["alpha_grad_clip_norm"], 0.5)
         self.assertEqual(recipe["alpha_min"], 0.1)
         self.assertEqual(recipe["alpha_max"], 5.0)
