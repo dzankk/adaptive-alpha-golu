@@ -44,7 +44,6 @@ from utils.train_tuning import (
     compute_model_grad_norm,
     load_training_checkpoint,
     overhead_tracking_enabled,
-    resolve_task_alpha_hparams,
     save_training_checkpoint,
 )
 
@@ -59,6 +58,13 @@ def _resolve_scale_recipe(config_path: str | None) -> dict:
         "d_model": int(scale_cfg.get("d_model", 256)),
         "n_layers": int(scale_cfg.get("n_layers", 6)),
         "n_heads": int(scale_cfg.get("n_heads", 8)),
+        # Deliberately distinct from Phase 1's shared alpha_lr_by_task.language_model (0.001, == base_lr):
+        # at 6 layers/d_model=256 that ratio measurably destabilized alpha (see run notes).
+        "alpha_lr": float(scale_cfg.get("alpha_lr", 1e-4)),
+        "alpha_lr_warmup_epochs": int(scale_cfg.get("alpha_lr_warmup_epochs", 2)),
+        "alpha_grad_clip_norm": float(scale_cfg.get("alpha_grad_clip_norm", 0.5)),
+        "alpha_min": float(scale_cfg.get("alpha_min", 0.1)),
+        "alpha_max": float(scale_cfg.get("alpha_max", 5.0)),
     }
 
 
@@ -103,9 +109,12 @@ def train_single_seed_lm_scale(
         act_type=act_type,
     ).to(device)
     overhead_tracker = OverheadTracker(task_name="language_model_scale", activation_name=act_type, model=model, device=device) if overhead_tracking_enabled() else None
-    alpha_lr, alpha_warmup_epochs, alpha_grad_clip_norm = resolve_task_alpha_hparams(
-        "language_model", alpha_lr, config_path=config_path
-    )
+    # Deliberately bypasses resolve_task_alpha_hparams()'s alpha_lr_by_task["language_model"] lookup:
+    # that shared Phase 1 value (0.001, == base_lr) is what destabilized alpha at this scale, so the
+    # scale recipe (language_model_scale_up) is the sole source of truth here, not the shared map.
+    alpha_lr = float(alpha_lr) if alpha_lr is not None else recipe["alpha_lr"]
+    alpha_warmup_epochs = recipe["alpha_lr_warmup_epochs"]
+    alpha_grad_clip_norm = recipe["alpha_grad_clip_norm"]
     optimizer, set_alpha_lr, act_params = build_adamw_with_activation_groups(
         model, base_lr=1e-3, base_weight_decay=1e-4, activation_lr=alpha_lr, activation_weight_decay=0.0, warmup_epochs=alpha_warmup_epochs
     )
@@ -193,7 +202,7 @@ def train_single_seed_lm_scale(
             optimizer.step()
             epoch_loss_total += float(loss.item())
             epoch_batches += 1
-            clamp_events, clamp_checks = clamp_alpha_golu_modules(model, min_alpha=0.2, max_alpha=3.0)
+            clamp_events, clamp_checks = clamp_alpha_golu_modules(model, min_alpha=recipe["alpha_min"], max_alpha=recipe["alpha_max"])
             alpha_clamp_events += clamp_events
             alpha_clamp_checks += clamp_checks
 

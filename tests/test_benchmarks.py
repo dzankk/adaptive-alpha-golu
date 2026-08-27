@@ -270,6 +270,32 @@ class TestActivationFactory(unittest.TestCase):
         self.assertEqual(recipe["d_model"], 256)
         self.assertEqual(recipe["n_layers"], 6)
         self.assertEqual(recipe["block_size"], 512)
+        # Regression guard: the scaled LM must NOT inherit Phase 1's shared alpha_lr_by_task
+        # ["language_model"]=0.001 (== base_lr), which destabilized alpha at this depth/width.
+        self.assertLess(recipe["alpha_lr"], 0.001)
+        self.assertEqual(recipe["alpha_lr"], 1e-4)
+        self.assertEqual(recipe["alpha_lr_warmup_epochs"], 2)
+        self.assertEqual(recipe["alpha_grad_clip_norm"], 0.5)
+        self.assertEqual(recipe["alpha_min"], 0.1)
+        self.assertEqual(recipe["alpha_max"], 5.0)
+
+    def test_language_model_scale_optimizer_uses_scale_specific_alpha_lr(self):
+        """The built optimizer's activation param group must use the scale recipe's alpha_lr,
+        not Phase 1's shared alpha_lr_by_task['language_model'] value from the same config file."""
+        from experiments.run_language_model import MiniGPT
+        from experiments.run_language_model_scale import _resolve_scale_recipe, build_adamw_with_activation_groups
+
+        recipe = _resolve_scale_recipe("configs/phase2_complex_scale.json")
+        model = MiniGPT(vocab_size=50, d_model=recipe["d_model"], n_heads=recipe["n_heads"], n_layers=recipe["n_layers"], max_seq_len=32, act_type="alpha_golu")
+        optimizer, set_alpha_lr, act_params = build_adamw_with_activation_groups(
+            model, base_lr=1e-3, base_weight_decay=1e-4,
+            activation_lr=recipe["alpha_lr"], activation_weight_decay=0.0,
+            warmup_epochs=recipe["alpha_lr_warmup_epochs"],
+        )
+        self.assertEqual(len(act_params), recipe["n_layers"])
+        post_warmup_lr = set_alpha_lr(recipe["alpha_lr_warmup_epochs"])
+        self.assertAlmostEqual(post_warmup_lr, recipe["alpha_lr"])
+        self.assertLess(post_warmup_lr, optimizer.param_groups[0]["lr"])
 
     def test_diffusion_scale_unet_forward_shape(self):
         from experiments.run_diffusion_scale import ScaledDiffusionUNet, _resolve_scale_recipe
