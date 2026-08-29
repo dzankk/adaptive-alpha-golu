@@ -21,11 +21,16 @@ TASK_LABELS = {
     "diffusion": "Diffusion",
     "language_model": "Language Modeling",
     "robustness": "Corruption Robustness",
+    "classification_scale": "Classification (Scale-Up)",
+    "diffusion_scale": "Diffusion (Scale-Up)",
+    "language_model_scale": "Language Modeling (Scale-Up)",
 }
 
-LOWER_IS_BETTER = {"diffusion", "language_model"}
+LOWER_IS_BETTER = {"diffusion", "language_model", "diffusion_scale", "language_model_scale"}
 
 TASK_ORDER = ["classification", "detection", "segmentation", "diffusion", "language_model", "robustness"]
+
+PHASE2_TASK_ORDER = ["classification_scale", "diffusion_scale", "language_model_scale"]
 
 PARAMETRIC_ACTIVATION_ORDER = ["alpha_golu", "prelu", "pgelu", "adaptive_swish", "swish_adaptive"]
 
@@ -37,6 +42,13 @@ PARAMETRIC_ACTIVATION_LABELS = {
     "adaptive_swish": r"Parametric Swish ($\beta$)",
     "swish_adaptive": r"Parametric Swish ($\beta$)",
 }
+
+
+def _grid_shape(num_panels: int, max_cols: int = 3) -> tuple[int, int]:
+    """Computes a (rows, cols) subplot grid that fits num_panels, capped at max_cols columns."""
+    cols = min(max_cols, max(num_panels, 1))
+    rows = -(-max(num_panels, 1) // cols)
+    return rows, cols
 
 
 def _load_json(path: str | Path) -> dict:
@@ -189,18 +201,26 @@ def plot_parametric_comparison(
     return save_path
 
 
-def plot_paper_benchmark_summary(results_path: str = "outputs/benchmark_results.json", save_dir: str = "outputs/paper_assets"):
-    """Plots a paper-style summary of mean performance for Alpha-GoLU versus Static GoLU."""
+def plot_paper_benchmark_summary(
+    results_path: str = "outputs/benchmark_results.json",
+    save_dir: str = "outputs/paper_assets",
+    task_order: list[str] | None = None,
+):
+    """Plots a paper-style summary of Alpha-GoLU versus Static GoLU, normalized to each task's
+    Static GoLU baseline (=100%). Raw task metrics use incompatible units/scales (accuracy %,
+    mIoU, MSE, perplexity, ...), so a shared absolute-value axis hides small-scale tasks; the
+    relative scale keeps every task's bars visible and comparable on one axis."""
     results = _load_json(results_path)
     if not results:
         print(f"[Visualizer] No benchmark summary found at {results_path}")
         return None
 
     os.makedirs(save_dir, exist_ok=True)
-    task_order = ["classification", "detection", "segmentation", "diffusion", "language_model", "robustness"]
+    task_order = task_order or TASK_ORDER
     alpha_values = []
     static_values = []
     task_labels = []
+    raw_pairs = []
 
     for task in task_order:
         task_data = results.get(task, {})
@@ -213,12 +233,19 @@ def plot_paper_benchmark_summary(results_path: str = "outputs/benchmark_results.
 
         alpha_mean = float(alpha_entry.get("mean", np.nan))
         static_mean = float(static_entry.get("mean", np.nan))
-        if not np.isfinite(alpha_mean) or not np.isfinite(static_mean):
+        if not np.isfinite(alpha_mean) or not np.isfinite(static_mean) or static_mean == 0 or alpha_mean == 0:
             continue
 
-        alpha_values.append(alpha_mean)
-        static_values.append(static_mean)
+        if task in LOWER_IS_BETTER:
+            # Lower raw values are better, so invert the ratio to keep "higher % = better" consistent.
+            alpha_relative = 100.0 * static_mean / alpha_mean
+        else:
+            alpha_relative = 100.0 * alpha_mean / static_mean
+
+        static_values.append(100.0)
+        alpha_values.append(alpha_relative)
         task_labels.append(TASK_LABELS.get(task, task.title()))
+        raw_pairs.append((static_mean, alpha_mean))
 
     if not task_labels:
         print(f"[Visualizer] No usable task entries found in {results_path}")
@@ -227,11 +254,25 @@ def plot_paper_benchmark_summary(results_path: str = "outputs/benchmark_results.
     x = np.arange(len(task_labels))
     width = 0.36
     fig, ax = plt.subplots(figsize=(12, 5.5))
-    ax.bar(x - width / 2, static_values, width, label="Static GoLU", color="#8da0cb")
-    ax.bar(x + width / 2, alpha_values, width, label="Alpha-GoLU", color="#fc8d62")
+    bars_static = ax.bar(x - width / 2, static_values, width, label="Static GoLU", color="#8da0cb")
+    bars_alpha = ax.bar(x + width / 2, alpha_values, width, label="Alpha-GoLU", color="#fc8d62")
+    ax.axhline(100.0, color="#555555", linestyle="--", linewidth=1.0)
+
+    for bar_static, bar_alpha, (static_raw, alpha_raw) in zip(bars_static, bars_alpha, raw_pairs):
+        top = max(bar_static.get_height(), bar_alpha.get_height())
+        ax.annotate(
+            f"{static_raw:.3g} / {alpha_raw:.3g}",
+            xy=((bar_static.get_x() + bar_alpha.get_x() + bar_alpha.get_width()) / 2, top),
+            xytext=(0, 4),
+            textcoords="offset points",
+            ha="center",
+            va="bottom",
+            fontsize=8,
+        )
+
     ax.set_xticks(x)
     ax.set_xticklabels(task_labels, rotation=18, ha="right")
-    ax.set_ylabel("Task Metric")
+    ax.set_ylabel("Relative Performance (% of Static GoLU baseline, higher = better)")
     ax.set_title("Alpha-GoLU vs Static GoLU Across Benchmarks")
     ax.grid(True, axis="y", alpha=0.25)
     ax.legend(frameon=False)
@@ -244,7 +285,7 @@ def plot_paper_benchmark_summary(results_path: str = "outputs/benchmark_results.
     return save_path
 
 
-def plot_paper_overhead_summary(overhead_root: str = "outputs/overhead", save_dir: str = "outputs/paper_assets"):
+def plot_paper_overhead_summary(overhead_root: str = "outputs/overhead", save_dir: str = "outputs/paper_assets", task_order: list[str] | None = None):
     """Plots mean forward/backward latency for Alpha-GoLU across tasks from overhead JSON records."""
     root_path = Path(overhead_root)
     if not root_path.exists():
@@ -261,7 +302,7 @@ def plot_paper_overhead_summary(overhead_root: str = "outputs/overhead", save_di
         print(f"[Visualizer] No overhead records found under {overhead_root}")
         return None
 
-    task_order = ["classification", "detection", "segmentation", "diffusion", "language_model", "robustness"]
+    task_order = task_order or TASK_ORDER
     task_labels = []
     forward_vals = []
     backward_vals = []
@@ -305,7 +346,12 @@ def plot_paper_overhead_summary(overhead_root: str = "outputs/overhead", save_di
     return save_path
 
 
-def plot_paper_alpha_trajectories(runs_root: str = "outputs/runs", save_dir: str = "outputs/paper_assets", activation_name: str = "alpha_golu"):
+def plot_paper_alpha_trajectories(
+    runs_root: str = "outputs/runs",
+    save_dir: str = "outputs/paper_assets",
+    activation_name: str = "alpha_golu",
+    task_order: list[str] | None = None,
+):
     """Plots alpha trajectories from the latest Alpha-GoLU run for each task."""
     root_path = Path(runs_root)
     if not root_path.exists():
@@ -313,9 +359,10 @@ def plot_paper_alpha_trajectories(runs_root: str = "outputs/runs", save_dir: str
         return None
 
     os.makedirs(save_dir, exist_ok=True)
-    task_order = ["classification", "detection", "segmentation", "diffusion", "language_model", "robustness"]
-    fig, axes = plt.subplots(2, 3, figsize=(15, 8), sharex=False)
-    axes = axes.flatten()
+    task_order = task_order or TASK_ORDER
+    rows, cols = _grid_shape(len(task_order))
+    fig, axes = plt.subplots(rows, cols, figsize=(5 * cols, 4 * rows), sharex=False)
+    axes = np.atleast_1d(axes).flatten()
     used_axes = 0
 
     for task in task_order:
@@ -388,6 +435,7 @@ def plot_curated_alpha_trajectories(
     save_dir: str = "outputs/paper_assets",
     activation_name: str = "alpha_golu",
     num_layers: int = 3,
+    task_order: list[str] | None = None,
 ):
     """Plots Early/Mid/Late representative layer alpha trajectories per task, one subplot per
     task, instead of every layer -- a cleaner alternative to plot_paper_alpha_trajectories."""
@@ -398,11 +446,13 @@ def plot_curated_alpha_trajectories(
 
     os.makedirs(save_dir, exist_ok=True)
     stage_colors = {"Early": "#1b9e77", "Mid": "#d95f02", "Late": "#7570b3"}
+    task_order = task_order or TASK_ORDER
 
-    fig, axes = plt.subplots(2, 3, figsize=(15, 8), sharex=False)
-    axes = axes.flatten()
+    rows, cols = _grid_shape(len(task_order))
+    fig, axes = plt.subplots(rows, cols, figsize=(5 * cols, 4 * rows), sharex=False)
+    axes = np.atleast_1d(axes).flatten()
 
-    for ax, task in zip(axes, TASK_ORDER):
+    for ax, task in zip(axes, task_order):
         ax.set_title(TASK_LABELS.get(task, task.title()))
 
         result = _find_latest_task_result(root_path, task, activation_name=activation_name)
@@ -426,6 +476,9 @@ def plot_curated_alpha_trajectories(
         ax.set_ylabel(r"$\alpha$")
         ax.grid(True, alpha=0.25)
         ax.legend(fontsize=8, frameon=False)
+
+    for ax in axes[len(task_order):]:
+        ax.set_axis_off()
 
     fig.suptitle("Alpha-GoLU Curated Trajectories (Early / Mid / Late Layers)", y=1.02, fontsize=16)
     fig.tight_layout()

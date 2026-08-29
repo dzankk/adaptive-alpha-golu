@@ -449,6 +449,7 @@ def train_single_seed_robustness(
         write_json(
             run_dir / "results.json",
             {
+                "task": "robustness",
                 "activation": act_type,
                 "data_root": data_root,
                 "seed": seed,

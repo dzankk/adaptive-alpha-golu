@@ -65,6 +65,10 @@ PARAMETRIC_ACTIVATIONS = ["alpha_golu", "prelu", "pgelu", "adaptive_swish", "swi
 
 DEFAULT_SEEDS = [42, 123, 999]
 
+# Phase 2 scale-up runners write "<task>_scale" task names, distinct from the Phase 1 names above.
+PHASE2_SCALE_TASKS = ["classification_scale", "diffusion_scale", "language_model_scale"]
+TRAJECTORY_TASK_CHOICES = list(TASK_MAP.keys()) + PHASE2_SCALE_TASKS
+
 TASK_METRIC_KEYS = {
     "classification": "accuracy",
     "detection": "map50",
@@ -1101,19 +1105,19 @@ def handle_generate_paper_assets(args):
             table_path = output_dir / "benchmark_table.tex"
             table_path.write_text(_build_benchmark_latex_table(benchmark_data), encoding="utf-8")
             print(f"[IO] Saved benchmark LaTeX table to {table_path}")
-            plot_paper_benchmark_summary(args.results_path, str(output_dir))
+            plot_paper_benchmark_summary(args.results_path, str(output_dir), task_order=args.tasks)
     else:
         print(f"[Warning] Benchmark results not found at {args.results_path}")
 
     if os.path.exists(args.overhead_root):
         overhead_args = argparse.Namespace(overhead_root=args.overhead_root, output_path=str(output_dir / "overhead_table.tex"))
         handle_generate_overhead_table(overhead_args)
-        plot_paper_overhead_summary(args.overhead_root, str(output_dir))
+        plot_paper_overhead_summary(args.overhead_root, str(output_dir), task_order=args.tasks)
     else:
         print(f"[Warning] Overhead root not found at {args.overhead_root}")
 
-    plot_paper_alpha_trajectories(args.runs_root, str(output_dir), activation_name=args.activation)
-    plot_curated_alpha_trajectories(args.runs_root, str(output_dir), activation_name=args.activation)
+    plot_paper_alpha_trajectories(args.runs_root, str(output_dir), activation_name=args.activation, task_order=args.tasks)
+    plot_curated_alpha_trajectories(args.runs_root, str(output_dir), activation_name=args.activation, task_order=args.tasks)
     print(f"[IO] Paper assets written to {output_dir}")
 
 
@@ -1121,7 +1125,7 @@ def handle_generate_curated_alpha_trajectories(args):
     """Plots Early/Mid/Late representative-layer alpha trajectories per task, one subplot per
     task, as a cleaner alternative to the full every-layer trajectory dashboard."""
     save_path = plot_curated_alpha_trajectories(
-        args.runs_root, args.output_dir, activation_name=args.activation, num_layers=args.num_layers
+        args.runs_root, args.output_dir, activation_name=args.activation, num_layers=args.num_layers, task_order=args.tasks
     )
     if save_path is None:
         print(f"[Warning] Could not generate curated alpha trajectories from {args.runs_root}")
@@ -1365,6 +1369,7 @@ def main():
     paper_parser.add_argument("--runs-root", type=str, default="outputs/runs", help="Directory containing benchmark run artifacts")
     paper_parser.add_argument("--output-dir", type=str, default="outputs/paper_assets", help="Directory where paper assets will be written")
     paper_parser.add_argument("--activation", type=str, default="alpha_golu", choices=SUPPORTED_ACTIVATIONS, help="Activation to use when scanning trajectory plots")
+    paper_parser.add_argument("--tasks", type=str, nargs="+", default=None, choices=TRAJECTORY_TASK_CHOICES, help="Override task list/order for plots (default: Phase 1's 6 tasks; pass the '_scale' names for Phase 2)")
 
     # Command: generate_parametric_comparison_plot
     parametric_parser = subparsers.add_parser("generate_parametric_comparison_plot", help="Plot layer-averaged parameter adaptation curves for parametric activations")
@@ -1379,6 +1384,7 @@ def main():
     curated_trajectories_parser.add_argument("--output-dir", type=str, default="outputs/paper_assets", help="Directory where the figure will be written")
     curated_trajectories_parser.add_argument("--activation", type=str, default="alpha_golu", choices=SUPPORTED_ACTIVATIONS, help="Activation to scan for alpha trajectories")
     curated_trajectories_parser.add_argument("--num-layers", type=int, default=3, help="Number of representative layers to sample per task (default 3: Early/Mid/Late)")
+    curated_trajectories_parser.add_argument("--tasks", type=str, nargs="+", default=None, choices=TRAJECTORY_TASK_CHOICES, help="Override task list/order (default: Phase 1's 6 tasks; pass the '_scale' names for Phase 2)")
 
     # Command: generate_alpha_lr_leaderboard
     leaderboard_parser = subparsers.add_parser("generate_alpha_lr_leaderboard", help="Compare multiple benchmark summaries and rank alpha-lr configs per task")
