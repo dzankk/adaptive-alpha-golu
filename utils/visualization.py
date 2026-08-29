@@ -362,6 +362,80 @@ def plot_paper_alpha_trajectories(runs_root: str = "outputs/runs", save_dir: str
     return save_path
 
 
+def _select_representative_layers(alpha_history: dict, num_layers: int = 3) -> list[tuple[str, str, list]]:
+    """Picks up to num_layers representative layers (Early/Mid/Late) from an alpha_history dict,
+    spread evenly across insertion order (a proxy for network depth)."""
+    layer_names = [name for name, history in alpha_history.items() if history]
+    if not layer_names:
+        return []
+
+    if len(layer_names) <= num_layers:
+        indices = list(range(len(layer_names)))
+    else:
+        indices = sorted({round(i * (len(layer_names) - 1) / (num_layers - 1)) for i in range(num_layers)})
+
+    stage_labels = ["Early", "Mid", "Late"] if num_layers == 3 else [f"Layer {rank + 1}" for rank in range(num_layers)]
+    picks = []
+    for rank, idx in enumerate(indices):
+        name = layer_names[idx]
+        stage = stage_labels[rank] if rank < len(stage_labels) else f"Layer {rank + 1}"
+        picks.append((name, stage, alpha_history[name]))
+    return picks
+
+
+def plot_curated_alpha_trajectories(
+    runs_root: str = "outputs/runs",
+    save_dir: str = "outputs/paper_assets",
+    activation_name: str = "alpha_golu",
+    num_layers: int = 3,
+):
+    """Plots Early/Mid/Late representative layer alpha trajectories per task, one subplot per
+    task, instead of every layer -- a cleaner alternative to plot_paper_alpha_trajectories."""
+    root_path = Path(runs_root)
+    if not root_path.exists():
+        print(f"[Visualizer] No runs directory found at {runs_root}")
+        return None
+
+    os.makedirs(save_dir, exist_ok=True)
+    stage_colors = {"Early": "#1b9e77", "Mid": "#d95f02", "Late": "#7570b3"}
+
+    fig, axes = plt.subplots(2, 3, figsize=(15, 8), sharex=False)
+    axes = axes.flatten()
+
+    for ax, task in zip(axes, TASK_ORDER):
+        ax.set_title(TASK_LABELS.get(task, task.title()))
+
+        result = _find_latest_task_result(root_path, task, activation_name=activation_name)
+        alpha_history = result.get("alpha_history") if result else None
+        if not isinstance(alpha_history, dict) or not alpha_history:
+            ax.text(0.5, 0.5, "No alpha history", ha="center", va="center", transform=ax.transAxes)
+            ax.set_axis_off()
+            continue
+
+        picks = _select_representative_layers(alpha_history, num_layers=num_layers)
+        if not picks:
+            ax.text(0.5, 0.5, "No alpha history", ha="center", va="center", transform=ax.transAxes)
+            ax.set_axis_off()
+            continue
+
+        for layer_name, stage, history in picks:
+            ax.plot(history, linewidth=1.8, alpha=0.9, label=f"{stage} ({layer_name})", color=stage_colors.get(stage))
+
+        ax.axhline(1.0, color="#d62728", linestyle="--", linewidth=1.2, label=r"Baseline Static ($\alpha=1.0$)")
+        ax.set_xlabel("Epoch")
+        ax.set_ylabel(r"$\alpha$")
+        ax.grid(True, alpha=0.25)
+        ax.legend(fontsize=8, frameon=False)
+
+    fig.suptitle("Alpha-GoLU Curated Trajectories (Early / Mid / Late Layers)", y=1.02, fontsize=16)
+    fig.tight_layout()
+    save_path = os.path.join(save_dir, "paper_alpha_trajectories_curated.png")
+    fig.savefig(save_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[Visualizer] Curated alpha trajectory dashboard saved to: {save_path}")
+    return save_path
+
+
 def plot_experiment_dashboard(results_dict: Dict[str, Any], save_dir: str = "outputs"):
     """
     Generates a 4-panel empirical evaluation dashboard.

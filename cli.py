@@ -35,8 +35,8 @@ from utils.run_artifacts import build_run_manifest, create_run_directory, write_
 from utils.preflight import run_preflight_checks, save_preflight_report
 from utils.data_prep import prepare_all_datasets
 from utils.stats import compute_summary_statistics, calculate_p_value
-from utils.scaled_benchmark_logger import write_significance_report
-from utils.visualization import plot_paper_alpha_trajectories, plot_paper_benchmark_summary, plot_paper_overhead_summary, plot_parametric_comparison
+from utils.scaled_benchmark_logger import load_results_by_activation, write_significance_report
+from utils.visualization import plot_curated_alpha_trajectories, plot_paper_alpha_trajectories, plot_paper_benchmark_summary, plot_paper_overhead_summary, plot_parametric_comparison
 
 TASK_MAP = {
     "classification": run_classification,
@@ -767,6 +767,9 @@ def handle_run_all(args, summary_only: bool = False):
                     "sem": stats["sem"],
                 }
                 all_task_results[task_name] = task_results
+                # Written after every seed (not just once at the end) so a killed/interrupted
+                # long-running sweep still leaves a usable summary reflecting whatever finished.
+                _save_json_file(Path(summary_path), all_task_results)
                 if resume_path is not None:
                     _save_json_file(
                         resume_path,
@@ -795,6 +798,7 @@ def handle_run_all(args, summary_only: bool = False):
                 task_results["alpha_golu"]["scores"]
             )
             all_task_results[task_name]["p_value_welch_alpha_vs_static"] = p_val
+        _save_json_file(Path(summary_path), all_task_results)
 
     json_path = summary_path
     with open(json_path, "w") as f:
@@ -875,6 +879,58 @@ def handle_significance_report(args):
         log_path=args.log_path,
     )
     print(f"[IO] Significance and scale-up analysis appended to {log_path}")
+
+
+def handle_rebuild_summary(args):
+    """Reconstructs benchmark_results.json purely from existing outputs/runs/**/results.json
+    artifacts, without retraining anything. Since the aggregate summary is now written
+    incrementally (see handle_run_all), this is mainly for recovering older sweeps that were
+    interrupted before this fix, or for rebuilding after --fresh cleared the resume state."""
+    config = load_benchmark_config(args.config) if args.config else {}
+    tasks = args.tasks or config.get("tasks", list(TASK_MAP.keys()))
+    activations = args.activations or config.get("activations", CANONICAL_ACTIVATIONS)
+    runs_root = args.runs_root or config.get("output_root", "outputs/runs")
+
+    all_task_results: dict = {}
+    for task_name in tasks:
+        if task_name not in TASK_MAP:
+            print(f"[Warning] Skipping unknown task '{task_name}'")
+            continue
+
+        results_by_activation = load_results_by_activation(task_name, activations, output_root=runs_root)
+        task_results: dict = {}
+        for act, payloads in results_by_activation.items():
+            completed_scores: dict = {}
+            scores: list = []
+            for payload in payloads:
+                metric = _extract_metric_from_result(task_name, payload)
+                seed = payload.get("seed")
+                if metric is None or seed is None:
+                    continue
+                completed_scores[str(seed)] = metric
+                scores.append(metric)
+            if not scores:
+                continue
+            stats = compute_summary_statistics(scores)
+            task_results[act] = {
+                "scores": scores,
+                "completed_scores": completed_scores,
+                "mean": stats["mean"],
+                "std": stats["std"],
+                "sem": stats["sem"],
+            }
+            print(f"[{task_name}][{act}] {len(scores)} seed(s) found, mean={stats['mean']:.4f} std={stats['std']:.4f}")
+
+        if "golu_static" in task_results and "alpha_golu" in task_results:
+            task_results["p_value_welch_alpha_vs_static"] = calculate_p_value(
+                task_results["golu_static"]["scores"], task_results["alpha_golu"]["scores"]
+            )
+        if task_results:
+            all_task_results[task_name] = task_results
+
+    summary_path = Path(args.summary_path)
+    _save_json_file(summary_path, all_task_results)
+    print(f"[IO] Rebuilt summary saved to {summary_path} ({len(all_task_results)} task(s))")
 
 
 def handle_generate_table(args):
@@ -1057,7 +1113,18 @@ def handle_generate_paper_assets(args):
         print(f"[Warning] Overhead root not found at {args.overhead_root}")
 
     plot_paper_alpha_trajectories(args.runs_root, str(output_dir), activation_name=args.activation)
+    plot_curated_alpha_trajectories(args.runs_root, str(output_dir), activation_name=args.activation)
     print(f"[IO] Paper assets written to {output_dir}")
+
+
+def handle_generate_curated_alpha_trajectories(args):
+    """Plots Early/Mid/Late representative-layer alpha trajectories per task, one subplot per
+    task, as a cleaner alternative to the full every-layer trajectory dashboard."""
+    save_path = plot_curated_alpha_trajectories(
+        args.runs_root, args.output_dir, activation_name=args.activation, num_layers=args.num_layers
+    )
+    if save_path is None:
+        print(f"[Warning] Could not generate curated alpha trajectories from {args.runs_root}")
 
 
 def handle_generate_parametric_comparison_plot(args):
@@ -1264,6 +1331,14 @@ def main():
     significance_report_parser.add_argument("--output-root", type=str, default="outputs/runs", help="Root directory containing outputs/runs/<task>/** run artifacts")
     significance_report_parser.add_argument("--log-path", type=str, default="outputs/reports/significance_and_scale_analysis.log", help="Destination log file")
 
+    # Command: rebuild_summary
+    rebuild_summary_parser = subparsers.add_parser("rebuild_summary", help="Reconstruct benchmark_results.json from existing outputs/runs/**/results.json artifacts without retraining")
+    rebuild_summary_parser.add_argument("--tasks", type=str, nargs="+", default=None, choices=list(TASK_MAP.keys()), help="Subset of tasks to include (default: config's tasks list or all)")
+    rebuild_summary_parser.add_argument("--activations", type=str, nargs="+", default=None, choices=SUPPORTED_ACTIVATIONS, help="Activations to include (default: config's activations list or the canonical 8)")
+    rebuild_summary_parser.add_argument("--config", type=str, default="configs/full_benchmark.json", help="Benchmark config file (used for default tasks/activations/output_root)")
+    rebuild_summary_parser.add_argument("--runs-root", type=str, default=None, help="Root directory containing outputs/runs/<task>/** artifacts (default: config's output_root or outputs/runs)")
+    rebuild_summary_parser.add_argument("--summary-path", type=str, default="outputs/benchmark_results.json", help="Where to write the reconstructed summary JSON")
+
     # Command: preflight
     preflight_parser = subparsers.add_parser("preflight", help="Run environment and storage checks before a long benchmark run")
     preflight_parser.add_argument("--data-root", type=str, default="./data", help="Dataset cache root to check")
@@ -1298,6 +1373,13 @@ def main():
     parametric_parser.add_argument("--task", type=str, default=None, choices=list(TASK_MAP.keys()), help="Optional task filter when scanning output runs")
     parametric_parser.add_argument("--output-path", type=str, default="outputs/paper_assets/parametric_comparison.png", help="Where to save the comparison figure")
 
+    # Command: generate_curated_alpha_trajectories
+    curated_trajectories_parser = subparsers.add_parser("generate_curated_alpha_trajectories", help="Plot Early/Mid/Late representative-layer alpha trajectories per task (cleaner alternative to the full every-layer dashboard)")
+    curated_trajectories_parser.add_argument("--runs-root", type=str, default="outputs/runs", help="Directory containing benchmark run artifacts")
+    curated_trajectories_parser.add_argument("--output-dir", type=str, default="outputs/paper_assets", help="Directory where the figure will be written")
+    curated_trajectories_parser.add_argument("--activation", type=str, default="alpha_golu", choices=SUPPORTED_ACTIVATIONS, help="Activation to scan for alpha trajectories")
+    curated_trajectories_parser.add_argument("--num-layers", type=int, default=3, help="Number of representative layers to sample per task (default 3: Early/Mid/Late)")
+
     # Command: generate_alpha_lr_leaderboard
     leaderboard_parser = subparsers.add_parser("generate_alpha_lr_leaderboard", help="Compare multiple benchmark summaries and rank alpha-lr configs per task")
     leaderboard_parser.add_argument("--results-paths", type=str, nargs="+", default=["outputs/benchmark_results_alpha_lr_1e3.json", "outputs/benchmark_results_alpha_lr_2e3.json", "outputs/benchmark_results.json"], help="Benchmark summary JSON files to compare")
@@ -1319,6 +1401,8 @@ def main():
         handle_extra_seeds(args)
     elif args.command == "significance_report":
         handle_significance_report(args)
+    elif args.command == "rebuild_summary":
+        handle_rebuild_summary(args)
     elif args.command == "generate_table":
         handle_generate_table(args)
     elif args.command == "generate_overhead_table":
@@ -1327,6 +1411,8 @@ def main():
         handle_generate_paper_assets(args)
     elif args.command == "generate_parametric_comparison_plot":
         handle_generate_parametric_comparison_plot(args)
+    elif args.command == "generate_curated_alpha_trajectories":
+        handle_generate_curated_alpha_trajectories(args)
     elif args.command == "generate_alpha_lr_leaderboard":
         handle_generate_alpha_lr_leaderboard(args)
     elif args.command == "preflight":
