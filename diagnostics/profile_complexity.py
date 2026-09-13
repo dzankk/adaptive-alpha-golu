@@ -84,9 +84,14 @@ TASK_SPECS: dict[str, TaskSpec] = {
         batch_shape={"images": [1, 3, 320, 320], "boxes": [[1, 4]], "num_classes": len(VOC_CLASSES) + 1},
     ),
     "segmentation": TaskSpec(
+        # batch_size=2 (not 1): DeepLabV3's ASPP image-pooling branch does AdaptiveAvgPool2d(1)
+        # then BatchNorm2d, which needs >1 element per channel in training mode -- with batch=1
+        # that collapses to exactly 1 element per channel and torch raises
+        # "Expected more than 1 value per channel when training". Real training also always uses
+        # batch_size > 1 (32), so this is more representative anyway.
         name="segmentation",
-        batch_size=1,
-        batch_shape={"images": [1, 3, 256, 256], "masks": [1, 256, 256], "num_classes": VOC_SEG_CLASSES},
+        batch_size=2,
+        batch_shape={"images": [2, 3, 256, 256], "masks": [2, 256, 256], "num_classes": VOC_SEG_CLASSES},
     ),
     "diffusion": TaskSpec(
         name="diffusion",
@@ -186,8 +191,8 @@ def build_sample(task_name: str, device: torch.device, lm_vocab_size: int) -> di
         }
     if task_name == "segmentation":
         return {
-            "images": torch.randn(1, 3, 256, 256, device=device),
-            "masks": torch.randint(0, VOC_SEG_CLASSES, (1, 256, 256), device=device),
+            "images": torch.randn(2, 3, 256, 256, device=device),
+            "masks": torch.randint(0, VOC_SEG_CLASSES, (2, 256, 256), device=device),
         }
     if task_name == "diffusion":
         x0 = torch.randn(1, 3, 32, 32, device=device)

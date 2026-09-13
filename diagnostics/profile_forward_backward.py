@@ -1,13 +1,17 @@
 """
 Forward/Backward CUDA Timing Verification
 ==========================================
-Uses torch.profiler (not the hand-rolled time.perf_counter timer in
-utils/overhead_tracker.py) to get an authoritative, kernel-level breakdown of
-forward vs backward time for a given task/activation. torch.profiler's CUDA
-tracing (Kineto/CUPTI) attributes actual GPU kernel completion time back to
-the enclosing named region regardless of asynchronous CPU/GPU dispatch, so
-this settles whether a "backward faster than forward" measurement reflects a
-real property of the model or a timing artifact.
+Times forward vs backward using CUDA events (or perf_counter+sync on CPU), and
+separately uses torch.profiler purely to print an informational kernel-level
+breakdown table. CUDA events are the ground truth here -- NOT
+torch.profiler's self_device_time_total attributed to a record_function
+marker: on CUDA, backward() can execute its kernels via the autograd engine
+off the thread that opened the record_function scope, so the marker's own
+"self" time comes back near-zero even though real backward work happened
+(confirmed: this previously reported ~0.001 ms/iter backward time for every
+activation/task on a real GPU run). CUDA events measure actual elapsed time
+between two points on the stream regardless of which thread enqueued the
+kernels in between, so they don't have this blind spot.
 
 This also doubles as the FASTEST way to fully populate outputs/overhead/ for
 the paper's runtime-overhead plot: unlike the OverheadTracker path (which only
@@ -18,7 +22,7 @@ this script profiles a handful of synthetic forward/backward passes per
 writing results into outputs/overhead/ takes minutes, not hours.
 
 Usage:
-    # Single (task, activation) -- just prints the profiler breakdown:
+    # Single (task, activation) -- just prints the timing + profiler breakdown:
     python -m diagnostics.profile_forward_backward --task detection --activation alpha_golu
 
     # All 8 canonical activations for a task, saved into outputs/overhead/:
@@ -27,6 +31,7 @@ Usage:
 
 import argparse
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -41,19 +46,10 @@ from diagnostics.profile_complexity import ACTIVATIONS, TASK_SPECS, build_model,
 from utils.run_artifacts import write_json
 
 
-def _self_device_time(event) -> float:
-    """self_cuda_time_total was renamed to self_device_time_total in newer PyTorch
-    (profiler generalized for non-CUDA accelerators); support both."""
-    value = getattr(event, "self_device_time_total", None)
-    if value is None:
-        value = getattr(event, "self_cuda_time_total", 0)
-    return float(value)
-
-
 def measure_forward_backward(
     task_name: str, activation: str, device: torch.device, warmup: int = 5, measured: int = 10, verbose: bool = True
 ) -> tuple[float, float]:
-    """Runs the profiler for one (task, activation) pair and returns (forward_ms, backward_ms)."""
+    """Runs forward/backward for one (task, activation) pair and returns (forward_ms, backward_ms)."""
     lm_vocab_size = 1000
     model = build_model(task_name, activation, device, lm_vocab_size)
     model.train()
@@ -66,48 +62,61 @@ def measure_forward_backward(
     if device.type == "cuda":
         torch.cuda.synchronize(device)
 
-    activities = [ProfilerActivity.CPU]
-    if device.type == "cuda":
-        activities.append(ProfilerActivity.CUDA)
+    forward_times_ms: list[float] = []
+    backward_times_ms: list[float] = []
+    for _ in range(measured):
+        model.zero_grad(set_to_none=True)
+        if device.type == "cuda":
+            start_fwd, end_fwd = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+            start_bwd, end_bwd = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+            start_fwd.record()
+            loss = training_loss(task_name, model, sample, lm_vocab_size)
+            end_fwd.record()
+            start_bwd.record()
+            loss.backward()
+            end_bwd.record()
+            torch.cuda.synchronize(device)
+            forward_times_ms.append(start_fwd.elapsed_time(end_fwd))
+            backward_times_ms.append(start_bwd.elapsed_time(end_bwd))
+        else:
+            t0 = time.perf_counter()
+            loss = training_loss(task_name, model, sample, lm_vocab_size)
+            t1 = time.perf_counter()
+            loss.backward()
+            t2 = time.perf_counter()
+            forward_times_ms.append((t1 - t0) * 1000.0)
+            backward_times_ms.append((t2 - t1) * 1000.0)
 
-    with profile(activities=activities, record_shapes=False) as prof:
-        for _ in range(measured):
-            model.zero_grad(set_to_none=True)
-            with record_function("forward_pass"):
-                loss = training_loss(task_name, model, sample, lm_vocab_size)
-            # Sync at each region boundary so async CUDA kernels from one named region can't
-            # still be in flight (and get misattributed) when the next region starts -- without
-            # this, forward/backward (and successive iterations) can bleed into each other and
-            # produce duplicate/inflated (>100% self time) entries for the same region name.
-            if device.type == "cuda":
-                torch.cuda.synchronize(device)
-            with record_function("backward_pass"):
-                loss.backward()
-            if device.type == "cuda":
-                torch.cuda.synchronize(device)
-
-    key_averages = prof.key_averages()
-    if device.type == "cuda":
-        forward_us = sum(_self_device_time(event) for event in key_averages if event.key == "forward_pass")
-        backward_us = sum(_self_device_time(event) for event in key_averages if event.key == "backward_pass")
-        time_label = "self_device_time_total (CUDA)"
-    else:
-        forward_us = sum(getattr(event, "self_cpu_time_total", 0) for event in key_averages if event.key == "forward_pass")
-        backward_us = sum(getattr(event, "self_cpu_time_total", 0) for event in key_averages if event.key == "backward_pass")
-        time_label = "self_cpu_time_total"
-
-    forward_ms = forward_us / measured / 1000.0
-    backward_ms = backward_us / measured / 1000.0
+    forward_ms = sum(forward_times_ms) / measured
+    backward_ms = sum(backward_times_ms) / measured
 
     if verbose:
+        time_label = "CUDA events" if device.type == "cuda" else "perf_counter (CPU)"
         print(f"\n=== {task_name} / {activation} on {device} (n={measured} measured iters, {warmup} warmup) ===")
-        print(f"Forward:  {forward_ms:.3f} ms/iter  ({time_label}, torch.profiler ground truth)")
-        print(f"Backward: {backward_ms:.3f} ms/iter  ({time_label}, torch.profiler ground truth)")
+        print(f"Forward:  {forward_ms:.3f} ms/iter  ({time_label}, ground truth)")
+        print(f"Backward: {backward_ms:.3f} ms/iter  ({time_label}, ground truth)")
+
+        # Separate torch.profiler pass purely for the informational kernel-level breakdown table
+        # below -- not used for the forward_ms/backward_ms numbers above (see module docstring).
+        activities = [ProfilerActivity.CPU] + ([ProfilerActivity.CUDA] if device.type == "cuda" else [])
+        table_iters = min(measured, 3)
+        with profile(activities=activities, record_shapes=False) as prof:
+            for _ in range(table_iters):
+                model.zero_grad(set_to_none=True)
+                with record_function("forward_pass"):
+                    loss = training_loss(task_name, model, sample, lm_vocab_size)
+                if device.type == "cuda":
+                    torch.cuda.synchronize(device)
+                with record_function("backward_pass"):
+                    loss.backward()
+                if device.type == "cuda":
+                    torch.cuda.synchronize(device)
         sort_key = "cuda_time_total" if device.type == "cuda" else "cpu_time_total"
-        print(f"\nTop ops by {sort_key}:")
-        print(key_averages.table(sort_by=sort_key, row_limit=15))
+        print(f"\nTop ops by {sort_key} (informational, {table_iters} iters -- not the timing source above):")
+        print(prof.key_averages().table(sort_by=sort_key, row_limit=15))
 
     return forward_ms, backward_ms
+
 
 
 def main() -> None:
@@ -146,7 +155,7 @@ def main() -> None:
                         "activation_name": activation,
                         "forward_ms": {"mean": forward_ms},
                         "backward_ms": {"mean": backward_ms},
-                        "source": "diagnostics.profile_forward_backward (torch.profiler)",
+                        "source": "diagnostics.profile_forward_backward (CUDA events / perf_counter ground truth)",
                     },
                 )
 
