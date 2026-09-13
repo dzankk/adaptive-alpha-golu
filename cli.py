@@ -726,7 +726,12 @@ def handle_run_all(args, summary_only: bool = False):
             completed_scores = _filter_valid_completed_scores(task_name, act, completed_scores)
             if task_name in rerun_tasks:
                 completed_scores = {}
-            accs = [float(completed_scores[str(seed)]) for seed in seeds if str(seed) in completed_scores]
+            # Aggregate over EVERY seed ever recorded for this task/activation (sorted ascending
+            # for deterministic, paired-test-safe ordering), not just the seeds passed to this
+            # particular invocation -- otherwise running `extra_seeds` with new seed values would
+            # silently drop the original seeds' scores from mean/std/sem while completed_scores
+            # itself still (correctly) retained them, producing a mismatched, wrong aggregate.
+            accs = [float(completed_scores[seed_key]) for seed_key in sorted(completed_scores.keys(), key=lambda key: int(key))]
 
             for seed in seeds:
                 seed_key = str(seed)
@@ -762,6 +767,11 @@ def handle_run_all(args, summary_only: bool = False):
                 print(f"Seed {seed} -> Score: {acc:.4f}")
 
                 completed_scores[seed_key] = acc
+                # Rebuild from completed_scores (sorted by seed) rather than trusting the
+                # incrementally-appended accs list, so scores/mean/std always exactly match the
+                # authoritative per-seed record even if different activations previously had
+                # different sets of completed seeds (keeps paired significance tests valid).
+                accs = [float(completed_scores[key]) for key in sorted(completed_scores.keys(), key=lambda key: int(key))]
                 stats = compute_summary_statistics(accs)
                 task_results[act] = {
                     "scores": accs,
