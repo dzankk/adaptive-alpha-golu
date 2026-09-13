@@ -633,6 +633,84 @@ def plot_paper_convergence_curves(
     return save_path
 
 
+def plot_corruption_breakdown(
+    runs_root: str = "outputs/runs",
+    save_dir: str = "outputs/paper_assets",
+    activations: list[str] | None = None,
+    include_clean: bool = True,
+):
+    """Grouped bar chart of mean per-corruption-type robustness accuracy across activations,
+    averaged over all available seeds per activation. A single aggregate "robustness" score
+    hides which corruption types actually drive the gap between activations, so this breaks it
+    down by corruption type (whatever was tracked -- see CORRUPTION_SUITE in
+    experiments/run_adversarial_robustness.py) plus clean accuracy for reference. Uses
+    load_results_by_activation so the legacy robustness folder/task-key split
+    (corruption_robustness/adversarial_robustness) is merged automatically."""
+    from utils.scaled_benchmark_logger import load_results_by_activation
+
+    activations = activations or DEFAULT_OVERHEAD_ACTIVATIONS
+    results_by_activation = load_results_by_activation("robustness", activations, output_root=runs_root)
+
+    corruption_names: list[str] = []
+    activation_means: dict[str, dict[str, float]] = {}
+    for act, payloads in results_by_activation.items():
+        if not payloads:
+            continue
+        per_corruption_values: dict[str, list[float]] = defaultdict(list)
+        for payload in payloads:
+            if include_clean and isinstance(payload.get("clean_acc"), (int, float)):
+                per_corruption_values["clean"].append(float(payload["clean_acc"]))
+            for key, value in payload.items():
+                if key in ("corruption_acc", "clean_acc"):
+                    continue
+                if key.endswith("_acc") and isinstance(value, (int, float)):
+                    per_corruption_values[key[: -len("_acc")]].append(float(value))
+
+        means = {name: float(np.mean(values)) for name, values in per_corruption_values.items() if values}
+        if not means:
+            continue
+        activation_means[act] = means
+        for name in means:
+            if name not in corruption_names:
+                corruption_names.append(name)
+
+    if not activation_means:
+        print(f"[Visualizer] No robustness per-corruption entries found under {runs_root}")
+        return None
+
+    corruption_names = sorted(corruption_names, key=lambda name: (name != "clean", name))
+    rendered_activations = [act for act in activations if act in activation_means]
+
+    x = np.arange(len(corruption_names))
+    n_acts = max(len(rendered_activations), 1)
+    width = 0.8 / n_acts
+    color_cycle = plt.rcParams["axes.prop_cycle"].by_key().get("color", [])
+
+    fig, ax = plt.subplots(figsize=(max(10, 1.8 * len(corruption_names) * n_acts), 5.5))
+    for i, act in enumerate(rendered_activations):
+        raw_values = [activation_means[act].get(name) for name in corruption_names]
+        heights = [value if value is not None else 0.0 for value in raw_values]
+        labels = [f"{value:.1f}" if value is not None else "" for value in raw_values]
+        offsets = x - 0.4 + width * (i + 0.5)
+        bars = ax.bar(offsets, heights, width=width, label=act.replace("_", " ").upper(), color=color_cycle[i % len(color_cycle)])
+        ax.bar_label(bars, labels=labels, padding=2, fontsize=7, rotation=90)
+
+    ax.set_xticks(x)
+    ax.set_xticklabels([name.replace("_", " ").title() for name in corruption_names], rotation=0, ha="center")
+    ax.set_ylabel("Accuracy (%)")
+    ax.set_title("Robustness Breakdown by Corruption Type")
+    ax.grid(True, axis="y", alpha=0.25)
+    ax.legend(frameon=False, ncol=min(4, n_acts), fontsize=8)
+
+    fig.tight_layout()
+    os.makedirs(save_dir, exist_ok=True)
+    save_path = os.path.join(save_dir, "paper_corruption_breakdown.png")
+    fig.savefig(save_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[Visualizer] Corruption breakdown chart saved to: {save_path}")
+    return save_path
+
+
 def plot_experiment_dashboard(results_dict: Dict[str, Any], save_dir: str = "outputs"):
     """
     Generates a 4-panel empirical evaluation dashboard.

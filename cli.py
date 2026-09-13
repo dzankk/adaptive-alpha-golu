@@ -36,7 +36,7 @@ from utils.preflight import run_preflight_checks, save_preflight_report
 from utils.data_prep import prepare_all_datasets
 from utils.stats import compute_summary_statistics, calculate_p_value
 from utils.scaled_benchmark_logger import load_results_by_activation, write_significance_report
-from utils.visualization import plot_curated_alpha_trajectories, plot_paper_alpha_trajectories, plot_paper_benchmark_summary, plot_paper_convergence_curves, plot_paper_overhead_summary, plot_parametric_comparison
+from utils.visualization import plot_corruption_breakdown, plot_curated_alpha_trajectories, plot_paper_alpha_trajectories, plot_paper_benchmark_summary, plot_paper_convergence_curves, plot_paper_overhead_summary, plot_parametric_comparison
 
 TASK_MAP = {
     "classification": run_classification,
@@ -1152,6 +1152,7 @@ def handle_generate_paper_assets(args):
     plot_paper_alpha_trajectories(args.runs_root, str(output_dir), activation_name=args.activation, task_order=args.tasks)
     plot_curated_alpha_trajectories(args.runs_root, str(output_dir), activation_name=args.activation, task_order=args.tasks)
     plot_paper_convergence_curves(args.runs_root, str(output_dir), task_order=args.tasks)
+    plot_corruption_breakdown(args.runs_root, str(output_dir))
     print(f"[IO] Paper assets written to {output_dir}")
 
 
@@ -1177,6 +1178,14 @@ def handle_generate_convergence_curves(args):
     )
     if save_path is None:
         print(f"[Warning] Could not generate convergence curves from {args.runs_root}")
+
+
+def handle_generate_corruption_breakdown(args):
+    """Plots a grouped bar chart of mean per-corruption-type robustness accuracy across
+    activations, averaged over all available seeds per activation."""
+    save_path = plot_corruption_breakdown(args.runs_root, args.output_dir, activations=args.activations)
+    if save_path is None:
+        print(f"[Warning] Could not generate corruption breakdown from {args.runs_root}")
 
 
 def handle_generate_parametric_comparison_plot(args):
@@ -1442,6 +1451,12 @@ def main():
     convergence_parser.add_argument("--proposed", type=str, default="alpha_golu", choices=SUPPORTED_ACTIVATIONS, help="Proposed activation to plot")
     convergence_parser.add_argument("--tasks", type=str, nargs="+", default=None, choices=TRAJECTORY_TASK_CHOICES, help="Override task list/order (default: Phase 1's 6 tasks; pass the '_scale' names for Phase 2)")
 
+    # Command: generate_corruption_breakdown
+    corruption_parser = subparsers.add_parser("generate_corruption_breakdown", help="Plot per-corruption-type robustness accuracy grouped by activation")
+    corruption_parser.add_argument("--runs-root", type=str, default="outputs/runs", help="Directory containing benchmark run artifacts")
+    corruption_parser.add_argument("--output-dir", type=str, default="outputs/paper_assets", help="Directory where the figure will be written")
+    corruption_parser.add_argument("--activations", type=str, nargs="+", default=None, choices=SUPPORTED_ACTIVATIONS, help="Activations to include (default: all activations with tracked robustness runs)")
+
     # Command: generate_alpha_lr_leaderboard
     leaderboard_parser = subparsers.add_parser("generate_alpha_lr_leaderboard", help="Compare multiple benchmark summaries and rank alpha-lr configs per task")
     leaderboard_parser.add_argument("--results-paths", type=str, nargs="+", default=["outputs/benchmark_results_alpha_lr_1e3.json", "outputs/benchmark_results_alpha_lr_2e3.json", "outputs/benchmark_results.json"], help="Benchmark summary JSON files to compare")
@@ -1477,6 +1492,8 @@ def main():
         handle_generate_curated_alpha_trajectories(args)
     elif args.command == "generate_convergence_curves":
         handle_generate_convergence_curves(args)
+    elif args.command == "generate_corruption_breakdown":
+        handle_generate_corruption_breakdown(args)
     elif args.command == "generate_alpha_lr_leaderboard":
         handle_generate_alpha_lr_leaderboard(args)
     elif args.command == "preflight":
