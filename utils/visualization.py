@@ -403,52 +403,49 @@ def plot_paper_overhead_summary(
         print(f"[Visualizer] No usable overhead entries found under {overhead_root}")
         return None
 
-    bar_width = 0.32
-    intra_gap = 0.12
-    inter_task_gap = 0.9
+    # One subplot per task with its own y-axis, instead of a single shared axis -- latency
+    # scales differ by 1-2 orders of magnitude across tasks (e.g. ~2ms language modeling vs
+    # ~130ms segmentation), which squashed the cheaper tasks into invisible stubs on one axis.
     color_cycle = plt.rcParams["axes.prop_cycle"].by_key().get("color", [])
     act_color_map = {act: color_cycle[i % len(color_cycle)] for i, act in enumerate(activations)}
+    bar_width = 0.32
 
-    fwd_xs, fwd_heights, bwd_xs, bwd_heights, bar_colors = [], [], [], [], []
-    tick_positions, task_labels = [], []
-    cursor = 0.0
-    for task in rendered_tasks:
+    rows, cols = _grid_shape(len(rendered_tasks))
+    fig, axes = plt.subplots(rows, cols, figsize=(4.5 * cols, 4.2 * rows), sharex=False, sharey=False)
+    axes = np.atleast_1d(axes).flatten()
+
+    for ax, task in zip(axes, rendered_tasks):
         acts_present = [act for act in activations if act in task_activation_latency[task]]
-        group_start = cursor
-        for act in acts_present:
-            forward_ms, backward_ms = task_activation_latency[task][act]
-            fwd_xs.append(cursor)
-            fwd_heights.append(forward_ms)
-            bwd_xs.append(cursor + bar_width)
-            bwd_heights.append(backward_ms)
-            bar_colors.append(act_color_map[act])
-            cursor += 2 * bar_width + intra_gap
-        group_end = cursor - intra_gap
-        tick_positions.append((group_start + group_end) / 2.0)
-        task_labels.append(TASK_LABELS.get(task, task.title()))
-        cursor = group_end + inter_task_gap
+        x = np.arange(len(acts_present))
+        fwd_heights = [task_activation_latency[task][act][0] for act in acts_present]
+        bwd_heights = [task_activation_latency[task][act][1] for act in acts_present]
+        bar_colors = [act_color_map[act] for act in acts_present]
 
-    fig_width = min(max(9.0, 0.9 * cursor), 18.0)
-    fig, ax = plt.subplots(figsize=(fig_width, 5.5))
-    fwd_bars = ax.bar(fwd_xs, fwd_heights, width=bar_width, color=bar_colors, edgecolor="black", linewidth=0.5)
-    bwd_bars = ax.bar(bwd_xs, bwd_heights, width=bar_width, color=bar_colors, edgecolor="black", linewidth=0.5, hatch="//")
-    ax.bar_label(fwd_bars, fmt="%.1f", padding=2, fontsize=8, rotation=90)
-    ax.bar_label(bwd_bars, fmt="%.1f", padding=2, fontsize=8, rotation=90)
+        fwd_bars = ax.bar(x - bar_width / 2, fwd_heights, width=bar_width, color=bar_colors, edgecolor="black", linewidth=0.5)
+        bwd_bars = ax.bar(x + bar_width / 2, bwd_heights, width=bar_width, color=bar_colors, edgecolor="black", linewidth=0.5, hatch="//")
+        ax.bar_label(fwd_bars, fmt="%.1f", padding=2, fontsize=8)
+        ax.bar_label(bwd_bars, fmt="%.1f", padding=2, fontsize=8)
 
-    ax.set_xticks(tick_positions)
-    ax.set_xticklabels(task_labels, rotation=0, ha="center", fontsize=11)
-    ax.set_ylabel("Latency (ms)", fontsize=12)
-    if len(rendered_tasks) == 1:
-        ax.set_title(f"Runtime Overhead: {task_labels[0]}", fontsize=14)
-    else:
-        ax.set_title(f"Runtime Overhead Across {len(rendered_tasks)} Benchmarks", fontsize=14)
-    ax.grid(True, axis="y", alpha=0.25)
+        ax.set_xticks(x)
+        ax.set_xticklabels([act.replace("_", " ").upper() for act in acts_present], rotation=30, ha="right", fontsize=9)
+        ax.set_title(TASK_LABELS.get(task, task.title()), fontsize=12)
+        ax.set_ylabel("Latency (ms)", fontsize=10)
+        ax.grid(True, axis="y", alpha=0.25)
+        ax.margins(y=0.15)
+
+    for ax in axes[len(rendered_tasks):]:
+        ax.set_axis_off()
 
     rendered_activations = [act for act in activations if any(act in task_activation_latency[task] for task in rendered_tasks)]
     legend_handles = [Patch(facecolor=act_color_map[act], edgecolor="black", label=act.replace("_", " ").upper()) for act in rendered_activations]
     legend_handles.append(Patch(facecolor="white", edgecolor="black", label="Forward"))
     legend_handles.append(Patch(facecolor="white", edgecolor="black", hatch="//", label="Backward"))
-    fig.legend(handles=legend_handles, loc="lower center", bbox_to_anchor=(0.5, -0.1), ncol=min(5, len(legend_handles)), frameon=False, fontsize=10)
+    fig.legend(handles=legend_handles, loc="lower center", bbox_to_anchor=(0.5, -0.08), ncol=min(6, len(legend_handles)), frameon=False, fontsize=9)
+
+    if len(rendered_tasks) == 1:
+        fig.suptitle(f"Runtime Overhead: {TASK_LABELS.get(rendered_tasks[0], rendered_tasks[0].title())}", fontsize=14, y=1.03)
+    else:
+        fig.suptitle(f"Runtime Overhead Across {len(rendered_tasks)} Benchmarks", fontsize=14, y=1.03)
 
     fig.tight_layout()
     os.makedirs(save_dir, exist_ok=True)
@@ -501,8 +498,9 @@ def plot_paper_alpha_trajectories(
             progress = np.linspace(0, 100, len(history))
             ax.plot(progress, history, linewidth=1.6, alpha=0.85, label=layer_name)
 
+        max_epochs = max((len(history) for history in alpha_history.values() if history), default=0)
         ax.axhline(1.0, color="#d62728", linestyle="--", linewidth=1.2, label="alpha = 1.0")
-        ax.set_title(TASK_LABELS.get(task, task.title()))
+        ax.set_title(f"{TASK_LABELS.get(task, task.title())} ({max_epochs} Epochs)")
         ax.set_xlabel("Training Progress (%)")
         ax.set_ylabel(r"$\alpha$")
         ax.ticklabel_format(axis="y", useOffset=False, style="plain")
@@ -591,6 +589,9 @@ def plot_curated_alpha_trajectories(
             ax.set_axis_off()
             continue
 
+        max_epochs = max((len(history) for _, _, history in picks if history), default=0)
+        ax.set_title(f"{TASK_LABELS.get(task, task.title())} ({max_epochs} Epochs)")
+
         for layer_name, stage, history in picks:
             progress = np.linspace(0, 100, len(history))
             ax.plot(progress, history, linewidth=1.8, alpha=0.9, label=stage, color=stage_colors.get(stage))
@@ -664,15 +665,26 @@ def plot_paper_convergence_curves(
             if not histories:
                 continue
 
-            min_len = min(len(history) for history in histories)
-            if min_len <= 0:
-                continue
-            stacked = np.array([history[:min_len] for history in histories], dtype=np.float64)
-            mean_loss = stacked.mean(axis=0)
-            epochs = np.arange(1, min_len + 1)
+            lengths = [len(history) for history in histories]
+            max_len = max(lengths)
+            if len(set(lengths)) > 1:
+                print(
+                    f"[Visualizer] Warning: {task}/{activation} seeds have inconsistent "
+                    f"epoch_loss_history lengths {sorted(lengths)} -- likely an interrupted/"
+                    "incomplete run; each seed is only averaged over the epochs it actually has."
+                )
+
+            # Pad shorter (e.g. interrupted) seeds with NaN instead of truncating every seed to
+            # the shortest one -- otherwise one incomplete run would silently cut off an
+            # otherwise-complete curve at its length, hiding exactly how incomplete it was.
+            padded = np.full((len(histories), max_len), np.nan, dtype=np.float64)
+            for row, history in enumerate(histories):
+                padded[row, : len(history)] = history
+            mean_loss = np.nanmean(padded, axis=0)
+            epochs = np.arange(1, max_len + 1)
             ax.plot(epochs, mean_loss, label=f"{label} (n={len(histories)})", linewidth=1.8, color=color)
             if len(histories) > 1:
-                std_loss = stacked.std(axis=0)
+                std_loss = np.nanstd(padded, axis=0)
                 ax.fill_between(epochs, mean_loss - std_loss, mean_loss + std_loss, color=color, alpha=0.15, linewidth=0)
             plotted = True
 
