@@ -937,6 +937,33 @@ def handle_rebuild_summary(args):
     print(f"[IO] Rebuilt summary saved to {summary_path} ({len(all_task_results)} task(s))")
 
 
+# Legacy/alternate top-level task keys to merge into their canonical task, e.g. robustness
+# runs historically split across "corruption_robustness"/"adversarial_robustness" keys.
+TASK_ALIASES = {
+    "robustness": ["corruption_robustness", "adversarial_robustness"],
+}
+
+
+def _normalize_task_alias_keys(data: dict) -> dict:
+    """Merges legacy alias task keys into their canonical task key so a benchmark summary
+    doesn't render duplicate columns/rows for what is really the same task."""
+    normalized = dict(data)
+    for canonical, aliases in TASK_ALIASES.items():
+        candidates = [normalized.get(canonical)] + [normalized.pop(alias, None) for alias in aliases]
+        best = None
+        for candidate in candidates:
+            if not isinstance(candidate, dict):
+                continue
+            if best is None:
+                best = candidate
+            if candidate.get("alpha_golu") and candidate.get("golu_static"):
+                best = candidate
+                break
+        if best is not None:
+            normalized[canonical] = best
+    return normalized
+
+
 def handle_generate_table(args):
     """Generates a publication-ready LaTeX benchmark table from JSON results with bold/underline highlighting."""
     json_path = args.results_path
@@ -947,6 +974,7 @@ def handle_generate_table(args):
     with open(json_path, "r") as f:
         data = json.load(f)
 
+    data = _normalize_task_alias_keys(data)
     tasks = list(data.keys())
     if not tasks:
         print("[Error] Results file contains no tasks.")
@@ -1027,6 +1055,7 @@ def handle_generate_table(args):
 
 
 def _build_benchmark_latex_table(data: dict) -> str:
+    data = _normalize_task_alias_keys(data)
     tasks = list(data.keys())
     if not tasks:
         return "% ===== Auto-Generated Publication LaTeX Benchmark Table =====\n% Empty benchmark results.\n"

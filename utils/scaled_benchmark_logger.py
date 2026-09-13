@@ -47,6 +47,13 @@ TASK_RUN_FOLDER = {
     "robustness": "corruption_robustness",
 }
 
+# Legacy/alternate run folder names to also scan and merge, keyed by canonical task name.
+# "robustness" runs were historically saved under "adversarial_robustness" before the run
+# folder was standardized to "corruption_robustness"; scan both so old runs aren't dropped.
+TASK_RUN_FOLDER_ALIASES = {
+    "robustness": ["adversarial_robustness"],
+}
+
 TASK_METRIC_KEYS = {
     "classification": "accuracy",
     "detection": "map50",
@@ -64,6 +71,15 @@ def _task_run_root(task_name: str, output_root: str | Path = PROJECT_ROOT / "out
     return Path(output_root) / folder
 
 
+def _task_run_roots(task_name: str, output_root: str | Path = PROJECT_ROOT / "outputs" / "runs") -> list[Path]:
+    """Primary run root plus any legacy alias folders for `task_name`, e.g. robustness runs
+    saved under both "corruption_robustness" and the older "adversarial_robustness" name."""
+    roots = [_task_run_root(task_name, output_root)]
+    for alias_folder in TASK_RUN_FOLDER_ALIASES.get(task_name, []):
+        roots.append(Path(output_root) / alias_folder)
+    return roots
+
+
 _SEED_SUFFIX_RE = re.compile(r"_seeds-(\d+)$")
 
 
@@ -75,39 +91,44 @@ def load_results_by_activation(
 ) -> Dict[str, List[Dict[str, Any]]]:
     """Loads the most recent saved results.json per seed for `task_name`, for each activation.
 
+    Scans the primary run folder plus any legacy alias folders (see TASK_RUN_FOLDER_ALIASES),
+    merging by seed so historical runs saved under an older folder name aren't dropped.
+
     Results are ordered by ascending seed number (not by directory timestamp), since two
     activations' run directories are created at unrelated times -- sorting by timestamp would
     silently misalign index i between activations and corrupt any paired-seed comparison
     (e.g. calculate_p_value(..., paired=True)). If a seed has multiple historical run
-    directories (re-runs), only the most recently modified one is used.
+    directories (re-runs, or duplicates across alias folders), only the most recently
+    modified one is used.
     """
-    run_root = _task_run_root(task_name, output_root)
+    run_roots = [root for root in _task_run_roots(task_name, output_root) if root.exists()]
     results_by_activation: Dict[str, List[Dict[str, Any]]] = {activation: [] for activation in activations}
-    if not run_root.exists():
+    if not run_roots:
         return results_by_activation
 
     for activation in activations:
         latest_by_seed: Dict[int, tuple[float, Dict[str, Any]]] = {}
-        for run_dir in run_root.glob(f"*_{task_name}_{activation}_seeds-*"):
-            match = _SEED_SUFFIX_RE.search(run_dir.name)
-            if match is None:
-                continue
-            seed = int(match.group(1))
-            result_path = run_dir / "results.json"
-            if not result_path.exists():
-                continue
-            try:
-                with result_path.open("r", encoding="utf-8") as handle:
-                    payload = json.load(handle)
-            except (OSError, json.JSONDecodeError):
-                continue
-            if not isinstance(payload, dict):
-                continue
+        for run_root in run_roots:
+            for run_dir in run_root.glob(f"*_{task_name}_{activation}_seeds-*"):
+                match = _SEED_SUFFIX_RE.search(run_dir.name)
+                if match is None:
+                    continue
+                seed = int(match.group(1))
+                result_path = run_dir / "results.json"
+                if not result_path.exists():
+                    continue
+                try:
+                    with result_path.open("r", encoding="utf-8") as handle:
+                        payload = json.load(handle)
+                except (OSError, json.JSONDecodeError):
+                    continue
+                if not isinstance(payload, dict):
+                    continue
 
-            mtime = run_dir.stat().st_mtime
-            existing = latest_by_seed.get(seed)
-            if existing is None or mtime >= existing[0]:
-                latest_by_seed[seed] = (mtime, payload)
+                mtime = run_dir.stat().st_mtime
+                existing = latest_by_seed.get(seed)
+                if existing is None or mtime >= existing[0]:
+                    latest_by_seed[seed] = (mtime, payload)
 
         results_by_activation[activation] = [payload for _, payload in (latest_by_seed[seed] for seed in sorted(latest_by_seed))]
 

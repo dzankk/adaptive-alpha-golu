@@ -11,6 +11,7 @@ from pathlib import Path
 from collections import defaultdict
 import numpy as np
 import matplotlib.pyplot as plt
+from matplotlib.patches import Patch
 from typing import Dict, Any
 
 
@@ -31,6 +32,14 @@ LOWER_IS_BETTER = {"diffusion", "language_model", "diffusion_scale", "language_m
 TASK_ORDER = ["classification", "detection", "segmentation", "diffusion", "language_model", "robustness"]
 
 PHASE2_TASK_ORDER = ["classification_scale", "diffusion_scale", "language_model_scale"]
+
+# Legacy/alternate top-level task keys to also check when a benchmark summary or overhead
+# record was produced before the "robustness" run-folder/task-key naming was standardized.
+TASK_ALIASES = {
+    "robustness": ["corruption_robustness", "adversarial_robustness"],
+}
+
+DEFAULT_OVERHEAD_ACTIVATIONS = ["relu", "gelu", "swish", "prelu", "pgelu", "golu_static", "alpha_golu", "adaptive_swish", "swish_adaptive"]
 
 PARAMETRIC_ACTIVATION_ORDER = ["alpha_golu", "prelu", "pgelu", "adaptive_swish", "swish_adaptive"]
 
@@ -151,6 +160,18 @@ def _select_latest_parametric_runs(run_json_paths: list[str], task_name: str | N
     return [(latest[key][1], latest[key][2]) for key in ordered_keys]
 
 
+def _resolve_task_data(results: dict, task: str) -> dict:
+    """Looks up `task` in a benchmark summary dict, falling back to legacy alias keys (see
+    TASK_ALIASES) if the canonical key is missing/incomplete -- e.g. older summaries that
+    split robustness runs across "corruption_robustness"/"adversarial_robustness" keys."""
+    for candidate in [task, *TASK_ALIASES.get(task, [])]:
+        task_data = results.get(candidate)
+        if isinstance(task_data, dict) and task_data.get("alpha_golu") and task_data.get("golu_static"):
+            return task_data
+    task_data = results.get(task, {})
+    return task_data if isinstance(task_data, dict) else {}
+
+
 def plot_parametric_comparison(
     run_json_paths: list[str],
     save_path: str = "outputs/paper_assets/parametric_comparison.png",
@@ -223,7 +244,7 @@ def plot_paper_benchmark_summary(
     raw_pairs = []
 
     for task in task_order:
-        task_data = results.get(task, {})
+        task_data = _resolve_task_data(results, task)
         if not isinstance(task_data, dict):
             continue
         alpha_entry = task_data.get("alpha_golu", {})
@@ -285,8 +306,16 @@ def plot_paper_benchmark_summary(
     return save_path
 
 
-def plot_paper_overhead_summary(overhead_root: str = "outputs/overhead", save_dir: str = "outputs/paper_assets", task_order: list[str] | None = None):
-    """Plots mean forward/backward latency for Alpha-GoLU across tasks from overhead JSON records."""
+def plot_paper_overhead_summary(
+    overhead_root: str = "outputs/overhead",
+    save_dir: str = "outputs/paper_assets",
+    task_order: list[str] | None = None,
+    activations: list[str] | None = None,
+):
+    """Plots mean forward/backward latency per activation, grouped by task, from overhead JSON
+    records. Baselines (e.g. ReLU/GELU/Static GoLU) are plotted alongside Alpha-GoLU whenever
+    their overhead was tracked, so reviewers can judge relative cost; tasks/activations with no
+    tracked records are simply omitted rather than left as empty gaps."""
     root_path = Path(overhead_root)
     if not root_path.exists():
         print(f"[Visualizer] No overhead directory found at {overhead_root}")
@@ -303,39 +332,87 @@ def plot_paper_overhead_summary(overhead_root: str = "outputs/overhead", save_di
         return None
 
     task_order = task_order or TASK_ORDER
-    task_labels = []
-    forward_vals = []
-    backward_vals = []
+    if activations is None:
+        present = {str(record.get("activation_name", record.get("activation", ""))).lower() for record in records}
+        activations = [act for act in DEFAULT_OVERHEAD_ACTIVATIONS if act in present]
+        activations += sorted(present - set(activations))
 
+    def _task_candidates(task: str) -> list[str]:
+        return [task, *TASK_ALIASES.get(task, [])]
+
+    # task -> activation -> (mean_forward_ms, mean_backward_ms)
+    task_activation_latency: dict[str, dict[str, tuple[float, float]]] = {}
     for task in task_order:
-        task_records = [record for record in records if str(record.get("task_name", record.get("task", ""))).lower() == task and str(record.get("activation_name", record.get("activation", ""))).lower() == "alpha_golu"]
-        if not task_records:
-            continue
-        forward = [float(record.get("forward_ms", {}).get("mean", record.get("forward_latency_ms", np.nan))) for record in task_records if isinstance(record, dict)]
-        backward = [float(record.get("backward_ms", {}).get("mean", record.get("backward_latency_ms", np.nan))) for record in task_records if isinstance(record, dict)]
-        forward = [value for value in forward if np.isfinite(value)]
-        backward = [value for value in backward if np.isfinite(value)]
-        if not forward or not backward:
-            continue
-        task_labels.append(TASK_LABELS.get(task, task.title()))
-        forward_vals.append(float(np.mean(forward)))
-        backward_vals.append(float(np.mean(backward)))
+        candidates = _task_candidates(task)
+        per_activation: dict[str, tuple[float, float]] = {}
+        for activation in activations:
+            forward_vals, backward_vals = [], []
+            for record in records:
+                record_task = str(record.get("task_name", record.get("task", ""))).lower()
+                record_act = str(record.get("activation_name", record.get("activation", ""))).lower()
+                if record_task not in candidates or record_act != activation:
+                    continue
+                forward = record.get("forward_ms", {}).get("mean", record.get("forward_latency_ms"))
+                backward = record.get("backward_ms", {}).get("mean", record.get("backward_latency_ms"))
+                if isinstance(forward, (int, float)) and np.isfinite(forward):
+                    forward_vals.append(float(forward))
+                if isinstance(backward, (int, float)) and np.isfinite(backward):
+                    backward_vals.append(float(backward))
+            if forward_vals and backward_vals:
+                per_activation[activation] = (float(np.mean(forward_vals)), float(np.mean(backward_vals)))
+        if per_activation:
+            task_activation_latency[task] = per_activation
 
-    if not task_labels:
+    rendered_tasks = [task for task in task_order if task in task_activation_latency]
+    if not rendered_tasks:
         print(f"[Visualizer] No usable overhead entries found under {overhead_root}")
         return None
 
-    x = np.arange(len(task_labels))
-    width = 0.36
-    fig, ax = plt.subplots(figsize=(12, 5.5))
-    ax.bar(x - width / 2, forward_vals, width, label="Forward", color="#66c2a5")
-    ax.bar(x + width / 2, backward_vals, width, label="Backward", color="#fc8d62")
-    ax.set_xticks(x)
-    ax.set_xticklabels(task_labels, rotation=18, ha="right")
+    bar_width = 0.32
+    intra_gap = 0.12
+    inter_task_gap = 0.9
+    color_cycle = plt.rcParams["axes.prop_cycle"].by_key().get("color", [])
+    act_color_map = {act: color_cycle[i % len(color_cycle)] for i, act in enumerate(activations)}
+
+    fwd_xs, fwd_heights, bwd_xs, bwd_heights, bar_colors = [], [], [], [], []
+    tick_positions, task_labels = [], []
+    cursor = 0.0
+    for task in rendered_tasks:
+        acts_present = [act for act in activations if act in task_activation_latency[task]]
+        group_start = cursor
+        for act in acts_present:
+            forward_ms, backward_ms = task_activation_latency[task][act]
+            fwd_xs.append(cursor)
+            fwd_heights.append(forward_ms)
+            bwd_xs.append(cursor + bar_width)
+            bwd_heights.append(backward_ms)
+            bar_colors.append(act_color_map[act])
+            cursor += 2 * bar_width + intra_gap
+        group_end = cursor - intra_gap
+        tick_positions.append((group_start + group_end) / 2.0)
+        task_labels.append(TASK_LABELS.get(task, task.title()))
+        cursor = group_end + inter_task_gap
+
+    fig, ax = plt.subplots(figsize=(max(12, 2.2 * len(tick_positions)), 5.5))
+    fwd_bars = ax.bar(fwd_xs, fwd_heights, width=bar_width, color=bar_colors, edgecolor="black", linewidth=0.5)
+    bwd_bars = ax.bar(bwd_xs, bwd_heights, width=bar_width, color=bar_colors, edgecolor="black", linewidth=0.5, hatch="//")
+    ax.bar_label(fwd_bars, fmt="%.1f ms", padding=2, fontsize=7, rotation=90)
+    ax.bar_label(bwd_bars, fmt="%.1f ms", padding=2, fontsize=7, rotation=90)
+
+    ax.set_xticks(tick_positions)
+    ax.set_xticklabels(task_labels, rotation=0, ha="center")
     ax.set_ylabel("Latency (ms)")
-    ax.set_title("Alpha-GoLU Runtime Overhead Across Benchmarks")
+    if len(rendered_tasks) == 1:
+        ax.set_title(f"Runtime Overhead: {task_labels[0]}")
+    else:
+        ax.set_title(f"Runtime Overhead Across {len(rendered_tasks)} Benchmarks")
     ax.grid(True, axis="y", alpha=0.25)
-    ax.legend(frameon=False)
+
+    rendered_activations = [act for act in activations if any(act in task_activation_latency[task] for task in rendered_tasks)]
+    legend_handles = [Patch(facecolor=act_color_map[act], edgecolor="black", label=act.replace("_", " ").upper()) for act in rendered_activations]
+    legend_handles.append(Patch(facecolor="white", edgecolor="black", label="Forward"))
+    legend_handles.append(Patch(facecolor="white", edgecolor="black", hatch="//", label="Backward"))
+    ax.legend(handles=legend_handles, frameon=False, ncol=min(4, len(legend_handles)), fontsize=8)
 
     fig.tight_layout()
     os.makedirs(save_dir, exist_ok=True)
