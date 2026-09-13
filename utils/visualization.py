@@ -355,6 +355,82 @@ def plot_paper_benchmark_summary(
     return save_path
 
 
+def plot_benchmark_delta(
+    results_path: str = "outputs/benchmark_results.json",
+    save_dir: str = "outputs/paper_assets",
+    task_order: list[str] | None = None,
+):
+    """Plots Alpha-GoLU's relative % change vs Static GoLU as a SINGLE signed delta bar per task
+    (positive = improvement, negative = regression), instead of two near-full-height 100%-
+    baseline bars. When most tasks sit within a percentage point or two of parity, paired bars
+    both reading ~100% convey almost no information at a glance; a signed delta makes the actual
+    story (ties vs. real gains vs. real regressions) immediately visible."""
+    results = _load_json(results_path)
+    if not results:
+        print(f"[Visualizer] No benchmark summary found at {results_path}")
+        return None
+
+    os.makedirs(save_dir, exist_ok=True)
+    task_order = task_order or TASK_ORDER
+    task_labels, deltas, p_values = [], [], []
+
+    for task in task_order:
+        task_data = _resolve_task_data(results, task)
+        if not isinstance(task_data, dict):
+            continue
+        alpha_entry = task_data.get("alpha_golu", {})
+        static_entry = task_data.get("golu_static", {})
+        if not alpha_entry or not static_entry:
+            continue
+
+        alpha_mean = float(alpha_entry.get("mean", np.nan))
+        static_mean = float(static_entry.get("mean", np.nan))
+        if not np.isfinite(alpha_mean) or not np.isfinite(static_mean) or static_mean == 0 or alpha_mean == 0:
+            continue
+
+        if task in LOWER_IS_BETTER:
+            relative = 100.0 * static_mean / alpha_mean
+        else:
+            relative = 100.0 * alpha_mean / static_mean
+
+        task_labels.append(TASK_LABELS.get(task, task.title()))
+        deltas.append(relative - 100.0)
+        p_values.append(task_data.get("p_value_welch_alpha_vs_static"))
+
+    if not task_labels:
+        print(f"[Visualizer] No usable task entries found in {results_path}")
+        return None
+
+    x = np.arange(len(task_labels))
+    colors = ["#2ca02c" if delta >= 0 else "#d62728" for delta in deltas]
+    fig, ax = plt.subplots(figsize=(11, 5.5))
+    bars = ax.bar(x, deltas, color=colors, edgecolor="black", linewidth=0.5)
+    ax.axhline(0.0, color="#555555", linewidth=1.0)
+
+    for bar, delta, p_value in zip(bars, deltas, p_values):
+        star = _significance_stars(p_value)
+        label = f"{delta:+.1f}%"
+        if star and star != "ns":
+            label = f"{label} {star}"
+        va = "bottom" if delta >= 0 else "top"
+        offset = 4 if delta >= 0 else -4
+        ax.annotate(label, xy=(bar.get_x() + bar.get_width() / 2, delta), xytext=(0, offset), textcoords="offset points", ha="center", va=va, fontsize=9)
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(task_labels, rotation=18, ha="right")
+    ax.set_ylabel("Alpha-GoLU vs Static GoLU (% change, + = better)")
+    ax.set_title("Alpha-GoLU Relative Improvement / Regression by Task")
+    ax.grid(True, axis="y", alpha=0.25)
+    ax.margins(y=0.25)
+
+    fig.tight_layout()
+    save_path = os.path.join(save_dir, "paper_benchmark_delta.png")
+    fig.savefig(save_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[Visualizer] Benchmark delta plot saved to: {save_path}")
+    return save_path
+
+
 def plot_paper_overhead_summary(
     overhead_root: str = "outputs/overhead",
     save_dir: str = "outputs/paper_assets",

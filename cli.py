@@ -36,7 +36,7 @@ from utils.preflight import run_preflight_checks, save_preflight_report
 from utils.data_prep import prepare_all_datasets
 from utils.stats import compute_summary_statistics, calculate_p_value
 from utils.scaled_benchmark_logger import load_results_by_activation, write_significance_report
-from utils.visualization import plot_alpha_distribution, plot_corruption_breakdown, plot_curated_alpha_trajectories, plot_gradient_stability, plot_paper_alpha_trajectories, plot_paper_benchmark_summary, plot_paper_convergence_curves, plot_paper_overhead_summary, plot_parametric_comparison, plot_robustness_retention
+from utils.visualization import plot_alpha_distribution, plot_benchmark_delta, plot_corruption_breakdown, plot_curated_alpha_trajectories, plot_gradient_stability, plot_paper_alpha_trajectories, plot_paper_benchmark_summary, plot_paper_convergence_curves, plot_paper_overhead_summary, plot_parametric_comparison, plot_robustness_retention
 
 TASK_MAP = {
     "classification": run_classification,
@@ -1149,6 +1149,7 @@ def handle_generate_paper_assets(args):
             table_path.write_text(_build_benchmark_latex_table(benchmark_data), encoding="utf-8")
             print(f"[IO] Saved benchmark LaTeX table to {table_path}")
             plot_paper_benchmark_summary(args.results_path, str(output_dir), task_order=args.tasks)
+            plot_benchmark_delta(args.results_path, str(output_dir), task_order=args.tasks)
     else:
         print(f"[Warning] Benchmark results not found at {args.results_path}")
 
@@ -1228,6 +1229,13 @@ def handle_generate_alpha_distribution(args):
     save_path = plot_alpha_distribution(args.runs_root, args.output_dir, activation_name=args.activation, task_order=args.tasks)
     if save_path is None:
         print(f"[Warning] Could not generate alpha distribution plot from {args.runs_root}")
+
+
+def handle_generate_benchmark_delta(args):
+    """Plots Alpha-GoLU's signed relative % change vs Static GoLU as one bar per task."""
+    save_path = plot_benchmark_delta(args.results_path, args.output_dir, task_order=args.tasks)
+    if save_path is None:
+        print(f"[Warning] Could not generate benchmark delta plot from {args.results_path}")
 
 
 def handle_generate_parametric_comparison_plot(args):
@@ -1520,6 +1528,12 @@ def main():
     alpha_dist_parser.add_argument("--activation", type=str, default="alpha_golu", choices=SUPPORTED_ACTIVATIONS, help="Activation to scan for alpha history")
     alpha_dist_parser.add_argument("--tasks", type=str, nargs="+", default=None, choices=TRAJECTORY_TASK_CHOICES, help="Override task list/order (default: Phase 1's 6 tasks; pass the '_scale' names for Phase 2)")
 
+    # Command: generate_benchmark_delta
+    delta_parser = subparsers.add_parser("generate_benchmark_delta", help="Plot Alpha-GoLU's signed relative %% change vs Static GoLU as one bar per task")
+    delta_parser.add_argument("--results-path", type=str, default="outputs/benchmark_results.json", help="Path to benchmark summary JSON")
+    delta_parser.add_argument("--output-dir", type=str, default="outputs/paper_assets", help="Directory where the figure will be written")
+    delta_parser.add_argument("--tasks", type=str, nargs="+", default=None, choices=TRAJECTORY_TASK_CHOICES, help="Override task list/order (default: Phase 1's 6 tasks; pass the '_scale' names for Phase 2)")
+
     # Command: generate_alpha_lr_leaderboard
     leaderboard_parser = subparsers.add_parser("generate_alpha_lr_leaderboard", help="Compare multiple benchmark summaries and rank alpha-lr configs per task")
     leaderboard_parser.add_argument("--results-paths", type=str, nargs="+", default=["outputs/benchmark_results_alpha_lr_1e3.json", "outputs/benchmark_results_alpha_lr_2e3.json", "outputs/benchmark_results.json"], help="Benchmark summary JSON files to compare")
@@ -1563,6 +1577,8 @@ def main():
         handle_generate_gradient_stability(args)
     elif args.command == "generate_alpha_distribution":
         handle_generate_alpha_distribution(args)
+    elif args.command == "generate_benchmark_delta":
+        handle_generate_benchmark_delta(args)
     elif args.command == "generate_alpha_lr_leaderboard":
         handle_generate_alpha_lr_leaderboard(args)
     elif args.command == "preflight":
