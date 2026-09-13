@@ -408,26 +408,27 @@ def plot_paper_overhead_summary(
         task_labels.append(TASK_LABELS.get(task, task.title()))
         cursor = group_end + inter_task_gap
 
-    fig, ax = plt.subplots(figsize=(max(12, 2.2 * len(tick_positions)), 5.5))
+    fig_width = min(max(9.0, 0.9 * cursor), 18.0)
+    fig, ax = plt.subplots(figsize=(fig_width, 5.5))
     fwd_bars = ax.bar(fwd_xs, fwd_heights, width=bar_width, color=bar_colors, edgecolor="black", linewidth=0.5)
     bwd_bars = ax.bar(bwd_xs, bwd_heights, width=bar_width, color=bar_colors, edgecolor="black", linewidth=0.5, hatch="//")
-    ax.bar_label(fwd_bars, fmt="%.1f ms", padding=2, fontsize=7, rotation=90)
-    ax.bar_label(bwd_bars, fmt="%.1f ms", padding=2, fontsize=7, rotation=90)
+    ax.bar_label(fwd_bars, fmt="%.1f", padding=2, fontsize=8, rotation=90)
+    ax.bar_label(bwd_bars, fmt="%.1f", padding=2, fontsize=8, rotation=90)
 
     ax.set_xticks(tick_positions)
-    ax.set_xticklabels(task_labels, rotation=0, ha="center")
-    ax.set_ylabel("Latency (ms)")
+    ax.set_xticklabels(task_labels, rotation=0, ha="center", fontsize=11)
+    ax.set_ylabel("Latency (ms)", fontsize=12)
     if len(rendered_tasks) == 1:
-        ax.set_title(f"Runtime Overhead: {task_labels[0]}")
+        ax.set_title(f"Runtime Overhead: {task_labels[0]}", fontsize=14)
     else:
-        ax.set_title(f"Runtime Overhead Across {len(rendered_tasks)} Benchmarks")
+        ax.set_title(f"Runtime Overhead Across {len(rendered_tasks)} Benchmarks", fontsize=14)
     ax.grid(True, axis="y", alpha=0.25)
 
     rendered_activations = [act for act in activations if any(act in task_activation_latency[task] for task in rendered_tasks)]
     legend_handles = [Patch(facecolor=act_color_map[act], edgecolor="black", label=act.replace("_", " ").upper()) for act in rendered_activations]
     legend_handles.append(Patch(facecolor="white", edgecolor="black", label="Forward"))
     legend_handles.append(Patch(facecolor="white", edgecolor="black", hatch="//", label="Backward"))
-    ax.legend(handles=legend_handles, frameon=False, ncol=min(4, len(legend_handles)), fontsize=8)
+    fig.legend(handles=legend_handles, loc="lower center", bbox_to_anchor=(0.5, -0.1), ncol=min(5, len(legend_handles)), frameon=False, fontsize=10)
 
     fig.tight_layout()
     os.makedirs(save_dir, exist_ok=True)
@@ -694,27 +695,55 @@ def plot_corruption_breakdown(
 
     corruption_names = sorted(corruption_names, key=lambda name: (name != "clean", name))
     rendered_activations = [act for act in activations if act in activation_means]
+    corruption_types = [name for name in corruption_names if name != "clean"]
+    has_clean = "clean" in corruption_names
 
-    x = np.arange(len(corruption_names))
     n_acts = max(len(rendered_activations), 1)
-    width = 0.8 / n_acts
     color_cycle = plt.rcParams["axes.prop_cycle"].by_key().get("color", [])
+    act_color_map = {act: color_cycle[i % len(color_cycle)] for i, act in enumerate(rendered_activations)}
+    width = 0.8 / n_acts
 
-    fig, ax = plt.subplots(figsize=(max(10, 1.8 * len(corruption_names) * n_acts), 5.5))
+    # Clean accuracy sits on a much higher scale than corrupted accuracy, so it gets its own
+    # panel instead of a bar cluster competing with the corruption-type clusters for the same
+    # y-axis (which used to squash all corruption bars into the bottom quarter of the plot).
+    fig_width = min(max(9.0, 1.3 * len(corruption_types) * n_acts), 16.0)
+    if has_clean:
+        fig, (ax_clean, ax_corrupt) = plt.subplots(
+            1, 2, figsize=(fig_width, 5.5), gridspec_kw={"width_ratios": [1, max(2.0, len(corruption_types))]}
+        )
+    else:
+        fig, ax_corrupt = plt.subplots(figsize=(fig_width, 5.5))
+        ax_clean = None
+
+    if ax_clean is not None:
+        clean_x = np.arange(n_acts)
+        clean_heights = [activation_means[act].get("clean", 0.0) for act in rendered_activations]
+        clean_bars = ax_clean.bar(clean_x, clean_heights, color=[act_color_map[act] for act in rendered_activations])
+        ax_clean.bar_label(clean_bars, fmt="%.1f", padding=2, fontsize=9)
+        ax_clean.set_xticks(clean_x)
+        ax_clean.set_xticklabels([act.replace("_", " ").upper() for act in rendered_activations], rotation=45, ha="right", fontsize=9)
+        ax_clean.set_ylabel("Accuracy (%)", fontsize=12)
+        ax_clean.set_title("Clean", fontsize=13)
+        ax_clean.grid(True, axis="y", alpha=0.25)
+
+    x = np.arange(len(corruption_types))
     for i, act in enumerate(rendered_activations):
-        raw_values = [activation_means[act].get(name) for name in corruption_names]
+        raw_values = [activation_means[act].get(name) for name in corruption_types]
         heights = [value if value is not None else 0.0 for value in raw_values]
         labels = [f"{value:.1f}" if value is not None else "" for value in raw_values]
         offsets = x - 0.4 + width * (i + 0.5)
-        bars = ax.bar(offsets, heights, width=width, label=act.replace("_", " ").upper(), color=color_cycle[i % len(color_cycle)])
-        ax.bar_label(bars, labels=labels, padding=2, fontsize=7, rotation=90)
+        bars = ax_corrupt.bar(offsets, heights, width=width, label=act.replace("_", " ").upper(), color=act_color_map[act])
+        ax_corrupt.bar_label(bars, labels=labels, padding=2, fontsize=9, rotation=90)
 
-    ax.set_xticks(x)
-    ax.set_xticklabels([name.replace("_", " ").title() for name in corruption_names], rotation=0, ha="center")
-    ax.set_ylabel("Accuracy (%)")
-    ax.set_title("Robustness Breakdown by Corruption Type")
-    ax.grid(True, axis="y", alpha=0.25)
-    ax.legend(frameon=False, ncol=min(4, n_acts), fontsize=8)
+    ax_corrupt.set_xticks(x)
+    ax_corrupt.set_xticklabels([name.replace("_", " ").title() for name in corruption_types], rotation=0, ha="center", fontsize=11)
+    ax_corrupt.set_ylabel("Accuracy (%)", fontsize=12)
+    ax_corrupt.set_title("Under Corruption", fontsize=13)
+    ax_corrupt.grid(True, axis="y", alpha=0.25)
+
+    fig.suptitle("Robustness Breakdown by Corruption Type", fontsize=15, y=1.04)
+    handles, labels = ax_corrupt.get_legend_handles_labels()
+    fig.legend(handles, labels, loc="lower center", bbox_to_anchor=(0.5, -0.08), ncol=min(4, n_acts), frameon=False, fontsize=10)
 
     fig.tight_layout()
     os.makedirs(save_dir, exist_ok=True)
