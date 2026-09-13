@@ -72,7 +72,17 @@ def _load_json(path: str | Path) -> dict:
     return payload if isinstance(payload, dict) else {}
 
 
-def _find_latest_task_result(runs_root: str | Path, task_name: str, activation_name: str = "alpha_golu") -> dict:
+def _find_latest_task_result(
+    runs_root: str | Path,
+    task_name: str,
+    activation_name: str = "alpha_golu",
+    required_field: str | None = None,
+) -> dict:
+    """Finds the most recent results.json for (task_name, activation_name). If `required_field`
+    is given, prefers the most recent run that actually has a non-empty value for that field --
+    otherwise a single stale/partial run (e.g. an interrupted re-run, or one saved by an older
+    code version that predates a given field) being the newest by mtime would silently blank out
+    a plot even though older runs for the same task/activation have perfectly good data."""
     root_path = Path(runs_root)
     if not root_path.exists():
         return {}
@@ -92,6 +102,10 @@ def _find_latest_task_result(runs_root: str | Path, task_name: str, activation_n
     if not candidates:
         return {}
     candidates.sort(key=lambda item: item[0], reverse=True)
+    if required_field:
+        for _, payload in candidates:
+            if payload.get(required_field):
+                return payload
     return candidates[0][1]
 
 
@@ -444,7 +458,7 @@ def plot_paper_alpha_trajectories(
     used_axes = 0
 
     for task in task_order:
-        result = _find_latest_task_result(root_path, task, activation_name=activation_name)
+        result = _find_latest_task_result(root_path, task, activation_name=activation_name, required_field="alpha_history")
         ax = axes[used_axes]
         used_axes += 1
         if not result:
@@ -533,7 +547,7 @@ def plot_curated_alpha_trajectories(
     for ax, task in zip(axes, task_order):
         ax.set_title(TASK_LABELS.get(task, task.title()))
 
-        result = _find_latest_task_result(root_path, task, activation_name=activation_name)
+        result = _find_latest_task_result(root_path, task, activation_name=activation_name, required_field="alpha_history")
         alpha_history = result.get("alpha_history") if result else None
         if not isinstance(alpha_history, dict) or not alpha_history:
             ax.text(0.5, 0.5, "No alpha history", ha="center", va="center", transform=ax.transAxes)
@@ -597,7 +611,7 @@ def plot_paper_convergence_curves(
             (baseline_activation, "Static GoLU", "#8da0cb"),
             (proposed_activation, "Alpha-GoLU", "#fc8d62"),
         ):
-            result = _find_latest_task_result(root_path, task, activation_name=activation)
+            result = _find_latest_task_result(root_path, task, activation_name=activation, required_field="epoch_loss_history")
             history = result.get("epoch_loss_history") if result else None
             if not isinstance(history, list) or not history:
                 continue
