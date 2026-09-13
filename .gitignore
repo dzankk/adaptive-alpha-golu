@@ -18,7 +18,8 @@ data/
 *.pth
 *.pt
 *.checkpoint
-outputs/
+outputs/*
+!outputs/paper_assets/
 
 # Ignore raw datasets
 data/
