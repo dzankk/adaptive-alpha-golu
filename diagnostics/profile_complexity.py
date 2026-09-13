@@ -31,7 +31,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from experiments.run_classification import ResNet18 as ClassificationResNet18
 from experiments.run_detection import VOC_CLASSES, build_detection_model
 from experiments.run_language_model import MiniGPT, build_language_model_dataloaders
-from experiments.run_segmentation import UNet, VOC_SEG_CLASSES
+from experiments.run_segmentation import ImageNetBackboneDeepLabV3, VOC_SEG_CLASSES
 from utils.overhead_tracker import OverheadTracker
 
 try:
@@ -135,7 +135,7 @@ def build_model(task_name: str, activation: str, device: torch.device, lm_vocab_
     if task_name == "detection":
         return build_detection_model(act_type=activation, num_classes=len(VOC_CLASSES) + 1).to(device)
     if task_name == "segmentation":
-        return UNet(act_type=activation, num_classes=VOC_SEG_CLASSES).to(device)
+        return ImageNetBackboneDeepLabV3(act_type=activation, num_classes=VOC_SEG_CLASSES).to(device)
     if task_name == "language_model":
         return MiniGPT(vocab_size=lm_vocab_size, act_type=activation, max_seq_len=64).to(device)
     raise ValueError(f"Unknown task: {task_name}")
