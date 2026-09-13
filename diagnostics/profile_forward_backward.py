@@ -27,6 +27,15 @@ if str(PROJECT_ROOT) not in sys.path:
 from diagnostics.profile_complexity import TASK_SPECS, build_model, build_sample, training_loss
 
 
+def _self_device_time(event) -> float:
+    """self_cuda_time_total was renamed to self_device_time_total in newer PyTorch
+    (profiler generalized for non-CUDA accelerators); support both."""
+    value = getattr(event, "self_device_time_total", None)
+    if value is None:
+        value = getattr(event, "self_cuda_time_total", 0)
+    return float(value)
+
+
 def profile_forward_backward(task_name: str, activation: str, device: torch.device, warmup: int = 5, measured: int = 10) -> None:
     lm_vocab_size = 1000
     model = build_model(task_name, activation, device, lm_vocab_size)
@@ -49,19 +58,28 @@ def profile_forward_backward(task_name: str, activation: str, device: torch.devi
             model.zero_grad(set_to_none=True)
             with record_function("forward_pass"):
                 loss = training_loss(task_name, model, sample, lm_vocab_size)
+            # Sync at each region boundary so async CUDA kernels from one named region can't
+            # still be in flight (and get misattributed) when the next region starts -- without
+            # this, forward/backward (and successive iterations) can bleed into each other and
+            # produce duplicate/inflated (>100% self time) entries for the same region name.
+            if device.type == "cuda":
+                torch.cuda.synchronize(device)
             with record_function("backward_pass"):
                 loss.backward()
-        if device.type == "cuda":
-            torch.cuda.synchronize(device)
+            if device.type == "cuda":
+                torch.cuda.synchronize(device)
 
     key_averages = prof.key_averages()
-    time_key = "self_cuda_time_total" if device.type == "cuda" else "self_cpu_time_total"
-    forward_us = sum(getattr(event, time_key, 0) for event in key_averages if event.key == "forward_pass")
-    backward_us = sum(getattr(event, time_key, 0) for event in key_averages if event.key == "backward_pass")
+    forward_us = sum(_self_device_time(event) for event in key_averages if event.key == "forward_pass")
+    backward_us = sum(_self_device_time(event) for event in key_averages if event.key == "backward_pass")
+    time_label = "self_device_time_total (CUDA)" if device.type == "cuda" else "self_cpu_time_total"
+    if device.type != "cuda":
+        forward_us = sum(getattr(event, "self_cpu_time_total", 0) for event in key_averages if event.key == "forward_pass")
+        backward_us = sum(getattr(event, "self_cpu_time_total", 0) for event in key_averages if event.key == "backward_pass")
 
     print(f"\n=== {task_name} / {activation} on {device} (n={measured} measured iters, {warmup} warmup) ===")
-    print(f"Forward:  {forward_us / measured / 1000:.3f} ms/iter  ({time_key}, torch.profiler ground truth)")
-    print(f"Backward: {backward_us / measured / 1000:.3f} ms/iter  ({time_key}, torch.profiler ground truth)")
+    print(f"Forward:  {forward_us / measured / 1000:.3f} ms/iter  ({time_label}, torch.profiler ground truth)")
+    print(f"Backward: {backward_us / measured / 1000:.3f} ms/iter  ({time_label}, torch.profiler ground truth)")
 
     sort_key = "cuda_time_total" if device.type == "cuda" else "cpu_time_total"
     print(f"\nTop ops by {sort_key}:")
