@@ -114,9 +114,10 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Verify forward/backward timing using torch.profiler (ground truth, independent of the custom OverheadTracker timer)"
     )
-    parser.add_argument("--task", type=str, default="detection", choices=list(TASK_SPECS.keys()))
+    parser.add_argument("--task", type=str, default=None, choices=list(TASK_SPECS.keys()), help="Single task to profile (default: use --tasks instead)")
+    parser.add_argument("--tasks", type=str, nargs="+", default=None, choices=list(TASK_SPECS.keys()), help="Profile every one of these tasks in a single run (default: just --task, or detection if neither is given)")
     parser.add_argument("--activation", type=str, default=None, help="Single activation to profile (default: use --activations instead)")
-    parser.add_argument("--activations", type=str, nargs="+", default=None, choices=ACTIVATIONS, help="Profile every one of these activations for --task in a single run (default: just --activation, or alpha_golu if neither is given)")
+    parser.add_argument("--activations", type=str, nargs="+", default=None, choices=ACTIVATIONS, help="Profile every one of these activations for each task in a single run (default: just --activation, or alpha_golu if neither is given)")
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--iters", type=int, default=10)
     parser.add_argument("--save", action="store_true", help="Write each (task, activation) result into outputs/overhead/ in the schema plot_paper_overhead_summary expects")
@@ -124,35 +125,38 @@ def main() -> None:
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    tasks = args.tasks or [args.task or "detection"]
     activations = args.activations or [args.activation or "alpha_golu"]
+    verbose = len(tasks) == 1 and len(activations) == 1
 
-    results = []
-    for activation in activations:
-        forward_ms, backward_ms = measure_forward_backward(
-            args.task, activation, device, warmup=args.warmup, measured=args.iters, verbose=(len(activations) == 1)
-        )
-        results.append((activation, forward_ms, backward_ms))
-        if args.save:
-            timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
-            overhead_root = Path(args.overhead_root)
-            write_json(
-                overhead_root / f"{timestamp}_{args.task}_{activation}_profiler.json",
-                {
-                    "task_name": args.task,
-                    "activation_name": activation,
-                    "forward_ms": {"mean": forward_ms},
-                    "backward_ms": {"mean": backward_ms},
-                    "source": "diagnostics.profile_forward_backward (torch.profiler)",
-                },
+    for task in tasks:
+        results = []
+        for activation in activations:
+            forward_ms, backward_ms = measure_forward_backward(
+                task, activation, device, warmup=args.warmup, measured=args.iters, verbose=verbose
             )
+            results.append((activation, forward_ms, backward_ms))
+            if args.save:
+                timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+                overhead_root = Path(args.overhead_root)
+                write_json(
+                    overhead_root / f"{timestamp}_{task}_{activation}_profiler.json",
+                    {
+                        "task_name": task,
+                        "activation_name": activation,
+                        "forward_ms": {"mean": forward_ms},
+                        "backward_ms": {"mean": backward_ms},
+                        "source": "diagnostics.profile_forward_backward (torch.profiler)",
+                    },
+                )
 
-    if len(activations) > 1:
-        print(f"\n=== Summary: {args.task} on {device} ===")
-        print(f"{'Activation':<16} {'Forward (ms)':>14} {'Backward (ms)':>15}")
-        for activation, forward_ms, backward_ms in results:
-            print(f"{activation:<16} {forward_ms:>14.3f} {backward_ms:>15.3f}")
-        if args.save:
-            print(f"\n[IO] Saved {len(results)} record(s) to {args.overhead_root}")
+        if not verbose:
+            print(f"\n=== Summary: {task} on {device} ===")
+            print(f"{'Activation':<16} {'Forward (ms)':>14} {'Backward (ms)':>15}")
+            for activation, forward_ms, backward_ms in results:
+                print(f"{activation:<16} {forward_ms:>14.3f} {backward_ms:>15.3f}")
+            if args.save:
+                print(f"[IO] Saved {len(results)} record(s) to {args.overhead_root}")
 
 
 if __name__ == "__main__":
