@@ -187,6 +187,19 @@ def _resolve_task_data(results: dict, task: str) -> dict:
     return task_data if isinstance(task_data, dict) else {}
 
 
+def _significance_stars(p_value) -> str:
+    """Standard significance-star convention: *** p<0.001, ** p<0.01, * p<0.05, ns otherwise."""
+    if not isinstance(p_value, (int, float)) or not np.isfinite(p_value):
+        return ""
+    if p_value < 0.001:
+        return "***"
+    if p_value < 0.01:
+        return "**"
+    if p_value < 0.05:
+        return "*"
+    return "ns"
+
+
 def plot_parametric_comparison(
     run_json_paths: list[str],
     save_path: str = "outputs/paper_assets/parametric_comparison.png",
@@ -257,6 +270,7 @@ def plot_paper_benchmark_summary(
     static_values = []
     task_labels = []
     raw_pairs = []
+    p_values = []
 
     for task in task_order:
         task_data = _resolve_task_data(results, task)
@@ -282,6 +296,7 @@ def plot_paper_benchmark_summary(
         alpha_values.append(alpha_relative)
         task_labels.append(TASK_LABELS.get(task, task.title()))
         raw_pairs.append((static_mean, alpha_mean))
+        p_values.append(task_data.get("p_value_welch_alpha_vs_static"))
 
     if not task_labels:
         print(f"[Visualizer] No usable task entries found in {results_path}")
@@ -294,10 +309,14 @@ def plot_paper_benchmark_summary(
     bars_alpha = ax.bar(x + width / 2, alpha_values, width, label="Alpha-GoLU", color="#fc8d62")
     ax.axhline(100.0, color="#555555", linestyle="--", linewidth=1.0)
 
-    for bar_static, bar_alpha, (static_raw, alpha_raw) in zip(bars_static, bars_alpha, raw_pairs):
+    for bar_static, bar_alpha, (static_raw, alpha_raw), p_value in zip(bars_static, bars_alpha, raw_pairs, p_values):
         top = max(bar_static.get_height(), bar_alpha.get_height())
+        star = _significance_stars(p_value)
+        label = f"{static_raw:.3g} / {alpha_raw:.3g}"
+        if star:
+            label = f"{label}\n{star}"
         ax.annotate(
-            f"{static_raw:.3g} / {alpha_raw:.3g}",
+            label,
             xy=((bar_static.get_x() + bar_alpha.get_x() + bar_alpha.get_width()) / 2, top),
             xytext=(0, 4),
             textcoords="offset points",
@@ -312,6 +331,7 @@ def plot_paper_benchmark_summary(
     ax.set_title("Alpha-GoLU vs Static GoLU Across Benchmarks")
     ax.grid(True, axis="y", alpha=0.25)
     ax.legend(frameon=False)
+    ax.margins(y=0.12)
 
     fig.tight_layout()
     save_path = os.path.join(save_dir, "paper_benchmark_summary.png")
@@ -478,12 +498,14 @@ def plot_paper_alpha_trajectories(
         for layer_name, history in alpha_history.items():
             if not history:
                 continue
-            ax.plot(history, linewidth=1.6, alpha=0.85, label=layer_name)
+            progress = np.linspace(0, 100, len(history))
+            ax.plot(progress, history, linewidth=1.6, alpha=0.85, label=layer_name)
 
         ax.axhline(1.0, color="#d62728", linestyle="--", linewidth=1.2, label="alpha = 1.0")
         ax.set_title(TASK_LABELS.get(task, task.title()))
-        ax.set_xlabel("Epoch")
+        ax.set_xlabel("Training Progress (%)")
         ax.set_ylabel(r"$\alpha$")
+        ax.ticklabel_format(axis="y", useOffset=False, style="plain")
         ax.grid(True, alpha=0.25)
 
     for ax in axes[used_axes:]:
@@ -503,7 +525,7 @@ def plot_paper_alpha_trajectories(
 
 
 def _select_representative_layers(alpha_history: dict, num_layers: int = 3) -> list[tuple[str, str, list]]:
-    """Picks up to num_layers representative layers (Early/Mid/Late) from an alpha_history dict,
+    """Picks up to num_layers representative layers (Early/.../Late) from an alpha_history dict,
     spread evenly across insertion order (a proxy for network depth)."""
     layer_names = [name for name, history in alpha_history.items() if history]
     if not layer_names:
@@ -515,10 +537,18 @@ def _select_representative_layers(alpha_history: dict, num_layers: int = 3) -> l
         indices = sorted({round(i * (len(layer_names) - 1) / (num_layers - 1)) for i in range(num_layers)})
 
     stage_labels = ["Early", "Mid", "Late"] if num_layers == 3 else [f"Layer {rank + 1}" for rank in range(num_layers)]
+    n_picked = len(indices)
     picks = []
     for rank, idx in enumerate(indices):
         name = layer_names[idx]
-        stage = stage_labels[rank] if rank < len(stage_labels) else f"Layer {rank + 1}"
+        if n_picked == 1:
+            stage = stage_labels[0]
+        else:
+            # Map proportionally across the full stage-label range (e.g. only 2 layers found
+            # should be labeled "Early"/"Late", not "Early"/"Mid" -- picking stage_labels[rank]
+            # directly would mislabel the last available layer as "Mid" and silently drop "Late".
+            stage_idx = round(rank * (len(stage_labels) - 1) / (n_picked - 1))
+            stage = stage_labels[stage_idx] if stage_idx < len(stage_labels) else f"Layer {rank + 1}"
         picks.append((name, stage, alpha_history[name]))
     return picks
 
@@ -562,16 +592,25 @@ def plot_curated_alpha_trajectories(
             continue
 
         for layer_name, stage, history in picks:
-            ax.plot(history, linewidth=1.8, alpha=0.9, label=f"{stage} ({layer_name})", color=stage_colors.get(stage))
+            progress = np.linspace(0, 100, len(history))
+            ax.plot(progress, history, linewidth=1.8, alpha=0.9, label=stage, color=stage_colors.get(stage))
 
         ax.axhline(1.0, color="#d62728", linestyle="--", linewidth=1.2, label=r"Baseline Static ($\alpha=1.0$)")
-        ax.set_xlabel("Epoch")
+        ax.set_xlabel("Training Progress (%)")
         ax.set_ylabel(r"$\alpha$")
+        ax.ticklabel_format(axis="y", useOffset=False, style="plain")
         ax.grid(True, alpha=0.25)
-        ax.legend(fontsize=8, frameon=False)
 
     for ax in axes[len(task_order):]:
         ax.set_axis_off()
+
+    # One shared legend (stage colors are identical across every subplot) instead of a
+    # per-subplot legend with full module paths, which was tiny and collided with the curves.
+    legend_handles = [Patch(facecolor=color, label=stage) for stage, color in stage_colors.items()]
+    legend_handles.append(
+        plt.Line2D([0], [0], color="#d62728", linestyle="--", linewidth=1.2, label=r"Baseline Static ($\alpha=1.0$)")
+    )
+    fig.legend(handles=legend_handles, loc="lower center", bbox_to_anchor=(0.5, -0.05), ncol=len(legend_handles), frameon=False, fontsize=10)
 
     fig.suptitle("Alpha-GoLU Curated Trajectories (Early / Mid / Late Layers)", y=1.02, fontsize=16)
     fig.tight_layout()
@@ -768,6 +807,63 @@ def plot_corruption_breakdown(
     fig.savefig(save_path, dpi=300, bbox_inches="tight")
     plt.close(fig)
     print(f"[Visualizer] Corruption breakdown chart saved to: {save_path}")
+    return save_path
+
+
+def plot_robustness_retention(
+    runs_root: str = "outputs/runs",
+    save_dir: str = "outputs/paper_assets",
+    activations: list[str] | None = None,
+):
+    """Bar chart of each activation's Robustness Retention Ratio (mean corruption accuracy /
+    mean clean accuracy x 100), averaged across seeds via load_results_by_activation. A single
+    aggregate robustness score conflates "starts higher" with "degrades less" -- this isolates
+    the degradation rate so a higher retention ratio means an activation keeps more of its clean
+    performance once corrupted, regardless of its raw clean-accuracy level."""
+    from utils.scaled_benchmark_logger import load_results_by_activation
+
+    activations = activations or DEFAULT_OVERHEAD_ACTIVATIONS
+    results_by_activation = load_results_by_activation("robustness", activations, output_root=runs_root)
+
+    retention_by_activation: dict[str, float] = {}
+    for act, payloads in results_by_activation.items():
+        clean_values = [float(p["clean_acc"]) for p in payloads if isinstance(p.get("clean_acc"), (int, float))]
+        corruption_values = [float(p["corruption_acc"]) for p in payloads if isinstance(p.get("corruption_acc"), (int, float))]
+        if not clean_values or not corruption_values:
+            continue
+        mean_clean = float(np.mean(clean_values))
+        mean_corruption = float(np.mean(corruption_values))
+        if mean_clean <= 0:
+            continue
+        retention_by_activation[act] = 100.0 * mean_corruption / mean_clean
+
+    if not retention_by_activation:
+        print(f"[Visualizer] No robustness clean/corruption accuracy pairs found under {runs_root}")
+        return None
+
+    rendered_activations = [act for act in activations if act in retention_by_activation]
+    color_cycle = plt.rcParams["axes.prop_cycle"].by_key().get("color", [])
+
+    fig_width = min(max(7.0, 1.1 * len(rendered_activations)), 12.0)
+    fig, ax = plt.subplots(figsize=(fig_width, 5.5))
+    heights = [retention_by_activation[act] for act in rendered_activations]
+    colors = [color_cycle[i % len(color_cycle)] for i in range(len(rendered_activations))]
+    bars = ax.bar(range(len(rendered_activations)), heights, color=colors, edgecolor="black", linewidth=0.5)
+    ax.bar_label(bars, fmt="%.1f%%", padding=3, fontsize=10)
+
+    ax.set_xticks(range(len(rendered_activations)))
+    ax.set_xticklabels([act.replace("_", " ").upper() for act in rendered_activations], rotation=30, ha="right", fontsize=11)
+    ax.set_ylabel("Retention Ratio (%) = Corruption Acc / Clean Acc", fontsize=12)
+    ax.set_title("Robustness Retention Ratio by Activation", fontsize=14)
+    ax.grid(True, axis="y", alpha=0.25)
+    ax.margins(y=0.12)
+
+    fig.tight_layout()
+    os.makedirs(save_dir, exist_ok=True)
+    save_path = os.path.join(save_dir, "paper_robustness_retention.png")
+    fig.savefig(save_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[Visualizer] Robustness retention ratio chart saved to: {save_path}")
     return save_path
 
 
