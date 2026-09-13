@@ -77,12 +77,13 @@ def _find_latest_task_result(runs_root: str | Path, task_name: str, activation_n
     if not root_path.exists():
         return {}
 
+    candidate_task_names = {task_name, *TASK_ALIASES.get(task_name, [])}
     candidates = []
     for result_path in root_path.rglob("results.json"):
         payload = _load_json(result_path)
         if not payload:
             continue
-        if str(payload.get("task", "")).lower() != task_name:
+        if str(payload.get("task", "")).lower() not in candidate_task_names:
             continue
         if str(payload.get("activation", payload.get("activation_name", ""))).lower() != activation_name:
             continue
@@ -563,6 +564,72 @@ def plot_curated_alpha_trajectories(
     fig.savefig(save_path, dpi=300, bbox_inches="tight")
     plt.close(fig)
     print(f"[Visualizer] Curated alpha trajectory dashboard saved to: {save_path}")
+    return save_path
+
+
+def plot_paper_convergence_curves(
+    runs_root: str = "outputs/runs",
+    save_dir: str = "outputs/paper_assets",
+    task_order: list[str] | None = None,
+    baseline_activation: str = "golu_static",
+    proposed_activation: str = "alpha_golu",
+):
+    """Plots per-task training-loss convergence curves comparing baseline vs proposed activation
+    (default: Static GoLU vs Alpha-GoLU), one subplot per task, using each activation's most
+    recent saved `epoch_loss_history`. Complements the final-metric summary bar chart by showing
+    *how* training progressed, not just the end result."""
+    root_path = Path(runs_root)
+    if not root_path.exists():
+        print(f"[Visualizer] No runs directory found at {runs_root}")
+        return None
+
+    os.makedirs(save_dir, exist_ok=True)
+    task_order = task_order or TASK_ORDER
+    rows, cols = _grid_shape(len(task_order))
+    fig, axes = plt.subplots(rows, cols, figsize=(5 * cols, 4 * rows), sharex=False)
+    axes = np.atleast_1d(axes).flatten()
+
+    rendered = 0
+    for ax, task in zip(axes, task_order):
+        ax.set_title(TASK_LABELS.get(task, task.title()))
+        plotted = False
+        for activation, label, color in (
+            (baseline_activation, "Static GoLU", "#8da0cb"),
+            (proposed_activation, "Alpha-GoLU", "#fc8d62"),
+        ):
+            result = _find_latest_task_result(root_path, task, activation_name=activation)
+            history = result.get("epoch_loss_history") if result else None
+            if not isinstance(history, list) or not history:
+                continue
+            epochs = np.arange(1, len(history) + 1)
+            ax.plot(epochs, history, label=label, linewidth=1.8, color=color)
+            plotted = True
+
+        if not plotted:
+            ax.text(0.5, 0.5, "No loss history", ha="center", va="center", transform=ax.transAxes)
+            ax.set_axis_off()
+            continue
+
+        rendered += 1
+        ax.set_xlabel("Epoch")
+        ax.set_ylabel("Training Loss")
+        ax.grid(True, alpha=0.25)
+        ax.legend(frameon=False, fontsize=8)
+
+    for ax in axes[len(task_order):]:
+        ax.set_axis_off()
+
+    if rendered == 0:
+        plt.close(fig)
+        print(f"[Visualizer] No usable loss-history entries found under {runs_root}")
+        return None
+
+    fig.suptitle("Training Loss Convergence: Static GoLU vs Alpha-GoLU", y=1.02, fontsize=16)
+    fig.tight_layout()
+    save_path = os.path.join(save_dir, "paper_convergence_curves.png")
+    fig.savefig(save_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[Visualizer] Convergence curves saved to: {save_path}")
     return save_path
 
 
