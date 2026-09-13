@@ -12,6 +12,7 @@ from collections import defaultdict
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.patches import Patch
+from matplotlib.ticker import MaxNLocator
 from typing import Dict, Any
 
 
@@ -847,14 +848,28 @@ def plot_alpha_distribution(
             continue
 
         mean_final = float(np.mean(final_values))
-        ax.hist(final_values, bins=min(15, max(5, len(final_values))), color="#7570b3", edgecolor="black", alpha=0.85)
+        n_layers = len(final_values)
+        # A histogram looks blocky/misleading with very few points (thin unfilled-looking bars,
+        # a mean line stranded in empty space between spikes) -- show individual points as a
+        # strip plot instead once there are too few layers for bins to be meaningful.
+        if n_layers <= 5:
+            jitter = np.random.default_rng(0).uniform(-0.08, 0.08, size=n_layers)
+            ax.scatter(final_values, 0.5 + jitter, s=90, color="#7570b3", edgecolor="black", linewidth=0.6, zorder=3)
+            ax.set_ylim(0, 1)
+            ax.set_yticks([])
+            ax.set_ylabel("Individual Layers")
+        else:
+            ax.hist(final_values, bins=min(15, max(5, n_layers)), color="#7570b3", edgecolor="black", alpha=0.85)
+            ax.yaxis.set_major_locator(MaxNLocator(integer=True))
+            ax.set_ylabel("Layer Count")
+
         ax.axvline(1.0, color="#d62728", linestyle="--", linewidth=1.2, label=r"Static ($\alpha=1.0$)")
         ax.axvline(mean_final, color="#1b9e77", linestyle="-", linewidth=1.5, label=f"Mean={mean_final:.3f}")
-        ax.set_title(f"{TASK_LABELS.get(task, task.title())} (n={len(final_values)} layers)")
+        ax.set_title(f"{TASK_LABELS.get(task, task.title())} (n={n_layers} layers)")
         ax.set_xlabel(r"Final $\alpha$")
-        ax.set_ylabel("Layer Count")
         ax.ticklabel_format(axis="x", useOffset=False, style="plain")
-        ax.legend(fontsize=8, frameon=False)
+        ax.margins(y=0.2)
+        ax.legend(fontsize=8, frameon=False, loc="upper right")
         ax.grid(True, alpha=0.25)
         rendered += 1
 
