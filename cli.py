@@ -36,7 +36,7 @@ from utils.preflight import run_preflight_checks, save_preflight_report
 from utils.data_prep import prepare_all_datasets
 from utils.stats import compute_summary_statistics, calculate_p_value
 from utils.scaled_benchmark_logger import load_results_by_activation, write_significance_report
-from utils.visualization import plot_corruption_breakdown, plot_curated_alpha_trajectories, plot_paper_alpha_trajectories, plot_paper_benchmark_summary, plot_paper_convergence_curves, plot_paper_overhead_summary, plot_parametric_comparison, plot_robustness_retention
+from utils.visualization import plot_alpha_distribution, plot_corruption_breakdown, plot_curated_alpha_trajectories, plot_gradient_stability, plot_paper_alpha_trajectories, plot_paper_benchmark_summary, plot_paper_convergence_curves, plot_paper_overhead_summary, plot_parametric_comparison, plot_robustness_retention
 
 TASK_MAP = {
     "classification": run_classification,
@@ -1152,6 +1152,8 @@ def handle_generate_paper_assets(args):
     plot_paper_alpha_trajectories(args.runs_root, str(output_dir), activation_name=args.activation, task_order=args.tasks)
     plot_curated_alpha_trajectories(args.runs_root, str(output_dir), activation_name=args.activation, task_order=args.tasks)
     plot_paper_convergence_curves(args.runs_root, str(output_dir), task_order=args.tasks)
+    plot_gradient_stability(args.runs_root, str(output_dir), task_order=args.tasks)
+    plot_alpha_distribution(args.runs_root, str(output_dir), activation_name=args.activation, task_order=args.tasks)
     plot_corruption_breakdown(args.runs_root, str(output_dir))
     plot_robustness_retention(args.runs_root, str(output_dir))
     print(f"[IO] Paper assets written to {output_dir}")
@@ -1195,6 +1197,27 @@ def handle_generate_robustness_retention(args):
     save_path = plot_robustness_retention(args.runs_root, args.output_dir, activations=args.activations)
     if save_path is None:
         print(f"[Warning] Could not generate robustness retention chart from {args.runs_root}")
+
+
+def handle_generate_gradient_stability(args):
+    """Plots per-task gradient-norm trajectories comparing the baseline and proposed
+    activations, averaged across all available seeds."""
+    save_path = plot_gradient_stability(
+        args.runs_root,
+        args.output_dir,
+        task_order=args.tasks,
+        baseline_activation=args.baseline,
+        proposed_activation=args.proposed,
+    )
+    if save_path is None:
+        print(f"[Warning] Could not generate gradient stability plot from {args.runs_root}")
+
+
+def handle_generate_alpha_distribution(args):
+    """Plots a histogram of each layer's final converged alpha value per task."""
+    save_path = plot_alpha_distribution(args.runs_root, args.output_dir, activation_name=args.activation, task_order=args.tasks)
+    if save_path is None:
+        print(f"[Warning] Could not generate alpha distribution plot from {args.runs_root}")
 
 
 def handle_generate_parametric_comparison_plot(args):
@@ -1472,6 +1495,21 @@ def main():
     retention_parser.add_argument("--output-dir", type=str, default="outputs/paper_assets", help="Directory where the figure will be written")
     retention_parser.add_argument("--activations", type=str, nargs="+", default=None, choices=SUPPORTED_ACTIVATIONS, help="Activations to include (default: all activations with tracked robustness runs)")
 
+    # Command: generate_gradient_stability
+    gradient_parser = subparsers.add_parser("generate_gradient_stability", help="Plot per-task gradient-norm trajectories comparing baseline vs proposed activation")
+    gradient_parser.add_argument("--runs-root", type=str, default="outputs/runs", help="Directory containing benchmark run artifacts")
+    gradient_parser.add_argument("--output-dir", type=str, default="outputs/paper_assets", help="Directory where the figure will be written")
+    gradient_parser.add_argument("--baseline", type=str, default="golu_static", choices=SUPPORTED_ACTIVATIONS, help="Baseline activation to plot")
+    gradient_parser.add_argument("--proposed", type=str, default="alpha_golu", choices=SUPPORTED_ACTIVATIONS, help="Proposed activation to plot")
+    gradient_parser.add_argument("--tasks", type=str, nargs="+", default=None, choices=TRAJECTORY_TASK_CHOICES, help="Override task list/order (default: Phase 1's 6 tasks; pass the '_scale' names for Phase 2)")
+
+    # Command: generate_alpha_distribution
+    alpha_dist_parser = subparsers.add_parser("generate_alpha_distribution", help="Plot a histogram of each layer's final converged alpha value per task")
+    alpha_dist_parser.add_argument("--runs-root", type=str, default="outputs/runs", help="Directory containing benchmark run artifacts")
+    alpha_dist_parser.add_argument("--output-dir", type=str, default="outputs/paper_assets", help="Directory where the figure will be written")
+    alpha_dist_parser.add_argument("--activation", type=str, default="alpha_golu", choices=SUPPORTED_ACTIVATIONS, help="Activation to scan for alpha history")
+    alpha_dist_parser.add_argument("--tasks", type=str, nargs="+", default=None, choices=TRAJECTORY_TASK_CHOICES, help="Override task list/order (default: Phase 1's 6 tasks; pass the '_scale' names for Phase 2)")
+
     # Command: generate_alpha_lr_leaderboard
     leaderboard_parser = subparsers.add_parser("generate_alpha_lr_leaderboard", help="Compare multiple benchmark summaries and rank alpha-lr configs per task")
     leaderboard_parser.add_argument("--results-paths", type=str, nargs="+", default=["outputs/benchmark_results_alpha_lr_1e3.json", "outputs/benchmark_results_alpha_lr_2e3.json", "outputs/benchmark_results.json"], help="Benchmark summary JSON files to compare")
@@ -1511,6 +1549,10 @@ def main():
         handle_generate_corruption_breakdown(args)
     elif args.command == "generate_robustness_retention":
         handle_generate_robustness_retention(args)
+    elif args.command == "generate_gradient_stability":
+        handle_generate_gradient_stability(args)
+    elif args.command == "generate_alpha_distribution":
+        handle_generate_alpha_distribution(args)
     elif args.command == "generate_alpha_lr_leaderboard":
         handle_generate_alpha_lr_leaderboard(args)
     elif args.command == "preflight":

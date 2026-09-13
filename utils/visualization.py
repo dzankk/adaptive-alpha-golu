@@ -435,7 +435,12 @@ def plot_paper_overhead_summary(
         ax.bar_label(bwd_bars, fmt="%.1f", padding=2, fontsize=8)
 
         ax.set_xticks(x)
-        ax.set_xticklabels([act.replace("_", " ").upper() for act in acts_present], rotation=30, ha="right", fontsize=9)
+        # Only rotate labels when there are enough of them to actually risk overlapping --
+        # a single centered "ALPHA GOLU" label doesn't need to be rotated at an angle.
+        if len(acts_present) <= 2:
+            ax.set_xticklabels([act.replace("_", " ").upper() for act in acts_present], rotation=0, ha="center", fontsize=9)
+        else:
+            ax.set_xticklabels([act.replace("_", " ").upper() for act in acts_present], rotation=30, ha="right", fontsize=9)
         ax.set_title(TASK_LABELS.get(task, task.title()), fontsize=12)
         ax.set_ylabel("Latency (ms)", fontsize=10)
         ax.grid(True, axis="y", alpha=0.25)
@@ -630,6 +635,43 @@ def plot_curated_alpha_trajectories(
     return save_path
 
 
+def _aggregate_seed_histories(
+    task: str, activation: str, field_name: str, output_root: str | Path
+) -> tuple[np.ndarray, np.ndarray, np.ndarray | None, int] | None:
+    """Averages a per-epoch history field (e.g. epoch_loss_history, grad_norm_history) across
+    all available seeds for (task, activation). Shorter/interrupted seeds are NaN-padded rather
+    than truncating every seed to the shortest one, so an incomplete run doesn't silently cut
+    off an otherwise-complete curve. Returns (epochs, mean, std_or_None, n_seeds), or None if no
+    usable history exists."""
+    from utils.scaled_benchmark_logger import load_results_by_activation
+
+    payloads = load_results_by_activation(task, [activation], output_root=output_root).get(activation, [])
+    histories = [
+        payload[field_name]
+        for payload in payloads
+        if isinstance(payload.get(field_name), list) and payload[field_name]
+    ]
+    if not histories:
+        return None
+
+    lengths = [len(history) for history in histories]
+    max_len = max(lengths)
+    if len(set(lengths)) > 1:
+        print(
+            f"[Visualizer] Warning: {task}/{activation} seeds have inconsistent "
+            f"{field_name} lengths {sorted(lengths)} -- likely an interrupted/incomplete run; "
+            "each seed is only averaged over the epochs it actually has."
+        )
+
+    padded = np.full((len(histories), max_len), np.nan, dtype=np.float64)
+    for row, history in enumerate(histories):
+        padded[row, : len(history)] = history
+    mean = np.nanmean(padded, axis=0)
+    std = np.nanstd(padded, axis=0) if len(histories) > 1 else None
+    epochs = np.arange(1, max_len + 1)
+    return epochs, mean, std, len(histories)
+
+
 def plot_paper_convergence_curves(
     runs_root: str = "outputs/runs",
     save_dir: str = "outputs/paper_assets",
@@ -643,8 +685,6 @@ def plot_paper_convergence_curves(
     curve). Complements the final-metric summary bar chart by showing *how* training progressed,
     not just the end result; the seed-count is shown in the legend so a single-seed activation
     (e.g. a baseline that's only been run once) is visibly distinguishable from an averaged one."""
-    from utils.scaled_benchmark_logger import load_results_by_activation
-
     root_path = Path(runs_root)
     if not root_path.exists():
         print(f"[Visualizer] No runs directory found at {runs_root}")
@@ -664,35 +704,12 @@ def plot_paper_convergence_curves(
             (baseline_activation, "Static GoLU", "#8da0cb"),
             (proposed_activation, "Alpha-GoLU", "#fc8d62"),
         ):
-            payloads = load_results_by_activation(task, [activation], output_root=root_path).get(activation, [])
-            histories = [
-                payload["epoch_loss_history"]
-                for payload in payloads
-                if isinstance(payload.get("epoch_loss_history"), list) and payload["epoch_loss_history"]
-            ]
-            if not histories:
+            aggregated = _aggregate_seed_histories(task, activation, "epoch_loss_history", root_path)
+            if aggregated is None:
                 continue
-
-            lengths = [len(history) for history in histories]
-            max_len = max(lengths)
-            if len(set(lengths)) > 1:
-                print(
-                    f"[Visualizer] Warning: {task}/{activation} seeds have inconsistent "
-                    f"epoch_loss_history lengths {sorted(lengths)} -- likely an interrupted/"
-                    "incomplete run; each seed is only averaged over the epochs it actually has."
-                )
-
-            # Pad shorter (e.g. interrupted) seeds with NaN instead of truncating every seed to
-            # the shortest one -- otherwise one incomplete run would silently cut off an
-            # otherwise-complete curve at its length, hiding exactly how incomplete it was.
-            padded = np.full((len(histories), max_len), np.nan, dtype=np.float64)
-            for row, history in enumerate(histories):
-                padded[row, : len(history)] = history
-            mean_loss = np.nanmean(padded, axis=0)
-            epochs = np.arange(1, max_len + 1)
-            ax.plot(epochs, mean_loss, label=f"{label} (n={len(histories)})", linewidth=1.8, color=color)
-            if len(histories) > 1:
-                std_loss = np.nanstd(padded, axis=0)
+            epochs, mean_loss, std_loss, n_seeds = aggregated
+            ax.plot(epochs, mean_loss, label=f"{label} (n={n_seeds})", linewidth=1.8, color=color)
+            if std_loss is not None:
                 ax.fill_between(epochs, mean_loss - std_loss, mean_loss + std_loss, color=color, alpha=0.15, linewidth=0)
             plotted = True
 
@@ -721,6 +738,140 @@ def plot_paper_convergence_curves(
     fig.savefig(save_path, dpi=300, bbox_inches="tight")
     plt.close(fig)
     print(f"[Visualizer] Convergence curves saved to: {save_path}")
+    return save_path
+
+
+def plot_gradient_stability(
+    runs_root: str = "outputs/runs",
+    save_dir: str = "outputs/paper_assets",
+    task_order: list[str] | None = None,
+    baseline_activation: str = "golu_static",
+    proposed_activation: str = "alpha_golu",
+):
+    """Plots per-task gradient-norm trajectories comparing baseline vs proposed activation,
+    averaged across all available seeds with a shaded +/-1 std band. Lower/smoother gradient
+    norms during training support an optimization-stability claim even when raw training-loss
+    convergence looks similar between activations (see plot_paper_convergence_curves)."""
+    root_path = Path(runs_root)
+    if not root_path.exists():
+        print(f"[Visualizer] No runs directory found at {runs_root}")
+        return None
+
+    os.makedirs(save_dir, exist_ok=True)
+    task_order = task_order or TASK_ORDER
+    rows, cols = _grid_shape(len(task_order))
+    fig, axes = plt.subplots(rows, cols, figsize=(5 * cols, 4 * rows), sharex=False)
+    axes = np.atleast_1d(axes).flatten()
+
+    rendered = 0
+    for ax, task in zip(axes, task_order):
+        ax.set_title(TASK_LABELS.get(task, task.title()))
+        plotted = False
+        for activation, label, color in (
+            (baseline_activation, "Static GoLU", "#8da0cb"),
+            (proposed_activation, "Alpha-GoLU", "#fc8d62"),
+        ):
+            aggregated = _aggregate_seed_histories(task, activation, "grad_norm_history", root_path)
+            if aggregated is None:
+                continue
+            epochs, mean_norm, std_norm, n_seeds = aggregated
+            ax.plot(epochs, mean_norm, label=f"{label} (n={n_seeds})", linewidth=1.8, color=color)
+            if std_norm is not None:
+                ax.fill_between(epochs, mean_norm - std_norm, mean_norm + std_norm, color=color, alpha=0.15, linewidth=0)
+            plotted = True
+
+        if not plotted:
+            ax.text(0.5, 0.5, "No grad-norm history", ha="center", va="center", transform=ax.transAxes)
+            ax.set_axis_off()
+            continue
+
+        rendered += 1
+        ax.set_xlabel("Epoch")
+        ax.set_ylabel("Gradient Norm")
+        ax.grid(True, alpha=0.25)
+        ax.legend(frameon=False, fontsize=8)
+
+    for ax in axes[len(task_order):]:
+        ax.set_axis_off()
+
+    if rendered == 0:
+        plt.close(fig)
+        print(f"[Visualizer] No usable grad-norm-history entries found under {runs_root}")
+        return None
+
+    fig.suptitle("Gradient-Norm Stability: Static GoLU vs Alpha-GoLU", y=1.02, fontsize=16)
+    fig.tight_layout()
+    save_path = os.path.join(save_dir, "paper_gradient_stability.png")
+    fig.savefig(save_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[Visualizer] Gradient stability plot saved to: {save_path}")
+    return save_path
+
+
+def plot_alpha_distribution(
+    runs_root: str = "outputs/runs",
+    save_dir: str = "outputs/paper_assets",
+    activation_name: str = "alpha_golu",
+    task_order: list[str] | None = None,
+):
+    """Plots a histogram of each layer's FINAL (converged) alpha value per task, one subplot per
+    task. Complements the trajectory dashboards by turning "vision tasks cluster above 1.0,
+    language modeling clusters below 1.0" from an eyeballed trajectory observation into a single
+    citable distribution figure."""
+    root_path = Path(runs_root)
+    if not root_path.exists():
+        print(f"[Visualizer] No runs directory found at {runs_root}")
+        return None
+
+    os.makedirs(save_dir, exist_ok=True)
+    task_order = task_order or TASK_ORDER
+    rows, cols = _grid_shape(len(task_order))
+    fig, axes = plt.subplots(rows, cols, figsize=(4.5 * cols, 4 * rows), sharex=False)
+    axes = np.atleast_1d(axes).flatten()
+
+    rendered = 0
+    for ax, task in zip(axes, task_order):
+        result = _find_latest_task_result(root_path, task, activation_name=activation_name, required_field="alpha_history")
+        alpha_history = result.get("alpha_history") if result else None
+        if not isinstance(alpha_history, dict) or not alpha_history:
+            ax.text(0.5, 0.5, "No alpha history", ha="center", va="center", transform=ax.transAxes)
+            ax.set_title(TASK_LABELS.get(task, task.title()))
+            ax.set_axis_off()
+            continue
+
+        final_values = [history[-1] for history in alpha_history.values() if history]
+        if not final_values:
+            ax.text(0.5, 0.5, "No alpha history", ha="center", va="center", transform=ax.transAxes)
+            ax.set_title(TASK_LABELS.get(task, task.title()))
+            ax.set_axis_off()
+            continue
+
+        mean_final = float(np.mean(final_values))
+        ax.hist(final_values, bins=min(15, max(5, len(final_values))), color="#7570b3", edgecolor="black", alpha=0.85)
+        ax.axvline(1.0, color="#d62728", linestyle="--", linewidth=1.2, label=r"Static ($\alpha=1.0$)")
+        ax.axvline(mean_final, color="#1b9e77", linestyle="-", linewidth=1.5, label=f"Mean={mean_final:.3f}")
+        ax.set_title(f"{TASK_LABELS.get(task, task.title())} (n={len(final_values)} layers)")
+        ax.set_xlabel(r"Final $\alpha$")
+        ax.set_ylabel("Layer Count")
+        ax.ticklabel_format(axis="x", useOffset=False, style="plain")
+        ax.legend(fontsize=8, frameon=False)
+        ax.grid(True, alpha=0.25)
+        rendered += 1
+
+    for ax in axes[len(task_order):]:
+        ax.set_axis_off()
+
+    if rendered == 0:
+        plt.close(fig)
+        print(f"[Visualizer] No usable alpha_history entries found under {runs_root}")
+        return None
+
+    fig.suptitle(f"Converged Alpha Distribution by Task ({activation_name})", y=1.02, fontsize=16)
+    fig.tight_layout()
+    save_path = os.path.join(save_dir, "paper_alpha_distribution.png")
+    fig.savefig(save_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[Visualizer] Alpha distribution plot saved to: {save_path}")
     return save_path
 
 
