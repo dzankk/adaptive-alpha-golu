@@ -321,7 +321,11 @@ def plot_paper_benchmark_summary(
         top = max(bar_static.get_height(), bar_alpha.get_height())
         star = _significance_stars(p_value)
         label = f"{static_raw:.3g} / {alpha_raw:.3g}"
-        if star:
+        # Only append a significance marker when it's an actual "*"/"**"/"***" -- printing the
+        # literal string "ns" ("not significant") right under a pair of raw numbers reads as a
+        # unit suffix (nanoseconds) out of context. Absence of a star already conventionally
+        # signals non-significance, so just omit it instead of using an ambiguous abbreviation.
+        if star and star != "ns":
             label = f"{label}\n{star}"
         ax.annotate(
             label,
@@ -338,8 +342,10 @@ def plot_paper_benchmark_summary(
     ax.set_ylabel("Relative Performance (% of Static GoLU baseline, higher = better)")
     ax.set_title("Alpha-GoLU vs Static GoLU Across Benchmarks")
     ax.grid(True, axis="y", alpha=0.25)
-    ax.legend(frameon=False)
-    ax.margins(y=0.12)
+    # Legend moved outside the axes (to the right) so it can never collide with the per-bar
+    # value annotations sitting just above the tallest bars.
+    ax.legend(frameon=False, loc="upper left", bbox_to_anchor=(1.02, 1.0))
+    ax.margins(y=0.15)
 
     fig.tight_layout()
     save_path = os.path.join(save_dir, "paper_benchmark_summary.png")
@@ -416,6 +422,11 @@ def plot_paper_overhead_summary(
     # ~130ms segmentation), which squashed the cheaper tasks into invisible stubs on one axis.
     forward_color, backward_color = "#66c2a5", "#fc8d62"
     bar_width = 0.32
+    # Same physical bar width/spacing on every subplot regardless of how many activations a
+    # given task happens to have tracked -- otherwise a 1-activation subplot's bars stretch to
+    # fill the same panel width as an 8-activation subplot, making them look inconsistent even
+    # though nothing is actually wrong with that task's data.
+    max_acts_per_subplot = max((len(task_activation_latency[task]) for task in rendered_tasks), default=1)
 
     rows, cols = _grid_shape(len(rendered_tasks))
     fig, axes = plt.subplots(rows, cols, figsize=(4.5 * cols, 4.2 * rows), sharex=False, sharey=False)
@@ -423,7 +434,11 @@ def plot_paper_overhead_summary(
 
     for ax, task in zip(axes, rendered_tasks):
         acts_present = [act for act in activations if act in task_activation_latency[task]]
-        x = np.arange(len(acts_present))
+        # Center this subplot's bars within the shared reserved width instead of always
+        # starting at 0, so a 1-activation subplot doesn't end up as a lone bar pinned to the
+        # far left with a large empty gap on the right.
+        offset = (max_acts_per_subplot - len(acts_present)) / 2.0
+        x = np.arange(len(acts_present)) + offset
         fwd_heights = [task_activation_latency[task][act][0] for act in acts_present]
         bwd_heights = [task_activation_latency[task][act][1] for act in acts_present]
 
@@ -436,12 +451,14 @@ def plot_paper_overhead_summary(
         ax.bar_label(bwd_bars, fmt="%.1f", padding=2, fontsize=8)
 
         ax.set_xticks(x)
-        # Only rotate labels when there are enough of them to actually risk overlapping --
-        # a single centered "ALPHA GOLU" label doesn't need to be rotated at an angle.
-        if len(acts_present) <= 2:
+        # Only skip rotation for a genuinely lone label (nothing adjacent to collide with) --
+        # 2+ activations can still collide even horizontally if names are long (e.g. "GOLU
+        # STATIC"/"ADAPTIVE SWISH" 1 unit apart), so keep a modest rotation for those.
+        if len(acts_present) <= 1:
             ax.set_xticklabels([act.replace("_", " ").upper() for act in acts_present], rotation=0, ha="center", fontsize=9)
         else:
             ax.set_xticklabels([act.replace("_", " ").upper() for act in acts_present], rotation=30, ha="right", fontsize=9)
+        ax.set_xlim(-0.5, max_acts_per_subplot - 0.5)
         ax.set_title(TASK_LABELS.get(task, task.title()), fontsize=12)
         ax.set_ylabel("Latency (ms)", fontsize=10)
         ax.grid(True, axis="y", alpha=0.25)
