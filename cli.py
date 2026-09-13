@@ -893,7 +893,11 @@ def handle_rebuild_summary(args):
     config = load_benchmark_config(args.config) if args.config else {}
     tasks = args.tasks or config.get("tasks", list(TASK_MAP.keys()))
     activations = args.activations or config.get("activations", CANONICAL_ACTIVATIONS)
-    runs_root = args.runs_root or config.get("output_root", "outputs/runs")
+    # NOTE: deliberately not falling back to config["output_root"] -- every experiment runner
+    # always writes to the flat outputs/runs/<task>/ structure regardless of that config value
+    # (several configs set output_root to a per-sweep subfolder that was never actually used
+    # for real training output, which made rebuild_summary silently find nothing).
+    runs_root = args.runs_root or "outputs/runs"
 
     all_task_results: dict = {}
     for task_name in tasks:
