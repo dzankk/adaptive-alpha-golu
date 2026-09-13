@@ -1,0 +1,23 @@
+% ===== Auto-Generated Publication LaTeX Benchmark Table =====
+\begin{table*}[t]
+\centering
+\small
+\begin{tabular}{lcccccc}
+\toprule
+Activation & \textbf{Classification} & \textbf{Detection} & \textbf{Diffusion} & \textbf{Language Model} & \textbf{Robustness} & \textbf{Segmentation} \\
+\midrule
+\texttt{ADAPTIVE-SWISH} & \underline{92.97 $\pm$ 0.13} & 0.69 $\pm$ 0.00 & 0.05 $\pm$ 0.00 & 106.36 $\pm$ 1.23 & 24.42 $\pm$ 0.85 & N/A \\
+\texttt{ALPHA-GOLU} & 92.86 $\pm$ 0.19 & 0.68 $\pm$ 0.02 & 0.06 $\pm$ 0.01 & \textbf{106.07 $\pm$ 1.22} & \textbf{29.61 $\pm$ 1.69} & \textbf{0.65 $\pm$ 0.01} \\
+\texttt{GELU} & \textbf{93.09 $\pm$ 0.09} & \textbf{0.70 $\pm$ 0.00} & 0.05 $\pm$ 0.00 & 106.30 $\pm$ 1.30 & 25.98 $\pm$ 2.93 & N/A \\
+\texttt{GOLU-STATIC} & 92.88 $\pm$ 0.13 & 0.68 $\pm$ 0.01 & 0.05 $\pm$ 0.00 & 106.32 $\pm$ 1.29 & \underline{29.45 $\pm$ 2.27} & \underline{0.64 $\pm$ 0.01} \\
+\texttt{PGELU} & 92.94 $\pm$ 0.12 & 0.69 $\pm$ 0.00 & 0.06 $\pm$ 0.01 & \underline{106.14 $\pm$ 1.32} & 27.42 $\pm$ 4.35 & N/A \\
+\texttt{PRELU} & 92.41 $\pm$ 0.18 & 0.69 $\pm$ 0.00 & \textbf{0.05 $\pm$ 0.00} & 107.08 $\pm$ 1.40 & 28.45 $\pm$ 6.55 & N/A \\
+\texttt{RELU} & 92.26 $\pm$ 0.85 & \underline{0.69 $\pm$ 0.00} & \underline{0.05 $\pm$ 0.00} & 106.79 $\pm$ 1.54 & 28.55 $\pm$ 1.11 & N/A \\
+\texttt{SWISH} & 92.94 $\pm$ 0.16 & 0.69 $\pm$ 0.01 & 0.05 $\pm$ 0.00 & 107.25 $\pm$ 1.32 & 26.67 $\pm$ 3.76 & N/A \\
+\midrule
+\textit{$p$-value (Welch; $\alpha$ vs Static)} & \textit{p = 0.9485} & \textit{p = 0.9089} & \textit{p = 0.3433} & \textit{p = 0.0204} & \textit{p = 0.9384} & \textit{p = 0.1469} \\
+\bottomrule
+\end{tabular}
+\caption{Empirical benchmark comparison across tasks. Best performance is in \textbf{bold}; second best is \underline{underlined}. Statistical significance is computed via Welch's $t$-test between Alpha-GoLU and GoLU Static.}
+\label{tab:benchmark_results}
+\end{table*}
