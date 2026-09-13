@@ -54,9 +54,16 @@ PARAMETRIC_ACTIVATION_LABELS = {
 
 
 def _grid_shape(num_panels: int, max_cols: int = 3) -> tuple[int, int]:
-    """Computes a (rows, cols) subplot grid that fits num_panels, capped at max_cols columns."""
-    cols = min(max_cols, max(num_panels, 1))
-    rows = -(-max(num_panels, 1) // cols)
+    """Computes a (rows, cols) subplot grid that tightly fits num_panels with minimal empty
+    cells, capped at max_cols columns. E.g. 4 panels -> 2x2 (not 2x3 with 2 dangling empty
+    slots), while 6 panels still -> 2x3 as before."""
+    import math
+
+    n = max(num_panels, 1)
+    if n <= max_cols:
+        return 1, n
+    cols = min(max_cols, math.ceil(math.sqrt(n)))
+    rows = -(-n // cols)
     return rows, cols
 
 
@@ -406,8 +413,7 @@ def plot_paper_overhead_summary(
     # One subplot per task with its own y-axis, instead of a single shared axis -- latency
     # scales differ by 1-2 orders of magnitude across tasks (e.g. ~2ms language modeling vs
     # ~130ms segmentation), which squashed the cheaper tasks into invisible stubs on one axis.
-    color_cycle = plt.rcParams["axes.prop_cycle"].by_key().get("color", [])
-    act_color_map = {act: color_cycle[i % len(color_cycle)] for i, act in enumerate(activations)}
+    forward_color, backward_color = "#66c2a5", "#fc8d62"
     bar_width = 0.32
 
     rows, cols = _grid_shape(len(rendered_tasks))
@@ -419,10 +425,12 @@ def plot_paper_overhead_summary(
         x = np.arange(len(acts_present))
         fwd_heights = [task_activation_latency[task][act][0] for act in acts_present]
         bwd_heights = [task_activation_latency[task][act][1] for act in acts_present]
-        bar_colors = [act_color_map[act] for act in acts_present]
 
-        fwd_bars = ax.bar(x - bar_width / 2, fwd_heights, width=bar_width, color=bar_colors, edgecolor="black", linewidth=0.5)
-        bwd_bars = ax.bar(x + bar_width / 2, bwd_heights, width=bar_width, color=bar_colors, edgecolor="black", linewidth=0.5, hatch="//")
+        # Two colors encode Forward vs Backward only -- coloring bars by activation AND listing
+        # activations on the x-axis was redundant and cluttered; the activation identity is
+        # already fully conveyed by the tick labels.
+        fwd_bars = ax.bar(x - bar_width / 2, fwd_heights, width=bar_width, color=forward_color, edgecolor="black", linewidth=0.5)
+        bwd_bars = ax.bar(x + bar_width / 2, bwd_heights, width=bar_width, color=backward_color, edgecolor="black", linewidth=0.5)
         ax.bar_label(fwd_bars, fmt="%.1f", padding=2, fontsize=8)
         ax.bar_label(bwd_bars, fmt="%.1f", padding=2, fontsize=8)
 
@@ -436,11 +444,11 @@ def plot_paper_overhead_summary(
     for ax in axes[len(rendered_tasks):]:
         ax.set_axis_off()
 
-    rendered_activations = [act for act in activations if any(act in task_activation_latency[task] for task in rendered_tasks)]
-    legend_handles = [Patch(facecolor=act_color_map[act], edgecolor="black", label=act.replace("_", " ").upper()) for act in rendered_activations]
-    legend_handles.append(Patch(facecolor="white", edgecolor="black", label="Forward"))
-    legend_handles.append(Patch(facecolor="white", edgecolor="black", hatch="//", label="Backward"))
-    fig.legend(handles=legend_handles, loc="lower center", bbox_to_anchor=(0.5, -0.08), ncol=min(6, len(legend_handles)), frameon=False, fontsize=9)
+    legend_handles = [
+        Patch(facecolor=forward_color, edgecolor="black", label="Forward"),
+        Patch(facecolor=backward_color, edgecolor="black", label="Backward"),
+    ]
+    fig.legend(handles=legend_handles, loc="lower center", bbox_to_anchor=(0.5, -0.04), ncol=2, frameon=False, fontsize=10)
 
     if len(rendered_tasks) == 1:
         fig.suptitle(f"Runtime Overhead: {TASK_LABELS.get(rendered_tasks[0], rendered_tasks[0].title())}", fontsize=14, y=1.03)
