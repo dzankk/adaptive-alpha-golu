@@ -30,8 +30,10 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from experiments.run_classification import ResNet18 as ClassificationResNet18
 from experiments.run_detection import VOC_CLASSES, build_detection_model
+from experiments.run_diffusion import DiffusionUNet
 from experiments.run_language_model import MiniGPT, build_language_model_dataloaders
 from experiments.run_segmentation import ImageNetBackboneDeepLabV3, VOC_SEG_CLASSES
+from experiments.run_adversarial_robustness import ResNet18 as RobustnessResNet18
 from utils.overhead_tracker import OverheadTracker
 
 try:
@@ -55,7 +57,9 @@ TASKS = [
     "classification",
     "detection",
     "segmentation",
+    "diffusion",
     "language_model",
+    "robustness",
 ]
 
 MB = 1024.0 ** 2
@@ -84,10 +88,20 @@ TASK_SPECS: dict[str, TaskSpec] = {
         batch_size=1,
         batch_shape={"images": [1, 3, 256, 256], "masks": [1, 256, 256], "num_classes": VOC_SEG_CLASSES},
     ),
+    "diffusion": TaskSpec(
+        name="diffusion",
+        batch_size=1,
+        batch_shape={"images": [1, 3, 32, 32]},
+    ),
     "language_model": TaskSpec(
         name="language_model",
         batch_size=1,
         batch_shape={"tokens": [1, 64]},
+    ),
+    "robustness": TaskSpec(
+        name="robustness",
+        batch_size=1,
+        batch_shape={"images": [1, 3, 32, 32], "labels": [1], "num_classes": 10},
     ),
 }
 
@@ -136,9 +150,22 @@ def build_model(task_name: str, activation: str, device: torch.device, lm_vocab_
         return build_detection_model(act_type=activation, num_classes=len(VOC_CLASSES) + 1).to(device)
     if task_name == "segmentation":
         return ImageNetBackboneDeepLabV3(act_type=activation, num_classes=VOC_SEG_CLASSES).to(device)
+    if task_name == "diffusion":
+        return DiffusionUNet(act_type=activation).to(device)
     if task_name == "language_model":
         return MiniGPT(vocab_size=lm_vocab_size, act_type=activation, max_seq_len=64).to(device)
+    if task_name == "robustness":
+        return RobustnessResNet18(act_type=activation, num_classes=10).to(device)
     raise ValueError(f"Unknown task: {task_name}")
+
+
+_DIFFUSION_TIMESTEPS = 1000
+
+
+def _diffusion_alpha_hat(device: torch.device) -> torch.Tensor:
+    beta = torch.linspace(0.0001, 0.02, _DIFFUSION_TIMESTEPS, device=device)
+    alpha = 1.0 - beta
+    return torch.cumprod(alpha, dim=0)
 
 
 def build_sample(task_name: str, device: torch.device, lm_vocab_size: int) -> dict[str, Any]:
@@ -162,9 +189,22 @@ def build_sample(task_name: str, device: torch.device, lm_vocab_size: int) -> di
             "images": torch.randn(1, 3, 256, 256, device=device),
             "masks": torch.randint(0, VOC_SEG_CLASSES, (1, 256, 256), device=device),
         }
+    if task_name == "diffusion":
+        x0 = torch.randn(1, 3, 32, 32, device=device)
+        t = torch.randint(0, _DIFFUSION_TIMESTEPS, (1,), device=device).long()
+        noise = torch.randn_like(x0)
+        alpha_hat = _diffusion_alpha_hat(device)
+        a_hat_t = alpha_hat[t][:, None, None, None]
+        xt = torch.sqrt(a_hat_t) * x0 + torch.sqrt(1 - a_hat_t) * noise
+        return {"xt": xt, "t": t, "noise": noise}
     if task_name == "language_model":
         return {
             "tokens": torch.randint(0, lm_vocab_size, (1, 64), device=device),
+        }
+    if task_name == "robustness":
+        return {
+            "images": torch.randn(1, 3, 32, 32, device=device),
+            "labels": torch.randint(0, 10, (1,), device=device),
         }
     raise ValueError(f"Unknown task: {task_name}")
 
@@ -176,8 +216,12 @@ def forward_only(task_name: str, model: nn.Module, sample: dict[str, Any]) -> to
         return model(sample["images"])
     if task_name == "segmentation":
         return model(sample["images"])
+    if task_name == "diffusion":
+        return model(sample["xt"], sample["t"])
     if task_name == "language_model":
         return model(sample["tokens"])
+    if task_name == "robustness":
+        return model(sample["images"])
     raise ValueError(f"Unknown task: {task_name}")
 
 
@@ -191,12 +235,18 @@ def training_loss(task_name: str, model: nn.Module, sample: dict[str, Any], lm_v
     if task_name == "segmentation":
         logits = model(sample["images"])
         return nn.CrossEntropyLoss(ignore_index=255)(logits.float(), sample["masks"])
+    if task_name == "diffusion":
+        predicted_noise = model(sample["xt"], sample["t"])
+        return nn.MSELoss()(predicted_noise.float(), sample["noise"])
     if task_name == "language_model":
         tokens = sample["tokens"]
         inputs = tokens[:, :-1]
         targets = tokens[:, 1:]
         logits = model(inputs)
         return nn.CrossEntropyLoss()(logits.float().reshape(-1, lm_vocab_size), targets.reshape(-1))
+    if task_name == "robustness":
+        logits = model(sample["images"])
+        return nn.CrossEntropyLoss()(logits.float(), sample["labels"])
     raise ValueError(f"Unknown task: {task_name}")
 
 

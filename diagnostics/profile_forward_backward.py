@@ -9,12 +9,25 @@ the enclosing named region regardless of asynchronous CPU/GPU dispatch, so
 this settles whether a "backward faster than forward" measurement reflects a
 real property of the model or a timing artifact.
 
+This also doubles as the FASTEST way to fully populate outputs/overhead/ for
+the paper's runtime-overhead plot: unlike the OverheadTracker path (which only
+records timing during a real training run, so a task only gets covered if you
+happen to (re)run full training for every activation with tracking enabled),
+this script profiles a handful of synthetic forward/backward passes per
+(task, activation) in seconds -- looping over every activation for a task and
+writing results into outputs/overhead/ takes minutes, not hours.
+
 Usage:
+    # Single (task, activation) -- just prints the profiler breakdown:
     python -m diagnostics.profile_forward_backward --task detection --activation alpha_golu
+
+    # All 8 canonical activations for a task, saved into outputs/overhead/:
+    python -m diagnostics.profile_forward_backward --task detection --activations relu gelu swish prelu pgelu golu_static alpha_golu adaptive_swish --save
 """
 
 import argparse
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 import torch
@@ -24,7 +37,8 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from diagnostics.profile_complexity import TASK_SPECS, build_model, build_sample, training_loss
+from diagnostics.profile_complexity import ACTIVATIONS, TASK_SPECS, build_model, build_sample, training_loss
+from utils.run_artifacts import write_json
 
 
 def _self_device_time(event) -> float:
@@ -36,7 +50,10 @@ def _self_device_time(event) -> float:
     return float(value)
 
 
-def profile_forward_backward(task_name: str, activation: str, device: torch.device, warmup: int = 5, measured: int = 10) -> None:
+def measure_forward_backward(
+    task_name: str, activation: str, device: torch.device, warmup: int = 5, measured: int = 10, verbose: bool = True
+) -> tuple[float, float]:
+    """Runs the profiler for one (task, activation) pair and returns (forward_ms, backward_ms)."""
     lm_vocab_size = 1000
     model = build_model(task_name, activation, device, lm_vocab_size)
     model.train()
@@ -70,20 +87,27 @@ def profile_forward_backward(task_name: str, activation: str, device: torch.devi
                 torch.cuda.synchronize(device)
 
     key_averages = prof.key_averages()
-    forward_us = sum(_self_device_time(event) for event in key_averages if event.key == "forward_pass")
-    backward_us = sum(_self_device_time(event) for event in key_averages if event.key == "backward_pass")
-    time_label = "self_device_time_total (CUDA)" if device.type == "cuda" else "self_cpu_time_total"
-    if device.type != "cuda":
+    if device.type == "cuda":
+        forward_us = sum(_self_device_time(event) for event in key_averages if event.key == "forward_pass")
+        backward_us = sum(_self_device_time(event) for event in key_averages if event.key == "backward_pass")
+        time_label = "self_device_time_total (CUDA)"
+    else:
         forward_us = sum(getattr(event, "self_cpu_time_total", 0) for event in key_averages if event.key == "forward_pass")
         backward_us = sum(getattr(event, "self_cpu_time_total", 0) for event in key_averages if event.key == "backward_pass")
+        time_label = "self_cpu_time_total"
 
-    print(f"\n=== {task_name} / {activation} on {device} (n={measured} measured iters, {warmup} warmup) ===")
-    print(f"Forward:  {forward_us / measured / 1000:.3f} ms/iter  ({time_label}, torch.profiler ground truth)")
-    print(f"Backward: {backward_us / measured / 1000:.3f} ms/iter  ({time_label}, torch.profiler ground truth)")
+    forward_ms = forward_us / measured / 1000.0
+    backward_ms = backward_us / measured / 1000.0
 
-    sort_key = "cuda_time_total" if device.type == "cuda" else "cpu_time_total"
-    print(f"\nTop ops by {sort_key}:")
-    print(key_averages.table(sort_by=sort_key, row_limit=15))
+    if verbose:
+        print(f"\n=== {task_name} / {activation} on {device} (n={measured} measured iters, {warmup} warmup) ===")
+        print(f"Forward:  {forward_ms:.3f} ms/iter  ({time_label}, torch.profiler ground truth)")
+        print(f"Backward: {backward_ms:.3f} ms/iter  ({time_label}, torch.profiler ground truth)")
+        sort_key = "cuda_time_total" if device.type == "cuda" else "cpu_time_total"
+        print(f"\nTop ops by {sort_key}:")
+        print(key_averages.table(sort_by=sort_key, row_limit=15))
+
+    return forward_ms, backward_ms
 
 
 def main() -> None:
@@ -91,13 +115,44 @@ def main() -> None:
         description="Verify forward/backward timing using torch.profiler (ground truth, independent of the custom OverheadTracker timer)"
     )
     parser.add_argument("--task", type=str, default="detection", choices=list(TASK_SPECS.keys()))
-    parser.add_argument("--activation", type=str, default="alpha_golu")
+    parser.add_argument("--activation", type=str, default=None, help="Single activation to profile (default: use --activations instead)")
+    parser.add_argument("--activations", type=str, nargs="+", default=None, choices=ACTIVATIONS, help="Profile every one of these activations for --task in a single run (default: just --activation, or alpha_golu if neither is given)")
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--iters", type=int, default=10)
+    parser.add_argument("--save", action="store_true", help="Write each (task, activation) result into outputs/overhead/ in the schema plot_paper_overhead_summary expects")
+    parser.add_argument("--overhead-root", type=str, default="outputs/overhead", help="Directory to write results into when --save is set")
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    profile_forward_backward(args.task, args.activation, device, warmup=args.warmup, measured=args.iters)
+    activations = args.activations or [args.activation or "alpha_golu"]
+
+    results = []
+    for activation in activations:
+        forward_ms, backward_ms = measure_forward_backward(
+            args.task, activation, device, warmup=args.warmup, measured=args.iters, verbose=(len(activations) == 1)
+        )
+        results.append((activation, forward_ms, backward_ms))
+        if args.save:
+            timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+            overhead_root = Path(args.overhead_root)
+            write_json(
+                overhead_root / f"{timestamp}_{args.task}_{activation}_profiler.json",
+                {
+                    "task_name": args.task,
+                    "activation_name": activation,
+                    "forward_ms": {"mean": forward_ms},
+                    "backward_ms": {"mean": backward_ms},
+                    "source": "diagnostics.profile_forward_backward (torch.profiler)",
+                },
+            )
+
+    if len(activations) > 1:
+        print(f"\n=== Summary: {args.task} on {device} ===")
+        print(f"{'Activation':<16} {'Forward (ms)':>14} {'Backward (ms)':>15}")
+        for activation, forward_ms, backward_ms in results:
+            print(f"{activation:<16} {forward_ms:>14.3f} {backward_ms:>15.3f}")
+        if args.save:
+            print(f"\n[IO] Saved {len(results)} record(s) to {args.overhead_root}")
 
 
 if __name__ == "__main__":

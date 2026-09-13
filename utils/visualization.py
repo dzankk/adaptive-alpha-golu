@@ -946,9 +946,10 @@ def plot_alpha_distribution(
         # a mean line stranded in empty space between spikes) -- show individual points as a
         # strip plot instead once there are too few layers for bins to be meaningful.
         if n_layers <= 5:
-            jitter = np.random.default_rng(0).uniform(-0.08, 0.08, size=n_layers)
-            ax.scatter(final_values, 0.5 + jitter, s=90, color="#7570b3", edgecolor="black", linewidth=0.6, zorder=3)
-            ax.set_ylim(0, 1)
+            # A true 1D strip plot (fixed y) keeps focus on the horizontal alpha spread; jittering
+            # y made points look like they varied on a dimension that doesn't actually exist here.
+            ax.scatter(final_values, [1.0] * n_layers, s=90, color="#7570b3", edgecolor="black", linewidth=0.6, zorder=3)
+            ax.set_ylim(0, 2)
             ax.set_yticks([])
             ax.set_ylabel("Individual Layers")
         else:
@@ -960,6 +961,9 @@ def plot_alpha_distribution(
         ax.axvline(mean_final, color="#1b9e77", linestyle="-", linewidth=1.5, label=f"Mean={mean_final:.3f}")
         ax.set_title(f"{TASK_LABELS.get(task, task.title())} (n={n_layers} layers)")
         ax.set_xlabel(r"Final $\alpha$")
+        # Dense decimal ticks (e.g. 1.0000/1.0001/1.0002...) overlap when alpha values cluster
+        # tightly; capping to 5 ticks keeps labels readable regardless of how tight the cluster is.
+        ax.xaxis.set_major_locator(MaxNLocator(5))
         ax.ticklabel_format(axis="x", useOffset=False, style="plain")
         ax.margins(y=0.2)
         ax.legend(fontsize=8, frameon=False, loc="upper right")
