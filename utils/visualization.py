@@ -590,9 +590,13 @@ def plot_paper_convergence_curves(
     proposed_activation: str = "alpha_golu",
 ):
     """Plots per-task training-loss convergence curves comparing baseline vs proposed activation
-    (default: Static GoLU vs Alpha-GoLU), one subplot per task, using each activation's most
-    recent saved `epoch_loss_history`. Complements the final-metric summary bar chart by showing
-    *how* training progressed, not just the end result."""
+    (default: Static GoLU vs Alpha-GoLU), one subplot per task, averaged across all available
+    seeds per activation with a shaded +/-1 std band (rather than a single arbitrary seed's
+    curve). Complements the final-metric summary bar chart by showing *how* training progressed,
+    not just the end result; the seed-count is shown in the legend so a single-seed activation
+    (e.g. a baseline that's only been run once) is visibly distinguishable from an averaged one."""
+    from utils.scaled_benchmark_logger import load_results_by_activation
+
     root_path = Path(runs_root)
     if not root_path.exists():
         print(f"[Visualizer] No runs directory found at {runs_root}")
@@ -612,12 +616,25 @@ def plot_paper_convergence_curves(
             (baseline_activation, "Static GoLU", "#8da0cb"),
             (proposed_activation, "Alpha-GoLU", "#fc8d62"),
         ):
-            result = _find_latest_task_result(root_path, task, activation_name=activation, required_field="epoch_loss_history")
-            history = result.get("epoch_loss_history") if result else None
-            if not isinstance(history, list) or not history:
+            payloads = load_results_by_activation(task, [activation], output_root=root_path).get(activation, [])
+            histories = [
+                payload["epoch_loss_history"]
+                for payload in payloads
+                if isinstance(payload.get("epoch_loss_history"), list) and payload["epoch_loss_history"]
+            ]
+            if not histories:
                 continue
-            epochs = np.arange(1, len(history) + 1)
-            ax.plot(epochs, history, label=label, linewidth=1.8, color=color)
+
+            min_len = min(len(history) for history in histories)
+            if min_len <= 0:
+                continue
+            stacked = np.array([history[:min_len] for history in histories], dtype=np.float64)
+            mean_loss = stacked.mean(axis=0)
+            epochs = np.arange(1, min_len + 1)
+            ax.plot(epochs, mean_loss, label=f"{label} (n={len(histories)})", linewidth=1.8, color=color)
+            if len(histories) > 1:
+                std_loss = stacked.std(axis=0)
+                ax.fill_between(epochs, mean_loss - std_loss, mean_loss + std_loss, color=color, alpha=0.15, linewidth=0)
             plotted = True
 
         if not plotted:
