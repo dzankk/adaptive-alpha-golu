@@ -407,6 +407,25 @@ def _metric_mean_with_aliases(records: list[dict], *, primary_key: str, nested_k
     return None
 
 
+def _metric_mean_per_batch(records: list[dict], total_key: str, count_key: str = "batch_count") -> float | None:
+    """Averages `record[total_key] / record[count_key]` across records, NOT `record[total_key]` directly.
+
+    OverheadTracker.summary() accumulates `total_key` (e.g. estimated_total_flops) by summing over
+    every batch of an entire tracked training run, so it scales with how many steps were run, not
+    with the cost of a single forward/backward pass. Naively averaging that raw cumulative field
+    across records (as the overhead table used to) produced FLOP counts inflated by however many
+    thousands of batches a run had -- ~6 orders of magnitude too large compared to a single-pass
+    FLOP count. Dividing by batch_count first recovers the actual per-step estimate."""
+    per_batch_values = []
+    for record in records:
+        raw_total = record.get(total_key)
+        raw_count = record.get(count_key)
+        if not isinstance(raw_total, (int, float)) or not isinstance(raw_count, (int, float)) or raw_count <= 0:
+            continue
+        per_batch_values.append(float(raw_total) / float(raw_count))
+    return float(mean(per_batch_values)) if per_batch_values else None
+
+
 def _format_metric(value: float | None, digits: int = 2, suffix: str = "") -> str:
     if value is None:
         return "N/A"
@@ -491,7 +510,7 @@ def handle_generate_overhead_table(args):
                 aliases=["backward_ms"],
             )
             peak_mb = _metric_mean(task_records, "peak_cuda_memory_mb")
-            total_flops = _metric_mean(task_records, "estimated_total_flops")
+            total_flops = _metric_mean_per_batch(task_records, "estimated_total_flops")
             cell = (
                 r"\shortstack{"
                 + f"Fwd {_format_metric(forward_ms)} ms" + r"\\"
@@ -506,7 +525,7 @@ def handle_generate_overhead_table(args):
     lines.extend([
         r"\bottomrule",
         r"\end{tabular}",
-        r"\caption{Mean overhead summary aggregated from saved benchmark runs. Each cell reports forward latency, backward latency, peak CUDA memory, and estimated total FLOPs for the corresponding activation-task pair.}",
+        r"\caption{Mean overhead summary aggregated from saved benchmark runs. Each cell reports forward latency, backward latency, peak CUDA memory, and estimated FLOPs for a single forward+backward step (not summed across the run) for the corresponding activation-task pair.}",
         r"\label{tab:overhead_results}",
         r"\end{table*}",
     ])
