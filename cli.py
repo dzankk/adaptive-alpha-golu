@@ -1082,7 +1082,7 @@ def handle_generate_table(args):
 
     print("\\bottomrule")
     print("\\end{tabular}")
-    print("\\caption{Empirical benchmark comparison across tasks. Best performance is in \\textbf{bold}; second best is \\underline{underlined}. Statistical significance is computed via Welch's $t$-test between Alpha-GoLU and GoLU Static.}")
+    print("\\caption{Empirical benchmark comparison across tasks. Best performance is in \\textbf{bold}; second best is \\underline{underlined}. Statistical significance is computed via a paired $t$-test between Alpha-GoLU and GoLU Static when matched seed sets are available, falling back to Welch's $t$-test otherwise.}")
     print("\\label{tab:benchmark_results}")
     print("\\end{table*}\n")
 
@@ -1147,7 +1147,7 @@ def _build_benchmark_latex_table(data: dict) -> str:
     lines.extend([
         r"\bottomrule",
         r"\end{tabular}",
-        r"\caption{Empirical benchmark comparison across tasks. Best performance is in \textbf{bold}; second best is \underline{underlined}. Statistical significance is computed via Welch's $t$-test between Alpha-GoLU and GoLU Static.}",
+        r"\caption{Empirical benchmark comparison across tasks. Best performance is in \textbf{bold}; second best is \underline{underlined}. Statistical significance is computed via a paired $t$-test between Alpha-GoLU and GoLU Static when matched seed sets are available, falling back to Welch's $t$-test otherwise.}",
         r"\label{tab:benchmark_results}",
         r"\end{table*}",
         "",
