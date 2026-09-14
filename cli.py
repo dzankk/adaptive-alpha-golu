@@ -401,7 +401,13 @@ def _metric_mean(records: list[dict], key: str, nested_key: str | None = None) -
 
 def _metric_mean_with_aliases(records: list[dict], *, primary_key: str, nested_key: str | None = None, aliases: list[str] | None = None) -> float | None:
     for key in [primary_key, *(aliases or [])]:
+        # Try the flat shape first (e.g. OverheadTracker's "forward_latency_ms": float), then fall
+        # back to the nested {"mean": ...} shape (e.g. diagnostics.profile_forward_backward's
+        # "forward_ms": {"mean": ...}) -- different tools write latency under the same alias key
+        # with different shapes, and silently reading only one shape drops the other's data as N/A.
         value = _metric_mean(records, key, nested_key)
+        if value is None and nested_key is None:
+            value = _metric_mean(records, key, "mean")
         if value is not None:
             return value
     return None
