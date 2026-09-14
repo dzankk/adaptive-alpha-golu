@@ -18,6 +18,6 @@ Activation & \textbf{Classification} & \textbf{Detection} & \textbf{Diffusion} &
 \textit{$p$-value (Welch; $\alpha$ vs Static)} & \textit{p = 0.9485} & \textit{p = 0.9089} & \textit{p = 0.3433} & \textit{p = 0.0180} & \textit{p = 0.7483} & \textit{p = 0.1417} \\
 \bottomrule
 \end{tabular}
-\caption{Empirical benchmark comparison across tasks. Best performance is in \textbf{bold}; second best is \underline{underlined}. Statistical significance is computed via Welch's $t$-test between Alpha-GoLU and GoLU Static.}
+\caption{Empirical benchmark comparison across tasks. Best performance is in \textbf{bold}; second best is \underline{underlined}. Statistical significance is computed via a paired $t$-test between Alpha-GoLU and GoLU Static when matched seed sets are available, falling back to Welch's $t$-test otherwise.}
 \label{tab:benchmark_results}
 \end{table*}
