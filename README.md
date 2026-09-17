@@ -13,8 +13,8 @@
 
 The full write-up — including statistical testing, an honest account of the mixed results, and the engineering bugs found and fixed along the way — is here:
 
-- **[Report (PDF)](paper/adaptive_alpha_golu_report.pdf)**
-- **[LaTeX source](paper/adaptive_alpha_golu_report.tex)**
+- **[Report (PDF)](paper/SAIProject_final.pdf)**
+- **[LaTeX source](paper/SAIproject_final.tex)**
 
 **tl;dr of the findings:** Alpha-GoLU is statistically indistinguishable from static GoLU on 5 of 6 tasks, with one small but statistically significant improvement on language modeling (p = 0.018) and one clear regression on diffusion. It also adds a measurable latency overhead over static GoLU and over ReLU/GELU/Swish, mostly in the backward pass — **this is not a free improvement**. The report treats this as a mixed, honestly-reported result rather than a clean win, and puts equal weight on the reproducible experimental pipeline itself.
 
@@ -26,8 +26,6 @@ The full write-up — including statistical testing, an honest account of the mi
 - **Full statistical testing, not just point estimates:** paired/Welch's t-tests, multi-seed evaluation (3+ seeds per condition), and dedicated overhead profiling.
 - **Cross-domain benchmark suite:** Classification (CIFAR-10), Object Detection (Pascal VOC), Segmentation (Pascal VOC), Diffusion (CIFAR-10), Language Modeling, and Corruption Robustness (Gaussian noise, shot noise, blur on CIFAR-10).
 - **Reproducible pipeline:** checkpoint/resume on interruption, and a CLI that regenerates every table and figure in the paper directly from saved run data.
-
-> ⚠️ **Note on dataset naming:** the Language Modeling task is described in the paper as a "synthetic/token corpus." *(Double-check this against `experiments/run_language_model.py` if it's actually WikiText-2 — pick whichever is accurate and make sure the README and the paper agree.)*
 
 ---
 
@@ -53,4 +51,3 @@ adaptive-alpha-golu/
 
 This project is licensed under the [MIT License](LICENSE.md).
 
-If referencing this work, please cite the report in `paper/`, and see [`kopic2026critical`] for the earlier critical analysis of GoLU that motivated this project.
