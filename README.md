@@ -13,7 +13,7 @@
 
 The full write-up — including statistical testing, an honest account of the mixed results, and the engineering bugs found and fixed along the way — is here:
 
-- **[Report (PDF)](paper/SAIProject_final.pdf)**
+- **[Report (PDF)](paper/saiProject_final.pdf)**
 - **[LaTeX source](paper/SAIproject_final.tex)**
 
 **tl;dr of the findings:** Alpha-GoLU is statistically indistinguishable from static GoLU on 5 of 6 tasks, with one small but statistically significant improvement on language modeling (p = 0.018) and one clear regression on diffusion. It also adds a measurable latency overhead over static GoLU and over ReLU/GELU/Swish, mostly in the backward pass — **this is not a free improvement**. The report treats this as a mixed, honestly-reported result rather than a clean win, and puts equal weight on the reproducible experimental pipeline itself.
