@@ -3,7 +3,6 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.12](https://img.shields.io/badge/python-3.12-blue.svg)](https://www.python.org/downloads/release/python-3120/)
 [![PyTorch 2.7](https://img.shields.io/badge/PyTorch-2.7%2B-ee4c2c.svg)](https://pytorch.org/)
-[![Code Style: Black](https://img.shields.io/badge/code%20style-black-000000.svg)](https://github.com/psf/black)
 
 **Adaptive Alpha-GoLU** is a per-layer learnable generalization of the **Gompertz Linear Unit (GoLU)** activation function. It introduces a learnable asymmetry parameter (α), optimized directly via backpropagation per layer (and per channel, depending on architecture), and empirically tests whether this improves accuracy, robustness, or training stability compared to fixed-shape GoLU — across six tasks spanning computer vision and language modeling.
 
@@ -33,16 +32,15 @@ The full write-up — including statistical testing, an honest account of the mi
 
 ```text
 adaptive-alpha-golu/
-├── configs/          # Benchmark and hyperparameter configuration JSONs
-├── diagnostics/      # Trajectory trackers for alpha dynamics and gradient stability
+├── configs/          # Benchmark and hyperparameter configuration JSONs (incl. configs/paper_benchmark.json)
+├── diagnostics/      # Complexity/FLOP profiling, timing verification, alpha-trajectory and compute-usage tooling
 ├── experiments/      # Task-specific runners (Classification, Detection, LM, etc.)
 ├── models/           # Core PyTorch modules (alpha_golu.py, backbones)
 ├── outputs/          # Execution runs, checkpoints, and exported paper assets
 ├── paper/            # Final report (PDF + LaTeX source)
 ├── tests/            # Unit testing suite for stability and layer equivalence
-├── utils/            # Data loaders, LaTeX exporters, and plot generators
-├── cli.py            # Main entrypoint for benchmarks and paper asset generation
-└── paper_benchmark.json
+├── utils/            # Data loaders and plot generators (LaTeX tables are generated in cli.py)
+└── cli.py            # Main entrypoint for benchmarks and paper asset generation
 ```
 
 ---
@@ -50,4 +48,3 @@ adaptive-alpha-golu/
 ## Citation & License
 
 This project is licensed under the [MIT License](LICENSE.md).
-
