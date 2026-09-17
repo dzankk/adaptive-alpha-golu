@@ -32,7 +32,9 @@ The full write-up — including statistical testing, an honest account of the mi
 
 ```text
 adaptive-alpha-golu/
+├── artifacts/        # Saved complexity/FLOP/parameter profiling output (complexity_analysis.json)
 ├── configs/          # Benchmark and hyperparameter configuration JSONs (incl. configs/paper_benchmark.json)
+├── data/             # Downloaded CIFAR-10 and Pascal VOC datasets
 ├── diagnostics/      # Complexity/FLOP profiling, timing verification, alpha-trajectory and compute-usage tooling
 ├── experiments/      # Task-specific runners (Classification, Detection, LM, etc.)
 ├── models/           # Core PyTorch modules (alpha_golu.py, backbones)
@@ -40,7 +42,10 @@ adaptive-alpha-golu/
 ├── paper/            # Final report (PDF + LaTeX source)
 ├── tests/            # Unit testing suite for stability and layer equivalence
 ├── utils/            # Data loaders and plot generators (LaTeX tables are generated in cli.py)
-└── cli.py            # Main entrypoint for benchmarks and paper asset generation
+├── cli.py            # Main entrypoint for Phase 1 benchmarks and paper asset generation
+├── cli_scale.py      # Standalone entrypoint for the isolated Phase 2 scale-up runners
+├── Makefile          # Shortcuts for install/test/reproduce targets (see `make help`)
+└── requirements.txt  # Python dependencies
 ```
 
 ---
